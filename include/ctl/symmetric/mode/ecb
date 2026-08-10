@@ -1,0 +1,104 @@
+/**
+ * @file ecb
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief ECB (Electronic Codebook) mode of operation (NIST SP 800-38A)
+ *
+ * Each block is processed independently, so the same plaintext block always
+ * maps to the same ciphertext block. Any repetition in the plaintext is
+ * therefore visible in the ciphertext, which is why this mode must not be used
+ * to encrypt data in general. It is provided for conformance testing and as a
+ * building block for other modes.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+#include <ext/result>
+
+namespace ctl {
+namespace symmetric {
+namespace mode {
+
+/**
+ * @brief ECB mode of operation
+ *
+ * @tparam _Cipher a block cipher, such as ctl::symmetric::cipher::aes
+ */
+template <class _Cipher> class ecb {
+public:
+  /**
+   * @brief The block cipher type
+   */
+  typedef _Cipher cipher_type;
+
+  /**
+   * @brief Block size in bytes
+   */
+  static constexpr size_t block_size = cipher_type::block_size;
+
+  /**
+   * @brief Key size in bytes
+   */
+  static constexpr size_t key_size = cipher_type::key_size;
+
+  enum error_status {
+    /**
+     * @brief The input length is not a multiple of the block size
+     */
+    invalid_input_length,
+  };
+
+  /**
+   * @brief Initializes with a key
+   *
+   * @param key key buffer
+   * @param size size of the key buffer, which must be at least key_size
+   */
+  ecb(const uint8_t *key, size_t size) : cipher_(key, size) {}
+
+  /**
+   * @brief Encrypts
+   *
+   * @param input input buffer
+   * @param size input size, which must be a multiple of block_size
+   * @param output output buffer, may be the same as input
+   */
+  ext::void_result<error_status> encrypt(const uint8_t *input, size_t size,
+                                        uint8_t *output) const {
+    if (size % block_size != 0)
+      return ext::err(invalid_input_length);
+    // The blocks are mutually independent, so all of them are handed over at
+    // once. Where a hardware path exists, this is where several blocks end up
+    // being interleaved.
+    cipher_.encrypt_blocks(input, output, size / block_size);
+    return ext::ok<void>();
+  }
+
+  /**
+   * @brief Decrypts
+   *
+   * @param input input buffer
+   * @param size input size, which must be a multiple of block_size
+   * @param output output buffer, may be the same as input
+   */
+  ext::void_result<error_status> decrypt(const uint8_t *input, size_t size,
+                                        uint8_t *output) const {
+    if (size % block_size != 0)
+      return ext::err(invalid_input_length);
+    cipher_.decrypt_blocks(input, output, size / block_size);
+    return ext::ok<void>();
+  }
+
+private:
+  cipher_type cipher_;
+};
+
+} // namespace mode
+} // namespace symmetric
+} // namespace ctl

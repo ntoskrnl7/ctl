@@ -1,0 +1,434 @@
+/**
+ * @file xts
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief XTS mode of operation (IEEE Std 1619 / NIST SP 800-38E)
+ *
+ * A mode intended for storage encryption. A different tweak is applied to each
+ * data unit, such as a sector, so the same plaintext becomes different
+ * ciphertext at a different position, and ciphertext stealing preserves the
+ * length even when it is not a multiple of the block size.
+ *
+ * The key is two block cipher keys concatenated. The first half, K1, encrypts
+ * the data and the second half, K2, encrypts the tweak.
+ *
+ * Two places are easy to get wrong and are called out explicitly.
+ *
+ * 1. The bit order of the tweak multiplication. XTS treats the sixteen bytes as
+ *    little endian, shifts left by one bit, and exclusive ors 0x87 into byte 0
+ *    when a bit is carried out. GCM uses the same irreducible polynomial but
+ *    the opposite convention, a right shift with 0xE1, so code from one must
+ *    not be mixed with the other.
+ *
+ * 2. The encoding of the data unit number. The specification defines it as an
+ *    integer and requires it to be converted to a little endian byte string.
+ *    The test values in the IEEE appendix print the already converted byte
+ *    string, so reading them back as an integer does not line up.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+
+#include <ext/result>
+
+#include <ctl/detail/endian>
+#include <ctl/detail/memory>
+
+namespace ctl {
+namespace symmetric {
+namespace mode {
+
+/**
+ * @brief XTS mode of operation
+ *
+ * @tparam _Cipher a block cipher, which must have a 128 bit block
+ */
+template <class _Cipher> class xts {
+public:
+  /**
+   * @brief The block cipher type
+   */
+  typedef _Cipher cipher_type;
+
+  /**
+   * @brief Block size in bytes
+   */
+  static constexpr size_t block_size = cipher_type::block_size;
+
+  static_assert(block_size == 16,
+                "XTS is defined only for 128 bit block ciphers. "
+                "(IEEE Std 1619)");
+
+  /**
+   * @brief Key size of one block cipher in bytes
+   */
+  static constexpr size_t cipher_key_size = cipher_type::key_size;
+
+  /**
+   * @brief XTS key size in bytes, that is K1 and K2 concatenated
+   */
+  static constexpr size_t key_size = cipher_key_size * 2;
+
+  /**
+   * @brief Tweak size in bytes
+   */
+  static constexpr size_t tweak_size = block_size;
+
+  /**
+   * @brief Maximum number of blocks in one data unit
+   *
+   * NIST SP 800-38E limits a data unit to 2^20 blocks.
+   */
+  static constexpr size_t max_blocks = 1u << 20;
+
+  /**
+   * @brief Number of blocks processed in one batch
+   */
+  static constexpr size_t batch_blocks = cipher_type::preferred_batch;
+
+  /**
+   * @brief Tweak type
+   */
+  typedef uint8_t tweak_t[tweak_size];
+
+  /**
+   * @brief Data unit number type
+   */
+  typedef uint64_t sequence_number_t;
+
+  enum error_status {
+    /**
+     * @brief The data unit is smaller than one block
+     *
+     * Ciphertext stealing needs a block to steal from, so XTS requires at
+     * least one block.
+     */
+    data_unit_too_short,
+
+    /**
+     * @brief The data unit exceeds max_blocks
+     */
+    data_unit_too_long,
+  };
+
+  /**
+   * @brief Initializes with a key
+   *
+   * @param key K1 || K2, key_size bytes
+   * @param size size of the key buffer, which must be at least key_size
+   * @exception std::invalid_argument if size is smaller than key_size
+   */
+  xts(const uint8_t *key, size_t size)
+      : data_cipher_(validate_key(key, size), cipher_key_size),
+        tweak_cipher_(key + cipher_key_size, cipher_key_size) {}
+
+  /**
+   * @brief Encrypts a data unit
+   *
+   * @param tweak the 128 bit tweak, i in the specification
+   * @param input input buffer
+   * @param size input size, at least block_size
+   * @param output output buffer, may be the same as input
+   */
+  ext::void_result<error_status> encrypt(const tweak_t &tweak,
+                                        const uint8_t *input, size_t size,
+                                        uint8_t *output) const {
+    error_status status;
+    if (size_error(size, status))
+      return ext::err(status);
+
+    uint8_t t[block_size];
+    tweak_cipher_.encrypt_block(&tweak[0], t);
+
+    const size_t remainder = size % block_size;
+    // When ciphertext stealing is needed, the last whole block is handled
+    // separately.
+    const size_t whole = remainder == 0 ? size / block_size
+                                        : size / block_size - 1;
+
+    transform_blocks<true>(input, whole, t, output);
+
+    if (remainder != 0) {
+      const size_t last = whole * block_size;
+
+      // The last whole block is encrypted with the current tweak. The front of
+      // that result becomes the ciphertext of the partial block, and the back
+      // is used to fill out the partial plaintext.
+      uint8_t stolen[block_size];
+      transform<true>(input + last, t, stolen);
+      multiply_alpha(t);
+
+      // All of the input is read before any output is written, which is what
+      // makes operating in place safe.
+      uint8_t combined[block_size];
+      memcpy(combined, input + last + block_size, remainder);
+      memcpy(combined + remainder, stolen + remainder, block_size - remainder);
+
+      transform<true>(combined, t, output + last);
+      memcpy(output + last + block_size, stolen, remainder);
+
+      ctl::detail::secure_zero(stolen, sizeof(stolen));
+      ctl::detail::secure_zero(combined, sizeof(combined));
+    }
+
+    ctl::detail::secure_zero(t, sizeof(t));
+    return ext::ok<void>();
+  }
+
+  /**
+   * @brief Decrypts a data unit
+   *
+   * @param tweak the 128 bit tweak, i in the specification
+   * @param input input buffer
+   * @param size input size, at least block_size
+   * @param output output buffer, may be the same as input
+   */
+  ext::void_result<error_status> decrypt(const tweak_t &tweak,
+                                        const uint8_t *input, size_t size,
+                                        uint8_t *output) const {
+    error_status status;
+    if (size_error(size, status))
+      return ext::err(status);
+
+    uint8_t t[block_size];
+    tweak_cipher_.encrypt_block(&tweak[0], t);
+
+    const size_t remainder = size % block_size;
+    const size_t whole = remainder == 0 ? size / block_size
+                                        : size / block_size - 1;
+
+    transform_blocks<false>(input, whole, t, output);
+
+    if (remainder != 0) {
+      const size_t last = whole * block_size;
+
+      // During encryption the last whole block was produced with the next
+      // tweak along, so decryption has to use that same tweak.
+      uint8_t next[block_size];
+      memcpy(next, t, block_size);
+      multiply_alpha(next);
+
+      uint8_t stolen[block_size];
+      transform<false>(input + last, next, stolen);
+
+      uint8_t combined[block_size];
+      memcpy(combined, input + last + block_size, remainder);
+      memcpy(combined + remainder, stolen + remainder, block_size - remainder);
+
+      transform<false>(combined, t, output + last);
+      memcpy(output + last + block_size, stolen, remainder);
+
+      ctl::detail::secure_zero(next, sizeof(next));
+      ctl::detail::secure_zero(stolen, sizeof(stolen));
+      ctl::detail::secure_zero(combined, sizeof(combined));
+    }
+
+    ctl::detail::secure_zero(t, sizeof(t));
+    return ext::ok<void>();
+  }
+
+  /**
+   * @brief Encrypts using a data unit number
+   *
+   * @param sequence_number data unit number, such as a sector number
+   * @param input input buffer
+   * @param size input size, at least block_size
+   * @param output output buffer, may be the same as input
+   */
+  ext::void_result<error_status> encrypt(sequence_number_t sequence_number,
+                                        const uint8_t *input, size_t size,
+                                        uint8_t *output) const {
+    tweak_t tweak;
+    make_tweak(sequence_number, tweak);
+    return encrypt(tweak, input, size, output);
+  }
+
+  /**
+   * @brief Decrypts using a data unit number
+   *
+   * @param sequence_number data unit number, such as a sector number
+   * @param input input buffer
+   * @param size input size, at least block_size
+   * @param output output buffer, may be the same as input
+   */
+  ext::void_result<error_status> decrypt(sequence_number_t sequence_number,
+                                        const uint8_t *input, size_t size,
+                                        uint8_t *output) const {
+    tweak_t tweak;
+    make_tweak(sequence_number, tweak);
+    return decrypt(tweak, input, size, output);
+  }
+
+  /**
+   * @brief Converts a data unit number into a tweak
+   *
+   * The specification defines the number as being converted to a little endian
+   * byte string.
+   *
+   * @param sequence_number data unit number
+   * @param tweak the resulting tweak
+   */
+  static void make_tweak(sequence_number_t sequence_number, tweak_t &tweak) {
+    memset(&tweak[0], 0, tweak_size);
+    ctl::detail::store_le64(sequence_number, &tweak[0]);
+  }
+
+private:
+  /**
+   * @brief Checks the key length, relying on the order in which the members of
+   * the constructor are initialized
+   */
+  static const uint8_t *validate_key(const uint8_t *key, size_t size) {
+    if (size < key_size)
+      throw std::invalid_argument(
+          "ctl::symmetric::mode::xts : "
+          "key buffer is shorter than the XTS key length.");
+    return key;
+  }
+
+  /**
+   * @brief Checks the data unit size
+   *
+   * This does not return a void_result on purpose. ext::void_result default
+   * constructs its internal err member even on the success path, and building
+   * that costs a heap allocation, so producing one just for a check would mean
+   * two allocations per call. Only the error condition is passed out, and the
+   * result object is built once.
+   *
+   * @param size data unit size
+   * @param status set to the error code when there is an error
+   * @return true if there is an error
+   */
+  static bool size_error(size_t size, error_status &status) {
+    if (size < block_size) {
+      status = data_unit_too_short;
+      return true;
+    }
+    if ((size + block_size - 1) / block_size > max_blocks) {
+      status = data_unit_too_long;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * @brief Processes a stretch of whole blocks
+   *
+   * Every block has a different tweak, so handing several over at once takes
+   * some preparation. Once the tweaks have been built and applied to the input,
+   * the block cipher calls are mutually independent and can be interleaved on a
+   * hardware path. The tweaks themselves form a serial chain through the alpha
+   * multiplication, but that is only a handful of operations and does not
+   * become the bottleneck.
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   * @param input input
+   * @param count number of blocks to process
+   * @param t the current tweak, advanced by count steps on return
+   * @param output output, may be the same as input
+   */
+  template <bool _Encrypt>
+  void transform_blocks(const uint8_t *input, size_t count, uint8_t *t,
+                        uint8_t *output) const {
+    uint8_t tweaks[batch_blocks * block_size];
+    uint8_t staging[batch_blocks * block_size];
+
+    size_t j = 0;
+    while (data_cipher_.prefers_batching() && j + batch_blocks <= count) {
+      for (size_t b = 0; b < batch_blocks; ++b) {
+        memcpy(tweaks + b * block_size, t, block_size);
+        ctl::detail::xor_block<block_size>(input + (j + b) * block_size, t,
+                                          staging + b * block_size);
+        multiply_alpha(t);
+      }
+
+      if constexpr (_Encrypt)
+        data_cipher_.encrypt_blocks(staging, staging, batch_blocks);
+      else
+        data_cipher_.decrypt_blocks(staging, staging, batch_blocks);
+
+      for (size_t b = 0; b < batch_blocks; ++b)
+        ctl::detail::xor_block<block_size>(staging + b * block_size,
+                                          tweaks + b * block_size,
+                                          output + (j + b) * block_size);
+      j += batch_blocks;
+    }
+
+    // Blocks left over that do not fill a batch
+    for (; j < count; ++j) {
+      transform<_Encrypt>(input + j * block_size, t, output + j * block_size);
+      multiply_alpha(t);
+    }
+
+    ctl::detail::secure_zero(tweaks, sizeof(tweaks));
+    ctl::detail::secure_zero(staging, sizeof(staging));
+  }
+
+  /**
+   * @brief Transforms one block with a tweak applied
+   *
+   * Encryption is C = E_K1(P ^ T) ^ T and decryption is P = D_K1(C ^ T) ^ T.
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   */
+  template <bool _Encrypt>
+  void transform(const uint8_t *input, const uint8_t *t,
+                 uint8_t *output) const {
+    uint8_t buffer[block_size];
+    ctl::detail::xor_block<block_size>(input, t, buffer);
+    if constexpr (_Encrypt)
+      data_cipher_.encrypt_block(buffer, buffer);
+    else
+      data_cipher_.decrypt_block(buffer, buffer);
+    ctl::detail::xor_block<block_size>(buffer, t, output);
+    // buffer is deliberately not erased. What it holds is derived from the
+    // plaintext or ciphertext the caller already has, so erasing it gains
+    // nothing, and a volatile write per block would only cost throughput. Key
+    // material is managed by the block cipher and by the tweak handling.
+  }
+
+  /**
+   * @brief Multiplies the tweak by the primitive element alpha
+   *
+   * The irreducible polynomial of GF(2^128) is x^128 + x^7 + x^2 + x + 1, and
+   * XTS interprets the byte string as little endian. The value is therefore
+   * shifted left by one bit and 0x87 is exclusive ored into byte 0 when a bit
+   * is carried out.
+   *
+   * @param value the tweak, block_size bytes, updated in place
+   */
+  static void multiply_alpha(uint8_t *value) {
+    // Little endian means the first eight bytes are the low word. Both words
+    // have to be read before either is written.
+    const uint64_t low = ctl::detail::load_le64(value);
+    const uint64_t high = ctl::detail::load_le64(value + 8);
+
+    // A mask is used rather than a branch when folding 0x87 back in, so the
+    // running time does not depend on the value of the tweak, which is derived
+    // from the key.
+    const uint64_t carry = high >> 63;
+    ctl::detail::store_le64((low << 1) ^ (0x87ull & (0ull - carry)), value);
+    ctl::detail::store_le64((high << 1) | (low >> 63), value + 8);
+  }
+
+  /**
+   * @brief The block cipher that encrypts the data, keyed with K1
+   */
+  cipher_type data_cipher_;
+
+  /**
+   * @brief The block cipher that encrypts the tweak, keyed with K2
+   */
+  cipher_type tweak_cipher_;
+};
+
+} // namespace mode
+} // namespace symmetric
+} // namespace ctl

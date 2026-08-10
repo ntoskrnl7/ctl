@@ -1,0 +1,178 @@
+/**
+ * @file ctr
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief CTR (Counter) mode of operation (NIST SP 800-38A)
+ *
+ * Counter blocks are encrypted to produce a key stream which is exclusive ored
+ * with the plaintext. The mode behaves like a stream cipher, so there is no
+ * constraint on the input length and no padding is needed, and encryption and
+ * decryption are exactly the same operation.
+ *
+ * A byte offset is accepted so that data can be accessed at an arbitrary
+ * position. Given an offset, the corresponding counter value and the position
+ * within the key stream block are computed, so processing can start in the
+ * middle without touching what comes before.
+ *
+ * Note that using the same counter block twice under the same key repeats the
+ * key stream, which exposes the exclusive or of the two plaintexts directly.
+ * Managing the nonce is what the security of this mode rests on.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+#include <ctl/detail/memory>
+
+namespace ctl {
+namespace symmetric {
+namespace mode {
+
+/**
+ * @brief CTR mode of operation
+ *
+ * @tparam _Cipher a block cipher, such as ctl::symmetric::cipher::aes
+ */
+template <class _Cipher> class ctr {
+public:
+  /**
+   * @brief The block cipher type
+   */
+  typedef _Cipher cipher_type;
+
+  /**
+   * @brief Block size in bytes
+   */
+  static constexpr size_t block_size = cipher_type::block_size;
+
+  /**
+   * @brief Key size in bytes
+   */
+  static constexpr size_t key_size = cipher_type::key_size;
+
+  /**
+   * @brief Initial counter block size in bytes
+   */
+  static constexpr size_t nonce_size = block_size;
+
+  /**
+   * @brief Initial counter block type
+   */
+  typedef uint8_t nonce_t[nonce_size];
+
+  /**
+   * @brief Byte offset type
+   */
+  typedef uint64_t offset_t;
+
+  /**
+   * @brief Number of blocks processed in one batch
+   */
+  static constexpr size_t batch_blocks = cipher_type::preferred_batch;
+
+  /**
+   * @brief Initializes with a key
+   *
+   * @param key key buffer
+   * @param size size of the key buffer, which must be at least key_size
+   */
+  ctr(const uint8_t *key, size_t size) : cipher_(key, size) {}
+
+  /**
+   * @brief Encrypts or decrypts
+   *
+   * CTR mode performs the same operation in both directions, so there is only
+   * one method. Nothing here can fail, so the result is not wrapped in a
+   * result type.
+   *
+   * @param nonce initial counter block
+   * @param byte_offset position in the stream to start at, in bytes
+   * @param input input buffer
+   * @param size input size, unconstrained
+   * @param output output buffer, may be the same as input
+   */
+  void crypt(const nonce_t &nonce, offset_t byte_offset, const uint8_t *input,
+             size_t size, uint8_t *output) const {
+    uint8_t counter[block_size];
+    memcpy(counter, &nonce[0], block_size);
+    increment(counter, byte_offset / block_size);
+
+    uint8_t keystream[block_size];
+    size_t i = 0;
+
+    // When the offset is not on a block boundary, only the first block starts
+    // partway into the key stream.
+    const size_t position = static_cast<size_t>(byte_offset % block_size);
+    if (position != 0) {
+      cipher_.encrypt_block(counter, keystream);
+      increment(counter, 1);
+      const size_t available = block_size - position;
+      const size_t count = available < size ? available : size;
+      ctl::detail::xor_bytes(input, keystream + position, output, count);
+      i = count;
+    }
+
+    // Over the block aligned stretch, several counter blocks are prepared and
+    // encrypted at once. Key stream blocks are mutually independent, so they
+    // can be interleaved on a hardware path.
+    uint8_t batch[batch_blocks * block_size];
+    for (; cipher_.prefers_batching() && i + sizeof(batch) <= size;
+         i += sizeof(batch)) {
+      for (size_t b = 0; b < batch_blocks; ++b) {
+        memcpy(batch + b * block_size, counter, block_size);
+        increment(counter, 1);
+      }
+      cipher_.encrypt_blocks(batch, batch, batch_blocks);
+      ctl::detail::xor_bytes(input + i, batch, output + i, sizeof(batch));
+    }
+
+    // Whole blocks left over that do not fill a batch
+    for (; i + block_size <= size; i += block_size) {
+      cipher_.encrypt_block(counter, keystream);
+      increment(counter, 1);
+      ctl::detail::xor_block<block_size>(input + i, keystream, output + i);
+    }
+
+    // The partial block at the end
+    if (i < size) {
+      cipher_.encrypt_block(counter, keystream);
+      ctl::detail::xor_bytes(input + i, keystream, output + i, size - i);
+    }
+
+    ctl::detail::secure_zero(batch, sizeof(batch));
+    ctl::detail::secure_zero(keystream, sizeof(keystream));
+    ctl::detail::secure_zero(counter, sizeof(counter));
+  }
+
+private:
+  /**
+   * @brief Increments the counter block
+   *
+   * The whole block is treated as a single big endian integer, so the carry has
+   * to propagate in units of eight bits.
+   *
+   * @param counter counter block of block_size bytes
+   * @param added value to add
+   */
+  static void increment(uint8_t *counter, uint64_t added) {
+    size_t n = block_size;
+    do {
+      --n;
+      added += counter[n];
+      counter[n] = static_cast<uint8_t>(added);
+      added >>= 8;
+    } while (n);
+  }
+
+  cipher_type cipher_;
+};
+
+} // namespace mode
+} // namespace symmetric
+} // namespace ctl
