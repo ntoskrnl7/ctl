@@ -1,0 +1,522 @@
+/**
+ * @file aria
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief ARIA block cipher (RFC 5794 / KS X 1213-1)
+ *
+ * Follows the specification designed by KISA and published as RFC 5794. It is
+ * an involutional SPN, so encryption and decryption take the same path and
+ * only the round keys are exchanged.
+ *
+ * On how the S-boxes are handled: RFC 5794 defines all four S-boxes as lookup
+ * tables only and does not give the algebraic definition, that is the inverse
+ * in GF(2^8) followed by an affine transformation. Copying tables into the
+ * source was therefore kept to a minimum.
+ *   - SB1 is the same as the AES S-box, so it is generated from the algebraic
+ *     definition (ctl/detail/sbox)
+ *   - SB3 is the inverse of SB1, so it is derived
+ *   - SB2 exists in the specification only as a table, so it is transcribed
+ *     from the document (sb2_table in this file)
+ *   - SB4 is the inverse of SB2, so it is derived
+ * The transcribed SB2 is checked at compile time for being a permutation, so a
+ * single mistyped byte makes compilation fail.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+
+#include <ctl/detail/config>
+#include <ctl/detail/memory>
+#include <ctl/detail/sbox>
+
+namespace ctl {
+namespace symmetric {
+namespace cipher {
+
+namespace aria_detail {
+
+/**
+ * @brief The SB2 table as printed in section 2.4.2 of RFC 5794
+ *
+ * The specification provides no algebraic definition, so this is transcribed
+ * from the document as it stands.
+ */
+inline constexpr uint8_t sb2_table[256] = {
+    0xe2, 0x4e, 0x54, 0xfc, 0x94, 0xc2, 0x4a, 0xcc, 0x62, 0x0d, 0x6a, 0x46,
+    0x3c, 0x4d, 0x8b, 0xd1, 0x5e, 0xfa, 0x64, 0xcb, 0xb4, 0x97, 0xbe, 0x2b,
+    0xbc, 0x77, 0x2e, 0x03, 0xd3, 0x19, 0x59, 0xc1, 0x1d, 0x06, 0x41, 0x6b,
+    0x55, 0xf0, 0x99, 0x69, 0xea, 0x9c, 0x18, 0xae, 0x63, 0xdf, 0xe7, 0xbb,
+    0x00, 0x73, 0x66, 0xfb, 0x96, 0x4c, 0x85, 0xe4, 0x3a, 0x09, 0x45, 0xaa,
+    0x0f, 0xee, 0x10, 0xeb, 0x2d, 0x7f, 0xf4, 0x29, 0xac, 0xcf, 0xad, 0x91,
+    0x8d, 0x78, 0xc8, 0x95, 0xf9, 0x2f, 0xce, 0xcd, 0x08, 0x7a, 0x88, 0x38,
+    0x5c, 0x83, 0x2a, 0x28, 0x47, 0xdb, 0xb8, 0xc7, 0x93, 0xa4, 0x12, 0x53,
+    0xff, 0x87, 0x0e, 0x31, 0x36, 0x21, 0x58, 0x48, 0x01, 0x8e, 0x37, 0x74,
+    0x32, 0xca, 0xe9, 0xb1, 0xb7, 0xab, 0x0c, 0xd7, 0xc4, 0x56, 0x42, 0x26,
+    0x07, 0x98, 0x60, 0xd9, 0xb6, 0xb9, 0x11, 0x40, 0xec, 0x20, 0x8c, 0xbd,
+    0xa0, 0xc9, 0x84, 0x04, 0x49, 0x23, 0xf1, 0x4f, 0x50, 0x1f, 0x13, 0xdc,
+    0xd8, 0xc0, 0x9e, 0x57, 0xe3, 0xc3, 0x7b, 0x65, 0x3b, 0x02, 0x8f, 0x3e,
+    0xe8, 0x25, 0x92, 0xe5, 0x15, 0xdd, 0xfd, 0x17, 0xa9, 0xbf, 0xd4, 0x9a,
+    0x7e, 0xc5, 0x39, 0x67, 0xfe, 0x76, 0x9d, 0x43, 0xa7, 0xe1, 0xd0, 0xf5,
+    0x68, 0xf2, 0x1b, 0x34, 0x70, 0x05, 0xa3, 0x8a, 0xd5, 0x79, 0x86, 0xa8,
+    0x30, 0xc6, 0x51, 0x4b, 0x1e, 0xa6, 0x27, 0xf6, 0x35, 0xd2, 0x6e, 0x24,
+    0x16, 0x82, 0x5f, 0xda, 0xe6, 0x75, 0xa2, 0xef, 0x2c, 0xb2, 0x1c, 0x9f,
+    0x5d, 0x6f, 0x80, 0x0a, 0x72, 0x44, 0x9b, 0x6c, 0x90, 0x0b, 0x5b, 0x33,
+    0x7d, 0x5a, 0x52, 0xf3, 0x61, 0xa1, 0xf7, 0xb0, 0xd6, 0x3f, 0x7c, 0x6d,
+    0xed, 0x14, 0xe0, 0xa5, 0x3d, 0x22, 0xb3, 0xf8, 0x89, 0xde, 0x71, 0x1a,
+    0xaf, 0xba, 0xb5, 0x81};
+
+// Transcription error detection: an S-box has to be a permutation, so a single
+// wrong byte makes compilation fail here.
+static_assert(ctl::detail::is_permutation(sb2_table),
+              "ARIA SB2 transcription error");
+
+/**
+ * @brief SB2 together with its inverse SB4
+ */
+inline constexpr ctl::detail::sbox_pair sb2 =
+    ctl::detail::make_sbox_pair(sb2_table);
+
+// The example in section 2.4.2 of RFC 5794: SB4(0xef) == 0xd3
+static_assert(sb2.inverse[0xef] == 0xd3, "ARIA SB4 derivation error");
+
+// The two extreme entries of the SB2 table of RFC 5794
+static_assert(sb2.forward[0x00] == 0xe2, "ARIA SB2 transcription error");
+static_assert(sb2.forward[0xff] == 0x81, "ARIA SB2 transcription error");
+
+// Values from the first row of the SB4 table of RFC 5794. The document has a
+// typographic slip there, printing column d as " 9" rather than "09"; since
+// SB4 is derived from SB2, this confirms that the value is 0x09.
+static_assert(sb2.inverse[0x00] == 0x30, "ARIA SB4 derivation error");
+static_assert(sb2.inverse[0x0d] == 0x09, "ARIA SB4 derivation error");
+
+/**
+ * @brief The key schedule constants C1, C2 and C3 (section 2.2 of RFC 5794)
+ *
+ * Taken from the leading 128*3 bits of the fractional part of 1/PI.
+ */
+inline constexpr uint8_t constants[3][16] = {
+    // C1 = 0x517cc1b727220a94fe13abe8fa9a6ee0
+    {0x51, 0x7c, 0xc1, 0xb7, 0x27, 0x22, 0x0a, 0x94, 0xfe, 0x13, 0xab, 0xe8,
+     0xfa, 0x9a, 0x6e, 0xe0},
+    // C2 = 0x6db14acc9e21c820ff28b1d5ef5de2b0
+    {0x6d, 0xb1, 0x4a, 0xcc, 0x9e, 0x21, 0xc8, 0x20, 0xff, 0x28, 0xb1, 0xd5,
+     0xef, 0x5d, 0xe2, 0xb0},
+    // C3 = 0xdb92371d2126e9700324977504e8c90e
+    {0xdb, 0x92, 0x37, 0x1d, 0x21, 0x26, 0xe9, 0x70, 0x03, 0x24, 0x97, 0x75,
+     0x04, 0xe8, 0xc9, 0x0e}};
+
+} // namespace aria_detail
+
+/**
+ * @brief ARIA block cipher (RFC 5794)
+ *
+ * The block size is fixed at 128 bits and only the key length is selected. Any
+ * byte string is a valid key, so setting a key cannot fail.
+ *
+ * @tparam _KeyBits key size in bits (128, 192 or 256)
+ */
+template <size_t _KeyBits = 128> class aria {
+  static_assert(_KeyBits == 128 || _KeyBits == 192 || _KeyBits == 256,
+                "ARIA supports only 128, 192 and 256 bit keys. (RFC 5794)");
+
+public:
+  /**
+   * @brief Block size in bits
+   */
+  static constexpr size_t block_bits = 128;
+
+  /**
+   * @brief Block size in bytes
+   */
+  static constexpr size_t block_size = block_bits / 8;
+
+  /**
+   * @brief Key size in bits
+   */
+  static constexpr size_t key_bits = _KeyBits;
+
+  /**
+   * @brief Key size in bytes
+   */
+  static constexpr size_t key_size = key_bits / 8;
+
+  /**
+   * @brief Number of rounds (section 2.2 of RFC 5794: 128 -> 12, 192 -> 14,
+   * 256 -> 16)
+   */
+  static constexpr size_t rounds = key_bits / 32 + 8;
+
+  static_assert(rounds == (_KeyBits == 128 ? 12 : (_KeyBits == 192 ? 14 : 16)),
+                "ARIA round count computation error");
+
+  /**
+   * @brief Number of round keys
+   *
+   * One more than the number of rounds, because the last round has an
+   * additional key addition layer.
+   */
+  static constexpr size_t round_key_count = rounds + 1;
+
+  /**
+   * @brief A good number of blocks to process in one batch
+   *
+   * Modes of operation use this to size their staging buffers.
+   */
+  static constexpr size_t preferred_batch = 8;
+
+  /**
+   * @brief Key type
+   */
+  typedef uint8_t key_t[key_size];
+
+  /**
+   * @brief Block type
+   */
+  typedef uint8_t block_t[block_size];
+
+  /**
+   * @brief Initializes with a key whose length is checked at compile time
+   *
+   * @param key the key
+   */
+  explicit aria(const key_t &key) { set_key(&key[0]); }
+
+  /**
+   * @brief Initializes with a key held in a run time buffer
+   *
+   * The length is taken as well for two reasons. It keeps this overload from
+   * being ambiguous with the one above that takes an array, and it prevents a
+   * short buffer from being read past its end so that uninitialized memory is
+   * used as key material.
+   *
+   * @param key key buffer
+   * @param size size of the key buffer, which must be at least key_size
+   * @exception std::invalid_argument if size is smaller than key_size
+   */
+  aria(const uint8_t *key, size_t size) {
+    if (size < key_size)
+      throw std::invalid_argument("ctl::symmetric::cipher::aria : "
+                                  "key buffer is shorter than the key length.");
+    set_key(key);
+  }
+
+  /**
+   * @brief Erases the round keys on destruction
+   */
+  ~aria() {
+    ctl::detail::secure_zero(ek_, sizeof(ek_));
+    ctl::detail::secure_zero(dk_, sizeof(dk_));
+  }
+
+  /**
+   * @brief Sets the key again (section 2.2 of RFC 5794)
+   *
+   * @param key must hold at least key_size bytes
+   */
+  void set_key(const uint8_t *key) {
+    // KL is the leading 128 bits and KR is the remainder, right padded with
+    // zeroes to 128 bits.
+    uint8_t kl[16];
+    uint8_t kr[16];
+    memcpy(kl, key, 16);
+    memset(kr, 0, sizeof(kr));
+    if constexpr (key_size > 16)
+      memcpy(kr, key + 16, key_size - 16);
+
+    // W0 through W3 are derived by a three round 256 bit Feistel cipher.
+    uint8_t w[4][16];
+    memcpy(w[0], kl, 16);
+    odd_round(w[0], constant(0), w[1]);
+    ctl::detail::xor_bytes(w[1], kr, w[1], 16);
+    even_round(w[1], constant(1), w[2]);
+    ctl::detail::xor_bytes(w[2], w[0], w[2], 16);
+    odd_round(w[2], constant(2), w[3]);
+    ctl::detail::xor_bytes(w[3], w[1], w[3], 16);
+
+    // ek1 through ek17 come in groups of four that share a rotation amount.
+    // The amounts the specification writes as left rotations are converted to
+    // right rotations here, for instance <<<61 becomes >>>67.
+    static constexpr unsigned int rotations[5] = {19, 31, 67, 97, 109};
+    size_t index = 0;
+    for (unsigned int group = 0; group < 5 && index < round_key_count; ++group)
+      for (unsigned int i = 0; i < 4 && index < round_key_count; ++i, ++index) {
+        uint8_t rotated[16];
+        rotr128(w[(i + 1) & 3], rotations[group], rotated);
+        ctl::detail::xor_bytes(w[i], rotated, ek_[index], 16);
+      }
+
+    // dk1 = ek{n+1}, dk{i} = A(ek{n+2-i}), dk{n+1} = ek1
+    memcpy(dk_[0], ek_[rounds], 16);
+    for (size_t i = 2; i <= rounds; ++i)
+      diffuse(ek_[rounds + 1 - i], dk_[i - 1]);
+    memcpy(dk_[rounds], ek_[0], 16);
+
+    ctl::detail::secure_zero(w, sizeof(w));
+    ctl::detail::secure_zero(kl, sizeof(kl));
+    ctl::detail::secure_zero(kr, sizeof(kr));
+  }
+
+  /**
+   * @brief Encrypts one block
+   *
+   * @param input input block of block_size bytes
+   * @param output output block of block_size bytes, may be the same as input
+   */
+  void encrypt_block(const uint8_t *input, uint8_t *output) const {
+    crypt(ek_, input, output);
+  }
+
+  /**
+   * @brief Decrypts one block
+   *
+   * ARIA is involutional, so decryption follows the same path as encryption
+   * and only the round keys are exchanged for the decryption ones (section
+   * 2.3.2 of RFC 5794).
+   *
+   * @param input input block of block_size bytes
+   * @param output output block of block_size bytes, may be the same as input
+   */
+  void decrypt_block(const uint8_t *input, uint8_t *output) const {
+    crypt(dk_, input, output);
+  }
+
+  /**
+   * @brief Whether passing blocks in batches is worthwhile
+   *
+   * ARIA has no hardware path, so batching gains nothing and only adds the
+   * cost of moving data through the staging buffers of the mode of operation.
+   */
+  bool prefers_batching() const { return false; }
+
+  /**
+   * @brief Encrypts several mutually independent blocks
+   *
+   * ARIA has no hardware path, so this simply iterates. The interface is kept
+   * in line so that a mode of operation works with any block cipher through
+   * the same code.
+   *
+   * @param input input of count * block_size bytes
+   * @param output output of count * block_size bytes, may be the same as input
+   * @param count number of blocks
+   */
+  void encrypt_blocks(const uint8_t *input, uint8_t *output,
+                      size_t count) const {
+    for (size_t i = 0; i < count; ++i)
+      crypt(ek_, input + i * block_size, output + i * block_size);
+  }
+
+  /**
+   * @brief Decrypts several mutually independent blocks
+   *
+   * @param input input of count * block_size bytes
+   * @param output output of count * block_size bytes, may be the same as input
+   * @param count number of blocks
+   */
+  void decrypt_blocks(const uint8_t *input, uint8_t *output,
+                      size_t count) const {
+    for (size_t i = 0; i < count; ++i)
+      crypt(dk_, input + i * block_size, output + i * block_size);
+  }
+
+private:
+  /**
+   * @brief Selects CK1, CK2 and CK3 according to the key size (section 2.2 of
+   * RFC 5794)
+   *
+   * The order is C1 C2 C3 for 128 bit keys, C2 C3 C1 for 192 bit keys and
+   * C3 C1 C2 for 256 bit keys.
+   *
+   * @param index 0 for CK1, 1 for CK2, 2 for CK3
+   * @return the selected constant
+   */
+  static const uint8_t *constant(size_t index) {
+    constexpr size_t offset =
+        _KeyBits == 128 ? 0 : (_KeyBits == 192 ? 1 : 2);
+    return aria_detail::constants[(offset + index) % 3];
+  }
+
+  /**
+   * @brief Rotates a 128 bit value right
+   *
+   * Follows the bit order of the specification, in which the most significant
+   * bit is bit 0.
+   *
+   * @param input input of 16 bytes
+   * @param bits number of bits to rotate by
+   * @param output output of 16 bytes, which must not overlap input
+   */
+  static void rotr128(const uint8_t *input, unsigned int bits,
+                      uint8_t *output) {
+    bits %= 128;
+    const unsigned int byte_shift = bits / 8;
+    const unsigned int bit_shift = bits % 8;
+    for (unsigned int i = 0; i < 16; ++i) {
+      const unsigned int high = (i + 16 - byte_shift) % 16;
+      if (bit_shift == 0) {
+        output[i] = input[high];
+      } else {
+        const unsigned int low = (high + 15) % 16;
+        output[i] = static_cast<uint8_t>((input[high] >> bit_shift) |
+                                        (input[low] << (8 - bit_shift)));
+      }
+    }
+  }
+
+  /**
+   * @brief Type 1 substitution layer SL1 (section 2.4.2 of RFC 5794)
+   */
+  static void substitute1(const uint8_t *input, uint8_t *output) {
+    for (size_t i = 0; i < 16; i += 4) {
+      output[i + 0] = ctl::detail::aes_sbox.forward[input[i + 0]];
+      output[i + 1] = aria_detail::sb2.forward[input[i + 1]];
+      output[i + 2] = ctl::detail::aes_sbox.inverse[input[i + 2]];
+      output[i + 3] = aria_detail::sb2.inverse[input[i + 3]];
+    }
+  }
+
+  /**
+   * @brief Type 2 substitution layer SL2 (section 2.4.2 of RFC 5794)
+   *
+   * The inverse of SL1.
+   */
+  static void substitute2(const uint8_t *input, uint8_t *output) {
+    for (size_t i = 0; i < 16; i += 4) {
+      output[i + 0] = ctl::detail::aes_sbox.inverse[input[i + 0]];
+      output[i + 1] = aria_detail::sb2.inverse[input[i + 1]];
+      output[i + 2] = ctl::detail::aes_sbox.forward[input[i + 2]];
+      output[i + 3] = aria_detail::sb2.forward[input[i + 3]];
+    }
+  }
+
+  /**
+   * @brief Diffusion layer A (section 2.4.3 of RFC 5794)
+   *
+   * A is an involution, so A(A(x)) == x holds.
+   *
+   * @param x input of 16 bytes
+   * @param y output of 16 bytes, may be the same as x
+   */
+  static void diffuse(const uint8_t *x, uint8_t *y) {
+    // Each equation in the specification exclusive ors seven inputs, so
+    // carrying them over directly costs 96 exclusive ors. Grouping the sixteen
+    // outputs into fours, however, shows that each group shares four inputs.
+    // Computing those shared terms once brings the count down to 12 + 48 = 60.
+    // This is algebraically identical to the equations as written, so the test
+    // values in appendix A of RFC 5794 verify the rearrangement as it stands.
+    const uint8_t t0 = x[3] ^ x[4] ^ x[9] ^ x[14];  // y0, y5, y11, y14
+    const uint8_t t1 = x[2] ^ x[5] ^ x[8] ^ x[15];  // y1, y4, y10, y15
+    const uint8_t t2 = x[1] ^ x[6] ^ x[11] ^ x[12]; // y2, y7, y9,  y12
+    const uint8_t t3 = x[0] ^ x[7] ^ x[10] ^ x[13]; // y3, y6, y8,  y13
+
+    uint8_t out[16];
+    out[0] = t0 ^ x[6] ^ x[8] ^ x[13];
+    out[5] = t0 ^ x[1] ^ x[10] ^ x[15];
+    out[11] = t0 ^ x[2] ^ x[7] ^ x[12];
+    out[14] = t0 ^ x[0] ^ x[5] ^ x[11];
+
+    out[1] = t1 ^ x[7] ^ x[9] ^ x[12];
+    out[4] = t1 ^ x[0] ^ x[11] ^ x[14];
+    out[10] = t1 ^ x[3] ^ x[6] ^ x[13];
+    out[15] = t1 ^ x[1] ^ x[4] ^ x[10];
+
+    out[2] = t2 ^ x[4] ^ x[10] ^ x[15];
+    out[7] = t2 ^ x[3] ^ x[8] ^ x[13];
+    out[9] = t2 ^ x[0] ^ x[5] ^ x[14];
+    out[12] = t2 ^ x[2] ^ x[7] ^ x[9];
+
+    out[3] = t3 ^ x[5] ^ x[11] ^ x[14];
+    out[6] = t3 ^ x[2] ^ x[9] ^ x[12];
+    out[8] = t3 ^ x[1] ^ x[4] ^ x[15];
+    out[13] = t3 ^ x[3] ^ x[6] ^ x[8];
+
+    memcpy(y, out, sizeof(out));
+  }
+
+  /**
+   * @brief Odd round function FO(D,RK) = A(SL1(D ^ RK)) (section 2.4.1 of
+   * RFC 5794)
+   */
+  static void odd_round(const uint8_t *data, const uint8_t *round_key,
+                        uint8_t *output) {
+    uint8_t t[16];
+    uint8_t s[16];
+    ctl::detail::xor_bytes(data, round_key, t, 16);
+    substitute1(t, s);
+    diffuse(s, output);
+  }
+
+  /**
+   * @brief Even round function FE(D,RK) = A(SL2(D ^ RK)) (section 2.4.1 of
+   * RFC 5794)
+   */
+  static void even_round(const uint8_t *data, const uint8_t *round_key,
+                         uint8_t *output) {
+    uint8_t t[16];
+    uint8_t s[16];
+    ctl::detail::xor_bytes(data, round_key, t, 16);
+    substitute2(t, s);
+    diffuse(s, output);
+  }
+
+  /**
+   * @brief Transforms one block with the given round keys (section 2.3.1 of
+   * RFC 5794)
+   *
+   * The last round has no diffusion layer, only SL2 and the key additions.
+   */
+  static void crypt(const uint8_t (&round_key)[round_key_count][16],
+                    const uint8_t *input, uint8_t *output) {
+    uint8_t state[16];
+    memcpy(state, input, sizeof(state));
+
+    for (size_t round = 1; round < rounds; ++round) {
+      if (round & 1)
+        odd_round(state, round_key[round - 1], state);
+      else
+        even_round(state, round_key[round - 1], state);
+    }
+
+    // C = SL2(P ^ ek{n}) ^ ek{n+1}
+    ctl::detail::xor_bytes(state, round_key[rounds - 1], state, 16);
+    substitute2(state, output);
+    ctl::detail::xor_bytes(output, round_key[rounds], output, 16);
+
+    ctl::detail::secure_zero(state, sizeof(state));
+  }
+
+  /**
+   * @brief Round keys for encryption
+   */
+  uint8_t ek_[round_key_count][16];
+
+  /**
+   * @brief Round keys for decryption
+   */
+  uint8_t dk_[round_key_count][16];
+};
+
+/**
+ * @brief ARIA-128
+ */
+typedef aria<128> aria128;
+
+/**
+ * @brief ARIA-192
+ */
+typedef aria<192> aria192;
+
+/**
+ * @brief ARIA-256
+ */
+typedef aria<256> aria256;
+
+} // namespace cipher
+} // namespace symmetric
+} // namespace ctl
