@@ -1,0 +1,83 @@
+/**
+ * @file cpu
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief Queries which instruction sets the running CPU supports
+ *
+ * The hardware accelerated path has to be chosen at run time rather than at
+ * compile time, because the same binary has to keep working on a CPU that does
+ * not support the acceleration.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <ctl/detail/config>
+
+#if defined(CTL_ARCH_X86)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#endif
+
+namespace ctl {
+namespace detail {
+namespace cpu {
+
+/**
+ * @brief Queries a bit of ECX from the basic CPUID leaf (1)
+ *
+ * Returns false when the target is not x86 or the query fails, so the caller
+ * always falls back to the software path.
+ *
+ * @param bit bit position to check
+ * @return true if the feature is supported
+ */
+inline bool feature_bit(unsigned int bit) {
+#if defined(CTL_ARCH_X86)
+#if defined(_MSC_VER)
+  int registers[4] = {0, 0, 0, 0};
+  __cpuid(registers, 1);
+  return ((static_cast<unsigned int>(registers[2]) >> bit) & 1u) != 0;
+#else
+  unsigned int eax = 0;
+  unsigned int ebx = 0;
+  unsigned int ecx = 0;
+  unsigned int edx = 0;
+  if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx))
+    return false;
+  return ((ecx >> bit) & 1u) != 0;
+#endif
+#else
+  (void)bit;
+  return false;
+#endif
+}
+
+/**
+ * @brief Whether the AES instruction set (AES-NI) is supported
+ *
+ * The query is performed once and the result is kept.
+ */
+inline bool has_aes() {
+  static const bool supported = feature_bit(25);
+  return supported;
+}
+
+/**
+ * @brief Whether carry-less multiplication (PCLMULQDQ) is supported
+ *
+ * Used to accelerate GHASH.
+ */
+inline bool has_carryless_multiply() {
+  static const bool supported = feature_bit(1);
+  return supported;
+}
+
+} // namespace cpu
+} // namespace detail
+} // namespace ctl

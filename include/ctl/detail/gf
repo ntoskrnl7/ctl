@@ -1,0 +1,141 @@
+/**
+ * @file gf
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief GF(2^8) finite field arithmetic
+ *
+ * The S-boxes of both AES and ARIA are defined as an affine transformation
+ * applied to the multiplicative inverse in GF(2^8). This header provides those
+ * operations as constexpr so that the definition can be evaluated at compile
+ * time. Nothing has to be transcribed into the source, which removes any
+ * possibility of a transcription error.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstdint>
+
+namespace ctl {
+namespace detail {
+namespace gf {
+
+/**
+ * @brief The irreducible polynomial shared by AES (FIPS 197) and ARIA
+ * (RFC 5794)
+ *
+ * x^8 + x^4 + x^3 + x + 1 (0x11b)
+ */
+inline constexpr uint16_t polynomial = 0x11b;
+
+/**
+ * @brief Multiplies by x in GF(2^8). (xtime in FIPS 197)
+ *
+ * @param a operand
+ * @return a * x
+ */
+constexpr uint8_t xtime(uint8_t a) {
+  return static_cast<uint8_t>((a << 1) ^
+                              ((a & 0x80) ? (polynomial & 0xff) : 0x00));
+}
+
+/**
+ * @brief Multiplication in GF(2^8)
+ *
+ * @param a operand
+ * @param b operand
+ * @return a * b
+ */
+constexpr uint8_t mul(uint8_t a, uint8_t b) {
+  uint8_t result = 0;
+  while (b) {
+    if (b & 1)
+      result ^= a;
+    a = xtime(a);
+    b = static_cast<uint8_t>(b >> 1);
+  }
+  return result;
+}
+
+/**
+ * @brief Exponentiation in GF(2^8)
+ *
+ * @param a base
+ * @param e exponent
+ * @return a^e
+ */
+constexpr uint8_t pow(uint8_t a, unsigned int e) {
+  uint8_t result = 1;
+  while (e) {
+    if (e & 1)
+      result = mul(result, a);
+    a = mul(a, a);
+    e >>= 1;
+  }
+  return result;
+}
+
+/**
+ * @brief Multiplicative inverse in GF(2^8)
+ *
+ * The multiplicative group has order 255, so a^254 == a^-1. Zero has no
+ * inverse, but the S-box definitions of AES and ARIA map it to zero.
+ *
+ * @param a operand
+ * @return a^-1, or 0 when a is 0
+ */
+constexpr uint8_t inverse(uint8_t a) { return a == 0 ? 0 : pow(a, 254); }
+
+/**
+ * @brief Rotates a byte left
+ *
+ * @param a operand
+ * @param n number of bits to rotate by
+ * @return the rotated value
+ */
+constexpr uint8_t rotl8(uint8_t a, unsigned int n) {
+  n &= 7;
+  return n == 0 ? a : static_cast<uint8_t>((a << n) | (a >> (8 - n)));
+}
+
+/**
+ * @brief Computes the parity of a byte
+ *
+ * @param v operand
+ * @return 1 if the number of set bits is odd, 0 otherwise
+ */
+constexpr uint8_t parity(uint8_t v) {
+  v = static_cast<uint8_t>(v ^ (v >> 4));
+  v = static_cast<uint8_t>(v ^ (v >> 2));
+  v = static_cast<uint8_t>(v ^ (v >> 1));
+  return static_cast<uint8_t>(v & 1);
+}
+
+/**
+ * @brief Multiplies an 8 bit vector by an 8x8 binary matrix and adds a
+ * constant vector
+ *
+ * This exists so that an affine transformation written as a matrix in a
+ * specification can be carried over directly. matrix[i] is the row producing
+ * bit i of the result, counting from the most significant bit, and the bits of
+ * each row select which bits of the input x are taken.
+ *
+ * @param matrix the binary matrix, one byte per row
+ * @param x input vector
+ * @param constant vector to exclusive or into the result
+ * @return the transformed value
+ */
+constexpr uint8_t affine(const uint8_t (&matrix)[8], uint8_t x,
+                         uint8_t constant) {
+  uint8_t result = 0;
+  for (unsigned int i = 0; i < 8; ++i)
+    result = static_cast<uint8_t>(
+        result | (parity(static_cast<uint8_t>(matrix[i] & x)) << (7 - i)));
+  return static_cast<uint8_t>(result ^ constant);
+}
+
+} // namespace gf
+} // namespace detail
+} // namespace ctl

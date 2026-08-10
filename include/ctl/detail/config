@@ -1,0 +1,81 @@
+/**
+ * @file config
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief Compiler and architecture detection
+ *
+ * Defines the macros used to conditionally compile the hardware accelerated
+ * paths. Define CTL_NO_HW_ACCEL to leave them out entirely.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+/**
+ * Whether the target is x86, either 32 or 64 bit
+ */
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) ||                 \
+    defined(__x86_64__)
+#define CTL_ARCH_X86 1
+#endif
+
+/**
+ * Whether the target is 64 bit ARM
+ */
+#if defined(_M_ARM64) || defined(__aarch64__)
+#define CTL_ARCH_ARM64 1
+#endif
+
+/**
+ * Whether the hardware accelerated paths are compiled in
+ *
+ * The accelerated paths implemented so far are AES-NI and PCLMULQDQ on x86.
+ * There is no ARMv8 Crypto Extensions path yet, so ARM targets use the
+ * software path only.
+ */
+#if defined(CTL_ARCH_X86) && !defined(CTL_NO_HW_ACCEL)
+#define CTL_HAS_X86_HW_ACCEL 1
+#endif
+
+/**
+ * Attribute that enables an instruction set for a single function
+ *
+ * GCC and Clang can select target instructions per function without -maes
+ * being passed globally. MSVC allows intrinsics unconditionally and needs no
+ * attribute.
+ */
+#if defined(CTL_HAS_X86_HW_ACCEL) &&                                           \
+    (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+#define CTL_TARGET_AESNI __attribute__((target("aes,sse2")))
+#define CTL_TARGET_PCLMUL __attribute__((target("pclmul,sse2")))
+#else
+#define CTL_TARGET_AESNI
+#define CTL_TARGET_PCLMUL
+#endif
+
+/**
+ * Whether the target is little endian
+ *
+ * On a little endian target the correspondence between byte strings and words
+ * matches the memory representation, so a word can be read or written in one
+ * go. The macro is left undefined where this cannot be determined, and the
+ * byte at a time path is used instead, which is correct for either byte order.
+ */
+#if defined(_WIN32) || defined(CTL_ARCH_X86) ||                                \
+    (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) &&            \
+     __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define CTL_LITTLE_ENDIAN 1
+#endif
+
+/**
+ * Forced inlining
+ */
+#if defined(_MSC_VER)
+#define CTL_FORCEINLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define CTL_FORCEINLINE inline __attribute__((always_inline))
+#else
+#define CTL_FORCEINLINE inline
+#endif

@@ -1,0 +1,125 @@
+/**
+ * @file sbox
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief S-boxes shared between ciphers
+ *
+ * The S-box of AES (FIPS 197) is the same table as SB1 of ARIA (RFC 5794),
+ * and its inverse is the same as SB3. Since both ciphers use the same table,
+ * it is generated once here and shared.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstdint>
+
+#include <ctl/detail/gf>
+
+namespace ctl {
+namespace detail {
+
+/**
+ * @brief An S-box together with its inverse
+ */
+struct sbox_pair {
+  /**
+   * @brief The substitution table
+   */
+  uint8_t forward[256];
+
+  /**
+   * @brief The inverse substitution table
+   */
+  uint8_t inverse[256];
+};
+
+/**
+ * @brief Checks whether a table is a permutation
+ *
+ * An S-box is by definition a permutation of 0..255. When a table is copied
+ * out of a specification, a single mistyped byte breaks that property, so
+ * asserting it with static_assert surfaces transcription errors at compile
+ * time.
+ *
+ * @param table table to check
+ * @return true if every value in 0..255 appears exactly once
+ */
+constexpr bool is_permutation(const uint8_t (&table)[256]) {
+  bool seen[256] = {};
+  for (unsigned int i = 0; i < 256; ++i) {
+    if (seen[table[i]])
+      return false;
+    seen[table[i]] = true;
+  }
+  return true;
+}
+
+/**
+ * @brief Derives the inverse of a substitution table and returns the pair
+ *
+ * @param table substitution table, which must be a permutation
+ * @return the table together with its inverse
+ */
+constexpr sbox_pair make_sbox_pair(const uint8_t (&table)[256]) {
+  sbox_pair pair = {};
+  for (unsigned int i = 0; i < 256; ++i)
+    pair.forward[i] = table[i];
+  for (unsigned int i = 0; i < 256; ++i)
+    pair.inverse[pair.forward[i]] = static_cast<uint8_t>(i);
+  return pair;
+}
+
+/**
+ * @brief Generates the AES S-box from its algebraic definition
+ *
+ * This carries over the definition in section 5.1.1 of FIPS 197 directly:
+ * S(x) = b ^ rotl(b,1) ^ rotl(b,2) ^ rotl(b,3) ^ rotl(b,4) ^ 0x63,
+ * where b = x^-1 in GF(2^8).
+ *
+ * @return the AES S-box together with its inverse
+ */
+constexpr sbox_pair make_aes_sbox() {
+  uint8_t forward[256] = {};
+  for (unsigned int i = 0; i < 256; ++i) {
+    const uint8_t b = gf::inverse(static_cast<uint8_t>(i));
+    forward[i] = static_cast<uint8_t>(b ^ gf::rotl8(b, 1) ^ gf::rotl8(b, 2) ^
+                                      gf::rotl8(b, 3) ^ gf::rotl8(b, 4) ^ 0x63);
+  }
+  return make_sbox_pair(forward);
+}
+
+/**
+ * @brief The AES S-box, which is ARIA SB1, together with its inverse, which is
+ * ARIA SB3
+ */
+inline constexpr sbox_pair aes_sbox = make_aes_sbox();
+
+static_assert(is_permutation(aes_sbox.forward), "AES S-box generation error");
+
+// The example in section 5.1.1 of FIPS 197: S({53}) == {ed}
+static_assert(aes_sbox.forward[0x53] == 0xed, "AES S-box generation error");
+static_assert(aes_sbox.inverse[0xed] == 0x53,
+              "AES inverse S-box generation error");
+
+// The two extreme entries of figure 7 of FIPS 197
+static_assert(aes_sbox.forward[0x00] == 0x63, "AES S-box generation error");
+static_assert(aes_sbox.forward[0xff] == 0x16, "AES S-box generation error");
+
+// The example in section 2.4.2 of RFC 5794: SB1(0x23) == 0x26. This confirms
+// against a value printed in the specification that ARIA SB1 is the AES S-box.
+static_assert(aes_sbox.forward[0x23] == 0x26, "ARIA SB1 mismatch");
+
+// The first row of the SB1 table of RFC 5794: 63 7c 77 7b ... ab 76
+static_assert(aes_sbox.forward[0x01] == 0x7c, "ARIA SB1 mismatch");
+static_assert(aes_sbox.forward[0x0f] == 0x76, "ARIA SB1 mismatch");
+
+// The first row of the SB3 table of RFC 5794: 52 09 6a d5 ... d7 fb
+static_assert(aes_sbox.inverse[0x00] == 0x52, "ARIA SB3 mismatch");
+static_assert(aes_sbox.inverse[0x01] == 0x09, "ARIA SB3 mismatch");
+static_assert(aes_sbox.inverse[0x0f] == 0xfb, "ARIA SB3 mismatch");
+
+} // namespace detail
+} // namespace ctl
