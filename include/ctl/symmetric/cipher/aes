@@ -431,6 +431,105 @@ public:
   }
 
   /**
+   * @brief Encrypts several blocks with a per block mask applied on both sides
+   *
+   * Computes output[i] = E(input[i] ^ mask[i]) ^ mask[i]. Whitening a block on
+   * the way in and on the way out with the same value is what tweakable modes
+   * such as XTS do, and having it here lets the whole thing happen in registers.
+   * Done separately, the caller would have to write the masked input to a buffer,
+   * let the cipher read and write that buffer, then read it back to unmask,
+   * which is more than twice the memory traffic.
+   *
+   * @param input input of count * block_size bytes
+   * @param mask masks of count * block_size bytes
+   * @param output output of count * block_size bytes, may be the same as input
+   * @param count number of blocks
+   */
+  void encrypt_blocks_masked(const uint8_t *input, const uint8_t *mask,
+                             uint8_t *output, size_t count) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (hardware_) {
+      size_t i = 0;
+      for (; i + preferred_batch <= count; i += preferred_batch)
+        wide_masked_aes_ni<preferred_batch, true, true>(
+            input + i * block_size, mask + i * block_size,
+            output + i * block_size);
+      for (; i < count; ++i)
+        block_masked<true>(input + i * block_size, mask + i * block_size,
+                           output + i * block_size);
+      return;
+    }
+#endif
+    for (size_t i = 0; i < count; ++i)
+      block_masked<true>(input + i * block_size, mask + i * block_size,
+                         output + i * block_size);
+  }
+
+  /**
+   * @brief Decrypts several blocks with a per block mask applied on both sides
+   *
+   * Computes output[i] = D(input[i] ^ mask[i]) ^ mask[i].
+   *
+   * @param input input of count * block_size bytes
+   * @param mask masks of count * block_size bytes
+   * @param output output of count * block_size bytes, may be the same as input
+   * @param count number of blocks
+   */
+  void decrypt_blocks_masked(const uint8_t *input, const uint8_t *mask,
+                             uint8_t *output, size_t count) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (hardware_) {
+      size_t i = 0;
+      for (; i + preferred_batch <= count; i += preferred_batch)
+        wide_masked_aes_ni<preferred_batch, false, true>(
+            input + i * block_size, mask + i * block_size,
+            output + i * block_size);
+      for (; i < count; ++i)
+        block_masked<false>(input + i * block_size, mask + i * block_size,
+                            output + i * block_size);
+      return;
+    }
+#endif
+    for (size_t i = 0; i < count; ++i)
+      block_masked<false>(input + i * block_size, mask + i * block_size,
+                          output + i * block_size);
+  }
+
+  /**
+   * @brief Encrypts several blocks and exclusive ors the results with a buffer
+   *
+   * Computes output[i] = E(input[i]) ^ operand[i]. Encrypting counter blocks
+   * and combining the result with the data is what counter based modes do, and
+   * having it here keeps the key stream in registers instead of writing it to a
+   * buffer that then has to be read back.
+   *
+   * @param input input of count * block_size bytes, the counter blocks
+   * @param operand buffer of count * block_size bytes to combine with
+   * @param output output of count * block_size bytes, may be the same as
+   * operand
+   * @param count number of blocks
+   */
+  void encrypt_blocks_then_xor(const uint8_t *input, const uint8_t *operand,
+                               uint8_t *output, size_t count) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (hardware_) {
+      size_t i = 0;
+      for (; i + preferred_batch <= count; i += preferred_batch)
+        wide_masked_aes_ni<preferred_batch, true, false>(
+            input + i * block_size, operand + i * block_size,
+            output + i * block_size);
+      for (; i < count; ++i)
+        block_then_xor(input + i * block_size, operand + i * block_size,
+                       output + i * block_size);
+      return;
+    }
+#endif
+    for (size_t i = 0; i < count; ++i)
+      block_then_xor(input + i * block_size, operand + i * block_size,
+                     output + i * block_size);
+  }
+
+  /**
    * @brief Decrypts one block using the table based software path
    *
    * @param input input block of block_size bytes
@@ -575,6 +674,33 @@ private:
            (static_cast<uint32_t>(r2) << 8) | static_cast<uint32_t>(r3);
   }
 
+  /**
+   * @brief Transforms one block with a mask applied on both sides
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   */
+  template <bool _Encrypt>
+  void block_masked(const uint8_t *input, const uint8_t *mask,
+                    uint8_t *output) const {
+    uint8_t buffer[block_size];
+    ctl::detail::xor_block<block_size>(input, mask, buffer);
+    if constexpr (_Encrypt)
+      encrypt_block(buffer, buffer);
+    else
+      decrypt_block(buffer, buffer);
+    ctl::detail::xor_block<block_size>(buffer, mask, output);
+  }
+
+  /**
+   * @brief Encrypts one block and exclusive ors the result with a buffer
+   */
+  void block_then_xor(const uint8_t *input, const uint8_t *operand,
+                      uint8_t *output) const {
+    uint8_t buffer[block_size];
+    encrypt_block(input, buffer);
+    ctl::detail::xor_block<block_size>(buffer, operand, output);
+  }
+
 #if defined(CTL_HAS_X86_HW_ACCEL)
   /**
    * @brief Encrypts one block with AES-NI
@@ -675,6 +801,66 @@ private:
       state[w] = _mm_aesdeclast_si128(state[w], key);
       _mm_storeu_si128(reinterpret_cast<__m128i *>(output + w * block_size),
                        state[w]);
+    }
+  }
+
+  /**
+   * @brief Transforms _Width blocks with AES-NI, applying a mask on both sides
+   *
+   * Everything stays in vector registers between the two exclusive ors, so the
+   * masked value is never written to memory.
+   *
+   * @tparam _Width number of blocks to interleave
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   * @tparam _MaskInput true to apply the mask on the way in as well, which is
+   * what a tweakable mode needs; false to apply it only on the way out, which
+   * is what a counter based mode needs
+   */
+  template <size_t _Width, bool _Encrypt, bool _MaskInput>
+  CTL_TARGET_AESNI void wide_masked_aes_ni(const uint8_t *input,
+                                           const uint8_t *mask,
+                                           uint8_t *output) const {
+    const uint8_t *rk_bytes = _Encrypt ? ek_bytes_ : dk_bytes_;
+    const __m128i *rk = reinterpret_cast<const __m128i *>(rk_bytes);
+
+    __m128i state[_Width];
+    __m128i key = _mm_loadu_si128(rk);
+    for (size_t w = 0; w < _Width; ++w) {
+      const __m128i data = _mm_loadu_si128(
+          reinterpret_cast<const __m128i *>(input + w * block_size));
+      if constexpr (_MaskInput) {
+        const __m128i m = _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(mask + w * block_size));
+        state[w] = _mm_xor_si128(_mm_xor_si128(data, m), key);
+      } else {
+        state[w] = _mm_xor_si128(data, key);
+      }
+    }
+
+    for (size_t round = 1; round < rounds; ++round) {
+      key = _mm_loadu_si128(rk + round);
+      for (size_t w = 0; w < _Width; ++w) {
+        if constexpr (_Encrypt)
+          state[w] = _mm_aesenc_si128(state[w], key);
+        else
+          state[w] = _mm_aesdec_si128(state[w], key);
+      }
+    }
+
+    key = _mm_loadu_si128(rk + rounds);
+    for (size_t w = 0; w < _Width; ++w) {
+      if constexpr (_Encrypt)
+        state[w] = _mm_aesenclast_si128(state[w], key);
+      else
+        state[w] = _mm_aesdeclast_si128(state[w], key);
+      // The mask is reloaded rather than held in a register. Keeping _Width
+      // masks alongside _Width states would need more than the sixteen vector
+      // registers available and force spilling, which costs more than the
+      // reload does.
+      const __m128i m = _mm_loadu_si128(
+          reinterpret_cast<const __m128i *>(mask + w * block_size));
+      _mm_storeu_si128(reinterpret_cast<__m128i *>(output + w * block_size),
+                       _mm_xor_si128(state[w], m));
     }
   }
 #endif

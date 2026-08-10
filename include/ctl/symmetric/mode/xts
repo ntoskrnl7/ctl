@@ -144,8 +144,10 @@ public:
     if (size_error(size, status))
       return ext::err(status);
 
-    uint8_t t[block_size];
-    tweak_cipher_.encrypt_block(&tweak[0], t);
+    uint8_t encrypted_tweak[block_size];
+    tweak_cipher_.encrypt_block(&tweak[0], encrypted_tweak);
+    tweak_state t = load_tweak(encrypted_tweak);
+    ctl::detail::secure_zero(encrypted_tweak, sizeof(encrypted_tweak));
 
     const size_t remainder = size % block_size;
     // When ciphertext stealing is needed, the last whole block is handled
@@ -163,7 +165,7 @@ public:
       // is used to fill out the partial plaintext.
       uint8_t stolen[block_size];
       transform<true>(input + last, t, stolen);
-      multiply_alpha(t);
+      advance(t);
 
       // All of the input is read before any output is written, which is what
       // makes operating in place safe.
@@ -178,7 +180,7 @@ public:
       ctl::detail::secure_zero(combined, sizeof(combined));
     }
 
-    ctl::detail::secure_zero(t, sizeof(t));
+    ctl::detail::secure_zero(&t, sizeof(t));
     return ext::ok<void>();
   }
 
@@ -197,8 +199,10 @@ public:
     if (size_error(size, status))
       return ext::err(status);
 
-    uint8_t t[block_size];
-    tweak_cipher_.encrypt_block(&tweak[0], t);
+    uint8_t encrypted_tweak[block_size];
+    tweak_cipher_.encrypt_block(&tweak[0], encrypted_tweak);
+    tweak_state t = load_tweak(encrypted_tweak);
+    ctl::detail::secure_zero(encrypted_tweak, sizeof(encrypted_tweak));
 
     const size_t remainder = size % block_size;
     const size_t whole = remainder == 0 ? size / block_size
@@ -211,9 +215,8 @@ public:
 
       // During encryption the last whole block was produced with the next
       // tweak along, so decryption has to use that same tweak.
-      uint8_t next[block_size];
-      memcpy(next, t, block_size);
-      multiply_alpha(next);
+      tweak_state next = t;
+      advance(next);
 
       uint8_t stolen[block_size];
       transform<false>(input + last, next, stolen);
@@ -225,12 +228,12 @@ public:
       transform<false>(combined, t, output + last);
       memcpy(output + last + block_size, stolen, remainder);
 
-      ctl::detail::secure_zero(next, sizeof(next));
+      ctl::detail::secure_zero(&next, sizeof(next));
       ctl::detail::secure_zero(stolen, sizeof(stolen));
       ctl::detail::secure_zero(combined, sizeof(combined));
     }
 
-    ctl::detail::secure_zero(t, sizeof(t));
+    ctl::detail::secure_zero(&t, sizeof(t));
     return ext::ok<void>();
   }
 
@@ -281,6 +284,66 @@ public:
   }
 
 private:
+  /**
+   * @brief A tweak held as two 64 bit halves rather than as bytes
+   *
+   * The tweaks of consecutive blocks form a serial chain, since each one is the
+   * previous one multiplied by alpha. Keeping the value in a byte array means
+   * every step of that chain stores and then reloads it, and the latency of
+   * that round trip lands directly on the critical path. Holding the two halves
+   * as values lets the whole chain stay in registers.
+   */
+  struct tweak_state {
+    /**
+     * @brief The low half, that is the first eight bytes
+     */
+    uint64_t low;
+
+    /**
+     * @brief The high half, that is the last eight bytes
+     */
+    uint64_t high;
+  };
+
+  /**
+   * @brief Reads a tweak from a byte string
+   */
+  static tweak_state load_tweak(const uint8_t *value) {
+    tweak_state t;
+    t.low = ctl::detail::load_le64(value);
+    t.high = ctl::detail::load_le64(value + 8);
+    return t;
+  }
+
+  /**
+   * @brief Writes a tweak out as a byte string
+   */
+  static void store_tweak(const tweak_state &t, uint8_t *value) {
+    ctl::detail::store_le64(t.low, value);
+    ctl::detail::store_le64(t.high, value + 8);
+  }
+
+  /**
+   * @brief Multiplies the tweak by the primitive element alpha
+   *
+   * The irreducible polynomial of GF(2^128) is x^128 + x^7 + x^2 + x + 1, and
+   * XTS interprets the byte string as little endian, which makes this a shift
+   * left by one bit with 0x87 folded into the lowest byte when a bit is carried
+   * out.
+   *
+   * A mask is used rather than a branch when folding 0x87 back in, so the
+   * running time does not depend on the value of the tweak, which is derived
+   * from the key.
+   *
+   * @param t the tweak, advanced in place
+   */
+  static void advance(tweak_state &t) {
+    const uint64_t low = t.low;
+    const uint64_t carry = t.high >> 63;
+    t.high = (t.high << 1) | (low >> 63);
+    t.low = (low << 1) ^ (0x87ull & (0ull - carry));
+  }
+
   /**
    * @brief Checks the key length, relying on the order in which the members of
    * the constructor are initialized
@@ -335,40 +398,42 @@ private:
    * @param output output, may be the same as input
    */
   template <bool _Encrypt>
-  void transform_blocks(const uint8_t *input, size_t count, uint8_t *t,
+  void transform_blocks(const uint8_t *input, size_t count, tweak_state &t,
                         uint8_t *output) const {
     uint8_t tweaks[batch_blocks * block_size];
-    uint8_t staging[batch_blocks * block_size];
 
     size_t j = 0;
     while (data_cipher_.prefers_batching() && j + batch_blocks <= count) {
+      // The chain of alpha multiplications runs entirely in registers here;
+      // only the resulting tweak of each block is written out, since that is
+      // what the cipher needs as the mask.
       for (size_t b = 0; b < batch_blocks; ++b) {
-        memcpy(tweaks + b * block_size, t, block_size);
-        ctl::detail::xor_block<block_size>(input + (j + b) * block_size, t,
-                                          staging + b * block_size);
-        multiply_alpha(t);
+        store_tweak(t, tweaks + b * block_size);
+        advance(t);
       }
 
+      // Handing the masks to the cipher rather than applying them here keeps
+      // the masked values in registers. Doing it separately would mean writing
+      // the masked input to a buffer, letting the cipher read and write that
+      // buffer, and reading it back to unmask.
       if constexpr (_Encrypt)
-        data_cipher_.encrypt_blocks(staging, staging, batch_blocks);
+        data_cipher_.encrypt_blocks_masked(input + j * block_size, tweaks,
+                                          output + j * block_size,
+                                          batch_blocks);
       else
-        data_cipher_.decrypt_blocks(staging, staging, batch_blocks);
-
-      for (size_t b = 0; b < batch_blocks; ++b)
-        ctl::detail::xor_block<block_size>(staging + b * block_size,
-                                          tweaks + b * block_size,
-                                          output + (j + b) * block_size);
+        data_cipher_.decrypt_blocks_masked(input + j * block_size, tweaks,
+                                          output + j * block_size,
+                                          batch_blocks);
       j += batch_blocks;
     }
 
     // Blocks left over that do not fill a batch
     for (; j < count; ++j) {
       transform<_Encrypt>(input + j * block_size, t, output + j * block_size);
-      multiply_alpha(t);
+      advance(t);
     }
 
     ctl::detail::secure_zero(tweaks, sizeof(tweaks));
-    ctl::detail::secure_zero(staging, sizeof(staging));
   }
 
   /**
@@ -379,43 +444,21 @@ private:
    * @tparam _Encrypt true to encrypt, false to decrypt
    */
   template <bool _Encrypt>
-  void transform(const uint8_t *input, const uint8_t *t,
+  void transform(const uint8_t *input, const tweak_state &t,
                  uint8_t *output) const {
+    uint8_t mask[block_size];
+    store_tweak(t, mask);
     uint8_t buffer[block_size];
-    ctl::detail::xor_block<block_size>(input, t, buffer);
+    ctl::detail::xor_block<block_size>(input, mask, buffer);
     if constexpr (_Encrypt)
       data_cipher_.encrypt_block(buffer, buffer);
     else
       data_cipher_.decrypt_block(buffer, buffer);
-    ctl::detail::xor_block<block_size>(buffer, t, output);
+    ctl::detail::xor_block<block_size>(buffer, mask, output);
     // buffer is deliberately not erased. What it holds is derived from the
     // plaintext or ciphertext the caller already has, so erasing it gains
     // nothing, and a volatile write per block would only cost throughput. Key
     // material is managed by the block cipher and by the tweak handling.
-  }
-
-  /**
-   * @brief Multiplies the tweak by the primitive element alpha
-   *
-   * The irreducible polynomial of GF(2^128) is x^128 + x^7 + x^2 + x + 1, and
-   * XTS interprets the byte string as little endian. The value is therefore
-   * shifted left by one bit and 0x87 is exclusive ored into byte 0 when a bit
-   * is carried out.
-   *
-   * @param value the tweak, block_size bytes, updated in place
-   */
-  static void multiply_alpha(uint8_t *value) {
-    // Little endian means the first eight bytes are the low word. Both words
-    // have to be read before either is written.
-    const uint64_t low = ctl::detail::load_le64(value);
-    const uint64_t high = ctl::detail::load_le64(value + 8);
-
-    // A mask is used rather than a branch when folding 0x87 back in, so the
-    // running time does not depend on the value of the tweak, which is derived
-    // from the key.
-    const uint64_t carry = high >> 63;
-    ctl::detail::store_le64((low << 1) ^ (0x87ull & (0ull - carry)), value);
-    ctl::detail::store_le64((high << 1) | (low >> 63), value + 8);
   }
 
   /**

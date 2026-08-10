@@ -325,7 +325,78 @@ public:
       crypt(dk_, input + i * block_size, output + i * block_size);
   }
 
+  /**
+   * @brief Encrypts several blocks with a per block mask applied on both sides
+   *
+   * Computes output[i] = E(input[i] ^ mask[i]) ^ mask[i], which is what
+   * tweakable modes such as XTS need. ARIA has no hardware path, so this simply
+   * iterates; the interface exists so that a mode works with any block cipher
+   * through the same code.
+   *
+   * @param input input of count * block_size bytes
+   * @param mask masks of count * block_size bytes
+   * @param output output of count * block_size bytes, may be the same as input
+   * @param count number of blocks
+   */
+  void encrypt_blocks_masked(const uint8_t *input, const uint8_t *mask,
+                             uint8_t *output, size_t count) const {
+    for (size_t i = 0; i < count; ++i)
+      block_masked(ek_, input + i * block_size, mask + i * block_size,
+                   output + i * block_size);
+  }
+
+  /**
+   * @brief Decrypts several blocks with a per block mask applied on both sides
+   *
+   * Computes output[i] = D(input[i] ^ mask[i]) ^ mask[i].
+   *
+   * @param input input of count * block_size bytes
+   * @param mask masks of count * block_size bytes
+   * @param output output of count * block_size bytes, may be the same as input
+   * @param count number of blocks
+   */
+  void decrypt_blocks_masked(const uint8_t *input, const uint8_t *mask,
+                             uint8_t *output, size_t count) const {
+    for (size_t i = 0; i < count; ++i)
+      block_masked(dk_, input + i * block_size, mask + i * block_size,
+                   output + i * block_size);
+  }
+
+  /**
+   * @brief Encrypts several blocks and exclusive ors the results with a buffer
+   *
+   * Computes output[i] = E(input[i]) ^ operand[i], which is what counter based
+   * modes need.
+   *
+   * @param input input of count * block_size bytes, the counter blocks
+   * @param operand buffer of count * block_size bytes to combine with
+   * @param output output of count * block_size bytes, may be the same as
+   * operand
+   * @param count number of blocks
+   */
+  void encrypt_blocks_then_xor(const uint8_t *input, const uint8_t *operand,
+                               uint8_t *output, size_t count) const {
+    for (size_t i = 0; i < count; ++i) {
+      uint8_t buffer[block_size];
+      crypt(ek_, input + i * block_size, buffer);
+      ctl::detail::xor_block<block_size>(buffer, operand + i * block_size,
+                                        output + i * block_size);
+    }
+  }
+
 private:
+  /**
+   * @brief Transforms one block with a mask applied on both sides
+   */
+  static void block_masked(const uint8_t (&round_key)[round_key_count][16],
+                           const uint8_t *input, const uint8_t *mask,
+                           uint8_t *output) {
+    uint8_t buffer[block_size];
+    ctl::detail::xor_block<block_size>(input, mask, buffer);
+    crypt(round_key, buffer, buffer);
+    ctl::detail::xor_block<block_size>(buffer, mask, output);
+  }
+
   /**
    * @brief Selects CK1, CK2 and CK3 according to the key size (section 2.2 of
    * RFC 5794)

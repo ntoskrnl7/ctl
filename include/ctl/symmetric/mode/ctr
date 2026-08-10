@@ -99,10 +99,12 @@ public:
    */
   void crypt(const nonce_t &nonce, offset_t byte_offset, const uint8_t *input,
              size_t size, uint8_t *output) const {
-    uint8_t counter[block_size];
-    memcpy(counter, &nonce[0], block_size);
+    counter_state counter = load_counter(&nonce[0]);
     increment(counter, byte_offset / block_size);
 
+    // The counter itself lives in registers; this is where it is materialized
+    // for the calls that take a single block.
+    uint8_t block[block_size];
     uint8_t keystream[block_size];
     size_t i = 0;
 
@@ -110,7 +112,8 @@ public:
     // partway into the key stream.
     const size_t position = static_cast<size_t>(byte_offset % block_size);
     if (position != 0) {
-      cipher_.encrypt_block(counter, keystream);
+      store_counter(counter, block);
+      cipher_.encrypt_block(block, keystream);
       increment(counter, 1);
       const size_t available = block_size - position;
       const size_t count = available < size ? available : size;
@@ -121,53 +124,93 @@ public:
     // Over the block aligned stretch, several counter blocks are prepared and
     // encrypted at once. Key stream blocks are mutually independent, so they
     // can be interleaved on a hardware path.
-    uint8_t batch[batch_blocks * block_size];
-    for (; cipher_.prefers_batching() && i + sizeof(batch) <= size;
-         i += sizeof(batch)) {
+    uint8_t counters[batch_blocks * block_size];
+    for (; cipher_.prefers_batching() && i + sizeof(counters) <= size;
+         i += sizeof(counters)) {
       for (size_t b = 0; b < batch_blocks; ++b) {
-        memcpy(batch + b * block_size, counter, block_size);
+        store_counter(counter, counters + b * block_size);
         increment(counter, 1);
       }
-      cipher_.encrypt_blocks(batch, batch, batch_blocks);
-      ctl::detail::xor_bytes(input + i, batch, output + i, sizeof(batch));
+      // Combining with the data inside the cipher keeps the key stream in
+      // registers. Generating it into a buffer first would mean writing it out
+      // and reading it back just to exclusive or it.
+      cipher_.encrypt_blocks_then_xor(counters, input + i, output + i,
+                                      batch_blocks);
     }
 
     // Whole blocks left over that do not fill a batch
     for (; i + block_size <= size; i += block_size) {
-      cipher_.encrypt_block(counter, keystream);
+      store_counter(counter, block);
+      cipher_.encrypt_block(block, keystream);
       increment(counter, 1);
       ctl::detail::xor_block<block_size>(input + i, keystream, output + i);
     }
 
     // The partial block at the end
     if (i < size) {
-      cipher_.encrypt_block(counter, keystream);
+      store_counter(counter, block);
+      cipher_.encrypt_block(block, keystream);
       ctl::detail::xor_bytes(input + i, keystream, output + i, size - i);
     }
 
-    ctl::detail::secure_zero(batch, sizeof(batch));
+    ctl::detail::secure_zero(counters, sizeof(counters));
     ctl::detail::secure_zero(keystream, sizeof(keystream));
-    ctl::detail::secure_zero(counter, sizeof(counter));
+    ctl::detail::secure_zero(block, sizeof(block));
+    ctl::detail::secure_zero(&counter, sizeof(counter));
   }
 
 private:
   /**
+   * @brief A counter block held as two 64 bit halves rather than as bytes
+   *
+   * The counter advances once per block and each step depends on the previous
+   * one. Propagating the carry a byte at a time through an array puts sixteen
+   * dependent load, add and store steps on that path for every block. Holding
+   * the two halves as values turns the whole thing into a pair of additions.
+   */
+  struct counter_state {
+    /**
+     * @brief The high half, that is the first eight bytes
+     */
+    uint64_t high;
+
+    /**
+     * @brief The low half, that is the last eight bytes
+     */
+    uint64_t low;
+  };
+
+  /**
+   * @brief Reads a counter block from a byte string
+   */
+  static counter_state load_counter(const uint8_t *value) {
+    counter_state c;
+    c.high = ctl::detail::load_be64(value);
+    c.low = ctl::detail::load_be64(value + 8);
+    return c;
+  }
+
+  /**
+   * @brief Writes a counter block out as a byte string
+   */
+  static void store_counter(const counter_state &c, uint8_t *value) {
+    ctl::detail::store_be64(c.high, value);
+    ctl::detail::store_be64(c.low, value + 8);
+  }
+
+  /**
    * @brief Increments the counter block
    *
-   * The whole block is treated as a single big endian integer, so the carry has
-   * to propagate in units of eight bits.
+   * The whole block is a single big endian integer. Adding to the low half
+   * carries into the high half exactly when the sum wraps, which is detected
+   * without a branch.
    *
-   * @param counter counter block of block_size bytes
+   * @param c counter block, advanced in place
    * @param added value to add
    */
-  static void increment(uint8_t *counter, uint64_t added) {
-    size_t n = block_size;
-    do {
-      --n;
-      added += counter[n];
-      counter[n] = static_cast<uint8_t>(added);
-      added >>= 8;
-    } while (n);
+  static void increment(counter_state &c, uint64_t added) {
+    c.low += added;
+    c.high += (c.low < added) ? 1u : 0u;
   }
 
   cipher_type cipher_;
