@@ -1,0 +1,727 @@
+/**
+ * @file aes
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief AES block cipher (FIPS 197)
+ *
+ * Follows the NIST FIPS 197 specification. Neither the S-box nor the round
+ * transformation tables are written out in the source; they are generated at
+ * compile time from the algebraic definition given in the specification, that
+ * is the multiplicative inverse in GF(2^8) followed by an affine
+ * transformation. Since no table is transcribed, a transcription error is not
+ * possible, and a few values stated in the specification are checked with
+ * static_assert so that a faulty generation is caught at compile time.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+
+#include <ctl/detail/config>
+#include <ctl/detail/cpu>
+#include <ctl/detail/endian>
+#include <ctl/detail/gf>
+#include <ctl/detail/memory>
+#include <ctl/detail/sbox>
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <immintrin.h>
+#endif
+#endif
+
+namespace ctl {
+namespace symmetric {
+namespace cipher {
+
+namespace aes_detail {
+
+/**
+ * @brief The round transformation tables used by AES
+ *
+ * The S-box itself is shared with ARIA and therefore lives in
+ * ctl/detail/sbox.
+ */
+struct tables {
+  /**
+   * @brief Round transformation table for encryption, folding together
+   * SubBytes, ShiftRows and MixColumns
+   *
+   * te[r] holds the contribution a byte in row r makes to a column. The
+   * columns of the MixColumns matrix rotate by one byte per row, so the
+   * relation te[r] == rotr32(te[0], 8r) holds.
+   */
+  uint32_t te[4][256];
+
+  /**
+   * @brief Round transformation table for decryption, folding together
+   * InvSubBytes, InvShiftRows and InvMixColumns
+   */
+  uint32_t td[4][256];
+};
+
+/**
+ * @brief Generates the round transformation tables from the matrices given in
+ * the specification
+ *
+ * @return the generated tables
+ */
+constexpr tables make_tables() {
+  using ctl::detail::gf::mul;
+  tables t = {};
+
+  for (unsigned int i = 0; i < 256; ++i) {
+    // First column of the MixColumns matrix: [02 01 01 03]
+    const uint8_t s = ctl::detail::aes_sbox.forward[i];
+    t.te[0][i] = (static_cast<uint32_t>(mul(s, 0x02)) << 24) |
+                 (static_cast<uint32_t>(s) << 16) |
+                 (static_cast<uint32_t>(s) << 8) |
+                 static_cast<uint32_t>(mul(s, 0x03));
+
+    // First column of the InvMixColumns matrix: [0e 09 0d 0b]
+    const uint8_t is = ctl::detail::aes_sbox.inverse[i];
+    t.td[0][i] = (static_cast<uint32_t>(mul(is, 0x0e)) << 24) |
+                 (static_cast<uint32_t>(mul(is, 0x09)) << 16) |
+                 (static_cast<uint32_t>(mul(is, 0x0d)) << 8) |
+                 static_cast<uint32_t>(mul(is, 0x0b));
+
+    for (unsigned int r = 1; r < 4; ++r) {
+      t.te[r][i] = ctl::detail::rotr32(t.te[0][i], 8 * r);
+      t.td[r][i] = ctl::detail::rotr32(t.td[0][i], 8 * r);
+    }
+  }
+
+  return t;
+}
+
+/**
+ * @brief The tables generated at compile time
+ */
+inline constexpr tables table = make_tables();
+
+// Checked against the first entries of Te0 and Td0 as they appear in widely
+// cited AES reference implementations. A mistake in the GF(2^8) multiplication
+// or in the layout of the matrices makes compilation fail here.
+// Te0[0] = (02*S(0), S(0), S(0), 03*S(0)) = (c6, 63, 63, a5)
+static_assert(table.te[0][0x00] == 0xc66363a5u, "AES Te table generation error");
+// Td0[0] = (0e*Si(0), 09*Si(0), 0d*Si(0), 0b*Si(0)) = (51, f4, a7, 50)
+static_assert(table.td[0][0x00] == 0x51f4a750u, "AES Td table generation error");
+// The relation te[r] == rotr32(te[0], 8r)
+static_assert(table.te[1][0x00] == 0xa5c66363u, "AES Te table rotation error");
+
+} // namespace aes_detail
+
+/**
+ * @brief AES block cipher (FIPS 197)
+ *
+ * The block size is fixed at 128 bits and only the key length is selected. Any
+ * byte string is a valid key, so setting a key cannot fail and the result is
+ * not wrapped in a result type. Checks that can fail, such as length
+ * constraints, are performed by the modes of operation.
+ *
+ * @tparam _KeyBits key size in bits (128, 192 or 256)
+ */
+template <size_t _KeyBits = 128> class aes {
+  static_assert(_KeyBits == 128 || _KeyBits == 192 || _KeyBits == 256,
+                "AES supports only 128, 192 and 256 bit keys. (FIPS 197)");
+
+public:
+  /**
+   * @brief Block size in bits
+   */
+  static constexpr size_t block_bits = 128;
+
+  /**
+   * @brief Block size in bytes
+   */
+  static constexpr size_t block_size = block_bits / 8;
+
+  /**
+   * @brief Key size in bits
+   */
+  static constexpr size_t key_bits = _KeyBits;
+
+  /**
+   * @brief Key size in bytes
+   */
+  static constexpr size_t key_size = key_bits / 8;
+
+  /**
+   * @brief Number of rounds (table 2 of FIPS 197: Nr = Nk + 6)
+   */
+  static constexpr size_t rounds = key_bits / 32 + 6;
+
+  static_assert(rounds == (_KeyBits == 128 ? 10 : (_KeyBits == 192 ? 12 : 14)),
+                "AES round count computation error");
+
+  /**
+   * @brief Number of key words (Nk in FIPS 197)
+   */
+  static constexpr size_t key_words = key_size / 4;
+
+  /**
+   * @brief Number of words in the expanded round key
+   */
+  static constexpr size_t round_key_words = 4 * (rounds + 1);
+
+  /**
+   * @brief A good number of blocks to process in one batch
+   *
+   * Modes of operation use this to size their staging buffers. It is large
+   * enough to hide the latency of AESENC while still allowing all of the state
+   * to be held in registers.
+   */
+  static constexpr size_t preferred_batch = 8;
+
+  /**
+   * @brief Key type
+   */
+  typedef uint8_t key_t[key_size];
+
+  /**
+   * @brief Block type
+   */
+  typedef uint8_t block_t[block_size];
+
+  /**
+   * @brief Initializes with a key whose length is checked at compile time
+   *
+   * @param key the key
+   */
+  explicit aes(const key_t &key) { set_key(&key[0]); }
+
+  /**
+   * @brief Initializes with a key held in a run time buffer
+   *
+   * The length is taken as well for two reasons. It keeps this overload from
+   * being ambiguous with the one above that takes an array, and it prevents a
+   * short buffer from being read past its end so that uninitialized memory is
+   * used as key material.
+   *
+   * @param key key buffer
+   * @param size size of the key buffer, which must be at least key_size
+   * @exception std::invalid_argument if size is smaller than key_size
+   */
+  aes(const uint8_t *key, size_t size) {
+    if (size < key_size)
+      throw std::invalid_argument("ctl::symmetric::cipher::aes : "
+                                  "key buffer is shorter than the key length.");
+    set_key(key);
+  }
+
+  /**
+   * @brief Erases the round keys on destruction
+   */
+  ~aes() {
+    ctl::detail::secure_zero(ek_, sizeof(ek_));
+    ctl::detail::secure_zero(dk_, sizeof(dk_));
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    ctl::detail::secure_zero(ek_bytes_, sizeof(ek_bytes_));
+    ctl::detail::secure_zero(dk_bytes_, sizeof(dk_bytes_));
+#endif
+  }
+
+  /**
+   * @brief Sets the key again (KeyExpansion, section 5.2 of FIPS 197)
+   *
+   * @param key must hold at least key_size bytes
+   */
+  void set_key(const uint8_t *key) {
+    for (size_t i = 0; i < key_words; ++i)
+      ek_[i] = ctl::detail::load_be32(key + 4 * i);
+
+    // Rcon[i] = x^(i-1), so the values are obtained by repeatedly applying
+    // xtime starting from 1.
+    uint8_t rc = 0x01;
+    for (size_t i = key_words; i < round_key_words; ++i) {
+      uint32_t temp = ek_[i - 1];
+      if (i % key_words == 0) {
+        temp = sub_word(ctl::detail::rotl32(temp, 8)) ^
+               (static_cast<uint32_t>(rc) << 24);
+        rc = ctl::detail::gf::xtime(rc);
+      } else if constexpr (key_words > 6) {
+        // The additional SubWord step that only AES-256 has.
+        if (i % key_words == 4)
+          temp = sub_word(temp);
+      }
+      ek_[i] = ek_[i - key_words] ^ temp;
+    }
+
+    // Decryption uses the equivalent inverse cipher (section 5.3.5 of
+    // FIPS 197). The round keys are laid out in reverse order and
+    // InvMixColumns is applied ahead of time to every round key except the
+    // first and the last.
+    for (size_t r = 0; r <= rounds; ++r)
+      for (size_t c = 0; c < 4; ++c)
+        dk_[4 * r + c] = ek_[4 * (rounds - r) + c];
+
+    for (size_t r = 1; r < rounds; ++r)
+      for (size_t c = 0; c < 4; ++c)
+        dk_[4 * r + c] = inv_mix_column(dk_[4 * r + c]);
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    // The hardware path loads round keys in byte order, so a separate copy is
+    // prepared. The decryption round keys of the equivalent inverse cipher
+    // match exactly what the AESDEC instruction expects and can be used as
+    // they are.
+    hardware_ = ctl::detail::cpu::has_aes();
+    if (hardware_) {
+      for (size_t i = 0; i < round_key_words; ++i) {
+        ctl::detail::store_be32(ek_[i], ek_bytes_ + 4 * i);
+        ctl::detail::store_be32(dk_[i], dk_bytes_ + 4 * i);
+      }
+    }
+#endif
+  }
+
+  /**
+   * @brief Encrypts one block
+   *
+   * On a CPU that supports AES-NI the hardware path is used. Support is
+   * determined once when the key is set and kept, so CPUID is not queried per
+   * block.
+   *
+   * @param input input block of block_size bytes
+   * @param output output block of block_size bytes, may be the same as input
+   */
+  void encrypt_block(const uint8_t *input, uint8_t *output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (hardware_) {
+      encrypt_block_aes_ni(input, output);
+      return;
+    }
+#endif
+    encrypt_block_software(input, output);
+  }
+
+  /**
+   * @brief Encrypts one block using the table based software path
+   *
+   * This path stays public even when a hardware path exists, because testing
+   * that the two paths agree requires a reference to compare against.
+   *
+   * @param input input block of block_size bytes
+   * @param output output block of block_size bytes, may be the same as input
+   */
+  void encrypt_block_software(const uint8_t *input, uint8_t *output) const {
+    uint32_t s0 = ctl::detail::load_be32(input + 0) ^ ek_[0];
+    uint32_t s1 = ctl::detail::load_be32(input + 4) ^ ek_[1];
+    uint32_t s2 = ctl::detail::load_be32(input + 8) ^ ek_[2];
+    uint32_t s3 = ctl::detail::load_be32(input + 12) ^ ek_[3];
+    uint32_t t0, t1, t2, t3;
+
+    const uint32_t *rk = ek_ + 4;
+
+    // The number of rounds that include MixColumns is rounds - 1, and that
+    // value is always odd (9, 11 or 13). Handling one round first and then
+    // taking the remaining rounds two at a time lets s and t alternate, so the
+    // state never has to be copied between rounds, and the input of the final
+    // round is always in t.
+    encrypt_round(s0, s1, s2, s3, rk, t0, t1, t2, t3);
+    rk += 4;
+
+    for (size_t i = 0; i < paired_rounds; ++i) {
+      encrypt_round(t0, t1, t2, t3, rk, s0, s1, s2, s3);
+      rk += 4;
+      encrypt_round(s0, s1, s2, s3, rk, t0, t1, t2, t3);
+      rk += 4;
+    }
+
+    // The final round has no MixColumns.
+    const uint8_t *sbox = ctl::detail::aes_sbox.forward;
+    ctl::detail::store_be32(last_column(sbox, t0, t1, t2, t3) ^ rk[0],
+                            output + 0);
+    ctl::detail::store_be32(last_column(sbox, t1, t2, t3, t0) ^ rk[1],
+                            output + 4);
+    ctl::detail::store_be32(last_column(sbox, t2, t3, t0, t1) ^ rk[2],
+                            output + 8);
+    ctl::detail::store_be32(last_column(sbox, t3, t0, t1, t2) ^ rk[3],
+                            output + 12);
+  }
+
+  /**
+   * @brief Decrypts one block
+   *
+   * @param input input block of block_size bytes
+   * @param output output block of block_size bytes, may be the same as input
+   */
+  void decrypt_block(const uint8_t *input, uint8_t *output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (hardware_) {
+      decrypt_block_aes_ni(input, output);
+      return;
+    }
+#endif
+    decrypt_block_software(input, output);
+  }
+
+  /**
+   * @brief Whether passing blocks in batches is worthwhile
+   *
+   * On the hardware path several blocks can be interleaved, which pays off. On
+   * the software path it only adds the cost of moving data through a staging
+   * buffer. Modes of operation consult this to choose their path.
+   */
+  bool prefers_batching() const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    return hardware_;
+#else
+    return false;
+#endif
+  }
+
+  /**
+   * @brief Encrypts several mutually independent blocks
+   *
+   * This shape matters on the hardware path. AESENC has a high throughput but
+   * also a latency, so running the rounds of a single block one after another
+   * waits out that latency on every round. Interleaving several blocks fills
+   * the wait with work from the other blocks.
+   *
+   * @param input input of count * block_size bytes
+   * @param output output of count * block_size bytes, may be the same as input
+   * @param count number of blocks
+   */
+  void encrypt_blocks(const uint8_t *input, uint8_t *output,
+                      size_t count) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (hardware_) {
+      size_t i = 0;
+      for (; i + preferred_batch <= count; i += preferred_batch)
+        encrypt_wide_aes_ni<preferred_batch>(input + i * block_size,
+                                            output + i * block_size);
+      for (; i < count; ++i)
+        encrypt_block_aes_ni(input + i * block_size, output + i * block_size);
+      return;
+    }
+#endif
+    for (size_t i = 0; i < count; ++i)
+      encrypt_block_software(input + i * block_size, output + i * block_size);
+  }
+
+  /**
+   * @brief Decrypts several mutually independent blocks
+   *
+   * @param input input of count * block_size bytes
+   * @param output output of count * block_size bytes, may be the same as input
+   * @param count number of blocks
+   */
+  void decrypt_blocks(const uint8_t *input, uint8_t *output,
+                      size_t count) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (hardware_) {
+      size_t i = 0;
+      for (; i + preferred_batch <= count; i += preferred_batch)
+        decrypt_wide_aes_ni<preferred_batch>(input + i * block_size,
+                                            output + i * block_size);
+      for (; i < count; ++i)
+        decrypt_block_aes_ni(input + i * block_size, output + i * block_size);
+      return;
+    }
+#endif
+    for (size_t i = 0; i < count; ++i)
+      decrypt_block_software(input + i * block_size, output + i * block_size);
+  }
+
+  /**
+   * @brief Decrypts one block using the table based software path
+   *
+   * @param input input block of block_size bytes
+   * @param output output block of block_size bytes, may be the same as input
+   */
+  void decrypt_block_software(const uint8_t *input, uint8_t *output) const {
+    uint32_t s0 = ctl::detail::load_be32(input + 0) ^ dk_[0];
+    uint32_t s1 = ctl::detail::load_be32(input + 4) ^ dk_[1];
+    uint32_t s2 = ctl::detail::load_be32(input + 8) ^ dk_[2];
+    uint32_t s3 = ctl::detail::load_be32(input + 12) ^ dk_[3];
+    uint32_t t0, t1, t2, t3;
+
+    const uint32_t *rk = dk_ + 4;
+
+    decrypt_round(s0, s1, s2, s3, rk, t0, t1, t2, t3);
+    rk += 4;
+
+    for (size_t i = 0; i < paired_rounds; ++i) {
+      decrypt_round(t0, t1, t2, t3, rk, s0, s1, s2, s3);
+      rk += 4;
+      decrypt_round(s0, s1, s2, s3, rk, t0, t1, t2, t3);
+      rk += 4;
+    }
+
+    // InvShiftRows moves row r to the right by r, so a column takes its values
+    // from the columns before it, the opposite direction of encryption.
+    const uint8_t *inv_sbox = ctl::detail::aes_sbox.inverse;
+    ctl::detail::store_be32(last_column(inv_sbox, t0, t3, t2, t1) ^ rk[0],
+                            output + 0);
+    ctl::detail::store_be32(last_column(inv_sbox, t1, t0, t3, t2) ^ rk[1],
+                            output + 4);
+    ctl::detail::store_be32(last_column(inv_sbox, t2, t1, t0, t3) ^ rk[2],
+                            output + 8);
+    ctl::detail::store_be32(last_column(inv_sbox, t3, t2, t1, t0) ^ rk[3],
+                            output + 12);
+  }
+
+private:
+  /**
+   * @brief Number of round pairs processed together
+   *
+   * The first round is handled separately and the remaining rounds are taken
+   * two at a time; this is how many such pairs there are, namely 4, 5 and 6
+   * for AES-128, AES-192 and AES-256.
+   */
+  static constexpr size_t paired_rounds = (rounds - 2) / 2;
+
+  /**
+   * @brief One encryption round, that is SubBytes, ShiftRows, MixColumns and
+   * the round key addition
+   *
+   * The column shifts caused by ShiftRows are fixed in the argument order, so
+   * no index arithmetic is performed at run time.
+   */
+  static CTL_FORCEINLINE void encrypt_round(uint32_t s0, uint32_t s1,
+                                            uint32_t s2, uint32_t s3,
+                                            const uint32_t *rk, uint32_t &d0,
+                                            uint32_t &d1, uint32_t &d2,
+                                            uint32_t &d3) {
+    const uint32_t(*te)[256] = aes_detail::table.te;
+    d0 = te[0][b0(s0)] ^ te[1][b1(s1)] ^ te[2][b2(s2)] ^ te[3][b3(s3)] ^ rk[0];
+    d1 = te[0][b0(s1)] ^ te[1][b1(s2)] ^ te[2][b2(s3)] ^ te[3][b3(s0)] ^ rk[1];
+    d2 = te[0][b0(s2)] ^ te[1][b1(s3)] ^ te[2][b2(s0)] ^ te[3][b3(s1)] ^ rk[2];
+    d3 = te[0][b0(s3)] ^ te[1][b1(s0)] ^ te[2][b2(s1)] ^ te[3][b3(s2)] ^ rk[3];
+  }
+
+  /**
+   * @brief One decryption round of the equivalent inverse cipher
+   */
+  static CTL_FORCEINLINE void decrypt_round(uint32_t s0, uint32_t s1,
+                                            uint32_t s2, uint32_t s3,
+                                            const uint32_t *rk, uint32_t &d0,
+                                            uint32_t &d1, uint32_t &d2,
+                                            uint32_t &d3) {
+    const uint32_t(*td)[256] = aes_detail::table.td;
+    d0 = td[0][b0(s0)] ^ td[1][b1(s3)] ^ td[2][b2(s2)] ^ td[3][b3(s1)] ^ rk[0];
+    d1 = td[0][b0(s1)] ^ td[1][b1(s0)] ^ td[2][b2(s3)] ^ td[3][b3(s2)] ^ rk[1];
+    d2 = td[0][b0(s2)] ^ td[1][b1(s1)] ^ td[2][b2(s0)] ^ td[3][b3(s3)] ^ rk[2];
+    d3 = td[0][b0(s3)] ^ td[1][b1(s2)] ^ td[2][b2(s1)] ^ td[3][b3(s0)] ^ rk[3];
+  }
+
+  /**
+   * @brief Builds one column of the final round, which has no MixColumns
+   *
+   * @param sbox substitution table to apply, the S-box for encryption and the
+   * inverse S-box for decryption
+   */
+  static CTL_FORCEINLINE uint32_t last_column(const uint8_t *sbox, uint32_t a,
+                                              uint32_t b, uint32_t c,
+                                              uint32_t d) {
+    return (static_cast<uint32_t>(sbox[b0(a)]) << 24) |
+           (static_cast<uint32_t>(sbox[b1(b)]) << 16) |
+           (static_cast<uint32_t>(sbox[b2(c)]) << 8) |
+           static_cast<uint32_t>(sbox[b3(d)]);
+  }
+
+  static constexpr uint8_t b0(uint32_t w) {
+    return static_cast<uint8_t>(w >> 24);
+  }
+  static constexpr uint8_t b1(uint32_t w) {
+    return static_cast<uint8_t>(w >> 16);
+  }
+  static constexpr uint8_t b2(uint32_t w) {
+    return static_cast<uint8_t>(w >> 8);
+  }
+  static constexpr uint8_t b3(uint32_t w) { return static_cast<uint8_t>(w); }
+
+  /**
+   * @brief Applies the S-box to each byte of a word (SubWord in FIPS 197)
+   */
+  static uint32_t sub_word(uint32_t w) {
+    const uint8_t *sbox = ctl::detail::aes_sbox.forward;
+    return (static_cast<uint32_t>(sbox[b0(w)]) << 24) |
+           (static_cast<uint32_t>(sbox[b1(w)]) << 16) |
+           (static_cast<uint32_t>(sbox[b2(w)]) << 8) |
+           static_cast<uint32_t>(sbox[b3(w)]);
+  }
+
+  /**
+   * @brief Applies InvMixColumns to one column
+   *
+   * Used to build the round keys of the equivalent inverse cipher. The matrix
+   * from the specification is evaluated directly rather than going through a
+   * table.
+   */
+  static uint32_t inv_mix_column(uint32_t w) {
+    using ctl::detail::gf::mul;
+    const uint8_t a0 = b0(w);
+    const uint8_t a1 = b1(w);
+    const uint8_t a2 = b2(w);
+    const uint8_t a3 = b3(w);
+    const uint8_t r0 = mul(a0, 0x0e) ^ mul(a1, 0x0b) ^
+                       mul(a2, 0x0d) ^ mul(a3, 0x09);
+    const uint8_t r1 = mul(a0, 0x09) ^ mul(a1, 0x0e) ^
+                       mul(a2, 0x0b) ^ mul(a3, 0x0d);
+    const uint8_t r2 = mul(a0, 0x0d) ^ mul(a1, 0x09) ^
+                       mul(a2, 0x0e) ^ mul(a3, 0x0b);
+    const uint8_t r3 = mul(a0, 0x0b) ^ mul(a1, 0x0d) ^
+                       mul(a2, 0x09) ^ mul(a3, 0x0e);
+    return (static_cast<uint32_t>(r0) << 24) |
+           (static_cast<uint32_t>(r1) << 16) |
+           (static_cast<uint32_t>(r2) << 8) | static_cast<uint32_t>(r3);
+  }
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  /**
+   * @brief Encrypts one block with AES-NI
+   *
+   * Processing a single block is bound by instruction latency. AESENC has a
+   * high throughput but also a latency, so a lone block whose rounds run one
+   * after another cannot reach the throughput the hardware is capable of.
+   * Several blocks have to be overlapped, and that requires the mode of
+   * operation to hand blocks over in batches.
+   */
+  CTL_TARGET_AESNI void encrypt_block_aes_ni(const uint8_t *input,
+                                             uint8_t *output) const {
+    const __m128i *rk = reinterpret_cast<const __m128i *>(ek_bytes_);
+    __m128i state = _mm_loadu_si128(reinterpret_cast<const __m128i *>(input));
+    state = _mm_xor_si128(state, _mm_loadu_si128(rk));
+    for (size_t round = 1; round < rounds; ++round)
+      state = _mm_aesenc_si128(state, _mm_loadu_si128(rk + round));
+    state = _mm_aesenclast_si128(state, _mm_loadu_si128(rk + rounds));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(output), state);
+  }
+
+  /**
+   * @brief Decrypts one block with AES-NI
+   *
+   * The decryption round keys of the equivalent inverse cipher match what the
+   * AESDEC instruction expects. AESDEC performs InvShiftRows, InvSubBytes and
+   * InvMixColumns in that order, and since InvSubBytes and InvShiftRows
+   * commute, the result is the same as the order given in the specification.
+   */
+  CTL_TARGET_AESNI void decrypt_block_aes_ni(const uint8_t *input,
+                                             uint8_t *output) const {
+    const __m128i *rk = reinterpret_cast<const __m128i *>(dk_bytes_);
+    __m128i state = _mm_loadu_si128(reinterpret_cast<const __m128i *>(input));
+    state = _mm_xor_si128(state, _mm_loadu_si128(rk));
+    for (size_t round = 1; round < rounds; ++round)
+      state = _mm_aesdec_si128(state, _mm_loadu_si128(rk + round));
+    state = _mm_aesdeclast_si128(state, _mm_loadu_si128(rk + rounds));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(output), state);
+  }
+
+  /**
+   * @brief Encrypts _Width blocks with AES-NI, interleaving them
+   *
+   * Each round key is read once and applied to every block, so _Width
+   * independent AESENC operations are issued side by side in each round. This
+   * is what hides the instruction latency and brings the throughput close to
+   * what the hardware can sustain.
+   */
+  template <size_t _Width>
+  CTL_TARGET_AESNI void encrypt_wide_aes_ni(const uint8_t *input,
+                                            uint8_t *output) const {
+    const __m128i *rk = reinterpret_cast<const __m128i *>(ek_bytes_);
+    __m128i state[_Width];
+    __m128i key = _mm_loadu_si128(rk);
+    for (size_t w = 0; w < _Width; ++w)
+      state[w] = _mm_xor_si128(
+          _mm_loadu_si128(
+              reinterpret_cast<const __m128i *>(input + w * block_size)),
+          key);
+
+    for (size_t round = 1; round < rounds; ++round) {
+      key = _mm_loadu_si128(rk + round);
+      for (size_t w = 0; w < _Width; ++w)
+        state[w] = _mm_aesenc_si128(state[w], key);
+    }
+
+    key = _mm_loadu_si128(rk + rounds);
+    for (size_t w = 0; w < _Width; ++w) {
+      state[w] = _mm_aesenclast_si128(state[w], key);
+      _mm_storeu_si128(reinterpret_cast<__m128i *>(output + w * block_size),
+                       state[w]);
+    }
+  }
+
+  /**
+   * @brief Decrypts _Width blocks with AES-NI, interleaving them
+   */
+  template <size_t _Width>
+  CTL_TARGET_AESNI void decrypt_wide_aes_ni(const uint8_t *input,
+                                            uint8_t *output) const {
+    const __m128i *rk = reinterpret_cast<const __m128i *>(dk_bytes_);
+    __m128i state[_Width];
+    __m128i key = _mm_loadu_si128(rk);
+    for (size_t w = 0; w < _Width; ++w)
+      state[w] = _mm_xor_si128(
+          _mm_loadu_si128(
+              reinterpret_cast<const __m128i *>(input + w * block_size)),
+          key);
+
+    for (size_t round = 1; round < rounds; ++round) {
+      key = _mm_loadu_si128(rk + round);
+      for (size_t w = 0; w < _Width; ++w)
+        state[w] = _mm_aesdec_si128(state[w], key);
+    }
+
+    key = _mm_loadu_si128(rk + rounds);
+    for (size_t w = 0; w < _Width; ++w) {
+      state[w] = _mm_aesdeclast_si128(state[w], key);
+      _mm_storeu_si128(reinterpret_cast<__m128i *>(output + w * block_size),
+                       state[w]);
+    }
+  }
+#endif
+
+  /**
+   * @brief Round keys for encryption
+   */
+  uint32_t ek_[round_key_words];
+
+  /**
+   * @brief Round keys for decryption, for the equivalent inverse cipher
+   */
+  uint32_t dk_[round_key_words];
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  /**
+   * @brief Whether AES-NI is used, determined once when the key is set
+   */
+  bool hardware_;
+
+  /**
+   * @brief Encryption round keys in byte order, for the hardware path
+   */
+  uint8_t ek_bytes_[4 * round_key_words];
+
+  /**
+   * @brief Decryption round keys in byte order, for the hardware path
+   */
+  uint8_t dk_bytes_[4 * round_key_words];
+#endif
+};
+
+/**
+ * @brief AES-128
+ */
+typedef aes<128> aes128;
+
+/**
+ * @brief AES-192
+ */
+typedef aes<192> aes192;
+
+/**
+ * @brief AES-256
+ */
+typedef aes<256> aes256;
+
+} // namespace cipher
+} // namespace symmetric
+} // namespace ctl
