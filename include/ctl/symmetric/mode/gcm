@@ -237,20 +237,14 @@ public:
       offset += p.size;
     }
 
-    uint8_t computed[tag_size];
-    state.finish(computed);
-
-    // Compared in constant time; a plain comparison would tell an attacker how
-    // many leading bytes of a forged tag were right.
-    const bool authentic =
-        ctl::detail::equal_constant_time(computed, tag, tag_size);
-    ctl::detail::secure_zero(computed, sizeof(computed));
-
-    if (!authentic) {
+    const ext::void_result<error_status> result = verify(state, tag);
+    if (!result) {
+      // Unlike the incremental interface, this one knows the whole output range
+      // and can make sure nothing unauthenticated is left where a caller who
+      // ignores the error could reach it.
       ctl::detail::secure_zero(output, data_size);
-      return ext::err(authentication_failed);
     }
-    return ext::ok<void>();
+    return result;
   }
 
 private:
@@ -434,6 +428,216 @@ private:
     size_t keystream_used_;
     bool aad_closed_;
   };
+
+public:
+  /**
+   * @brief Encryption in progress, data phase
+   *
+   * Reached from the AAD phase, and there is deliberately no way back: the
+   * specification requires every byte of AAD to be hashed before any
+   * ciphertext, so supplying AAD once encryption has begun is not a mistake to
+   * be reported at run time but something the type system refuses.
+   *
+   * Created through gcm::encryptor. Must not outlive the gcm it came from.
+   */
+  class encrypt_data {
+  public:
+    explicit encrypt_data(const session &state) : state_(state) {}
+
+    /**
+     * @brief Encrypts one run of data and authenticates the result
+     *
+     * The key stream carries on between calls, so a run of any length is fine.
+     *
+     * @param input data to encrypt
+     * @param output where the ciphertext goes, may overlap input
+     */
+    encrypt_data &write(piece input, uint8_t *output) {
+      state_.encrypt(input.data, input.size, output);
+      return *this;
+    }
+
+    /**
+     * @brief Produces the authentication tag
+     *
+     * @param tag tag_size bytes
+     */
+    void finish(uint8_t *tag) { state_.finish(tag); }
+
+  private:
+    session state_;
+  };
+
+  /**
+   * @brief Encryption in progress, additional authenticated data phase
+   *
+   * Created through gcm::encryptor. Must not outlive the gcm it came from.
+   */
+  class encrypt_aad {
+  public:
+    encrypt_aad(const cipher_type &cipher, const uint8_t *subkey,
+                const uint8_t *iv, size_t iv_size)
+        : state_(cipher, subkey, iv, iv_size) {}
+
+    /**
+     * @brief Authenticates one run of additional data
+     *
+     * Runs are concatenated, so where they are split makes no difference but
+     * the order they are supplied in does.
+     */
+    encrypt_aad &aad(piece data) {
+      state_.absorb_aad(data.data, data.size);
+      return *this;
+    }
+
+    /**
+     * @brief Moves on to the data phase
+     */
+    encrypt_data data() { return encrypt_data(state_); }
+
+    /**
+     * @brief Produces the tag with no data at all, which is GMAC
+     *
+     * @param tag tag_size bytes
+     */
+    void finish(uint8_t *tag) { state_.finish(tag); }
+
+  private:
+    session state_;
+  };
+
+  /**
+   * @brief Decryption in progress, data phase
+   *
+   * One thing here differs from the single call interface and matters. That
+   * interface erases its output buffer when the tag does not match, so a caller
+   * who ignores the error is left with zeroes. This cannot do the same: the
+   * plaintext has been handed out across however many buffers the caller chose,
+   * and none of them can be reached from here.
+   *
+   * So on failure the caller has to discard everything it received. Until the
+   * tag has been checked, none of it is authentic, and acting on any of it is
+   * exactly the mistake authenticated encryption exists to prevent. Where that
+   * obligation is hard to honour, use the single call interface instead.
+   *
+   * Created through gcm::decryptor. Must not outlive the gcm it came from.
+   */
+  class decrypt_data {
+  public:
+    explicit decrypt_data(const session &state) : state_(state) {}
+
+    /**
+     * @brief Decrypts one run of ciphertext
+     *
+     * What comes out is not authentic yet. It becomes authentic only once
+     * finish reports success.
+     *
+     * @param input ciphertext to decrypt
+     * @param output where the plaintext goes, may overlap input
+     */
+    decrypt_data &write(piece input, uint8_t *output) {
+      state_.decrypt(input.data, input.size, output);
+      return *this;
+    }
+
+    /**
+     * @brief Verifies the authentication tag
+     *
+     * @param tag the tag to verify against, tag_size bytes
+     * @return success only if the data is authentic; on failure the caller must
+     * discard every byte of plaintext it received
+     */
+    ext::void_result<error_status> finish(const uint8_t *tag) {
+      return verify(state_, tag);
+    }
+
+  private:
+    session state_;
+  };
+
+  /**
+   * @brief Decryption in progress, additional authenticated data phase
+   *
+   * Created through gcm::decryptor. Must not outlive the gcm it came from.
+   */
+  class decrypt_aad {
+  public:
+    decrypt_aad(const cipher_type &cipher, const uint8_t *subkey,
+                const uint8_t *iv, size_t iv_size)
+        : state_(cipher, subkey, iv, iv_size) {}
+
+    /**
+     * @brief Authenticates one run of additional data
+     */
+    decrypt_aad &aad(piece data) {
+      state_.absorb_aad(data.data, data.size);
+      return *this;
+    }
+
+    /**
+     * @brief Moves on to the data phase
+     */
+    decrypt_data data() { return decrypt_data(state_); }
+
+    /**
+     * @brief Verifies the tag with no data at all, which is GMAC
+     */
+    ext::void_result<error_status> finish(const uint8_t *tag) {
+      return verify(state_, tag);
+    }
+
+  private:
+    session state_;
+  };
+
+  /**
+   * @brief Begins an encryption that is fed over several calls
+   *
+   * Use this when the data does not all exist at once. When it does, the single
+   * call interface is both simpler and impossible to misuse.
+   *
+   * @param iv initialization vector, any non zero length; 12 bytes recommended
+   * @param iv_size length of the initialization vector
+   * @exception std::invalid_argument if iv_size is zero
+   */
+  encrypt_aad encryptor(const uint8_t *iv, size_t iv_size) const {
+    if (iv_size == 0)
+      throw std::invalid_argument("ctl::symmetric::mode::gcm : "
+                                  "the initialization vector is empty.");
+    return encrypt_aad(cipher_, subkey_, iv, iv_size);
+  }
+
+  /**
+   * @brief Begins a decryption that is fed over several calls
+   *
+   * Read what decrypt_data says about failure before using this.
+   *
+   * @param iv initialization vector, the same one used to encrypt
+   * @param iv_size length of the initialization vector
+   * @exception std::invalid_argument if iv_size is zero
+   */
+  decrypt_aad decryptor(const uint8_t *iv, size_t iv_size) const {
+    if (iv_size == 0)
+      throw std::invalid_argument("ctl::symmetric::mode::gcm : "
+                                  "the initialization vector is empty.");
+    return decrypt_aad(cipher_, subkey_, iv, iv_size);
+  }
+
+private:
+  /**
+   * @brief Completes a session and compares the tag in constant time
+   */
+  static ext::void_result<error_status> verify(session &state,
+                                              const uint8_t *tag) {
+    uint8_t computed[tag_size];
+    state.finish(computed);
+    const bool authentic =
+        ctl::detail::equal_constant_time(computed, tag, tag_size);
+    ctl::detail::secure_zero(computed, sizeof(computed));
+    if (!authentic)
+      return ext::err(authentication_failed);
+    return ext::ok<void>();
+  }
 
   /**
    * @brief Adds up the lengths of a list of pieces

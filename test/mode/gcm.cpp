@@ -11,6 +11,9 @@
  */
 #include <gtest/gtest.h>
 
+#include <type_traits>
+#include <utility>
+
 #include <ctl/symmetric/cipher/aes>
 #include <ctl/symmetric/mode/gcm>
 
@@ -306,6 +309,176 @@ TEST(gcm, tag_can_be_appended_to_the_output) {
                           {{packet.data(), plain.size()}}, decrypted.data(),
                           packet.data() + plain.size()));
   EXPECT_EQ(test::to_hex(plain), test::to_hex(decrypted));
+}
+
+namespace {
+
+using gcm128 = mode::gcm<aes128>;
+
+// Detects whether a phase type accepts additional authenticated data. Used to
+// check by compilation that the data phase does not, which is the whole point of
+// giving the two phases different types.
+template <class T, class = void> struct accepts_aad : std::false_type {};
+
+template <class T>
+struct accepts_aad<T, decltype(void(std::declval<T &>().aad(
+                          std::declval<gcm128::piece>())))>
+    : std::true_type {};
+
+} // namespace
+
+static_assert(accepts_aad<gcm128::encrypt_aad>::value,
+              "the AAD phase has to accept AAD");
+static_assert(!accepts_aad<gcm128::encrypt_data>::value,
+              "the data phase must not accept AAD, since the specification "
+              "requires all of it to be hashed before any ciphertext");
+static_assert(accepts_aad<gcm128::decrypt_aad>::value,
+              "the AAD phase has to accept AAD");
+static_assert(!accepts_aad<gcm128::decrypt_data>::value,
+              "the data phase must not accept AAD");
+
+// Feeding the same input through the incremental interface in several pieces has
+// to give exactly what the single call gives.
+TEST(gcm, builder_matches_the_single_call) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> aad = test::hex(kAad);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  gcm128 gcm(key.data(), key.size());
+
+  std::vector<uint8_t> once(plain.size());
+  std::vector<uint8_t> once_tag(16);
+  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
+                          {{plain.data(), plain.size()}}, once.data(),
+                          once_tag.data()));
+
+  std::vector<uint8_t> streamed(plain.size());
+  std::vector<uint8_t> streamed_tag(16);
+  {
+    auto writer = gcm.encryptor(iv.data(), iv.size())
+                      .aad({aad.data(), 4})
+                      .aad({aad.data() + 4, aad.size() - 4})
+                      .data();
+    // Deliberately uneven runs so the key stream has to carry on mid block.
+    writer.write({plain.data(), 7}, streamed.data())
+        .write({plain.data() + 7, 20}, streamed.data() + 7)
+        .write({plain.data() + 27, plain.size() - 27}, streamed.data() + 27);
+    writer.finish(streamed_tag.data());
+  }
+
+  EXPECT_EQ(test::to_hex(once), test::to_hex(streamed));
+  EXPECT_EQ(test::to_hex(once_tag), test::to_hex(streamed_tag));
+}
+
+TEST(gcm, builder_reproduces_the_official_vector) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> aad = test::hex(kAad);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  gcm128 gcm(key.data(), key.size());
+
+  std::vector<uint8_t> out(plain.size());
+  std::vector<uint8_t> tag(16);
+  auto writer = gcm.encryptor(iv.data(), iv.size())
+                    .aad({aad.data(), aad.size()})
+                    .data();
+  for (size_t offset = 0; offset < plain.size(); offset += 9) {
+    const size_t run =
+        (plain.size() - offset) < 9 ? (plain.size() - offset) : 9;
+    writer.write({plain.data() + offset, run}, out.data() + offset);
+  }
+  writer.finish(tag.data());
+
+  EXPECT_EQ(std::string("42831ec2217774244b7221b784d0d49c"
+                        "e3aa212f2c02a4e035c17e2329aca12e"
+                        "21d514b25466931c7d8f6a5aac84aa05"
+                        "1ba30b396a0aac973d58e091"),
+            test::to_hex(out));
+  EXPECT_EQ(std::string("5bc94fbc3221a5db94fae95ae7121a47"), test::to_hex(tag));
+}
+
+// Finishing straight from the AAD phase authenticates without encrypting, which
+// is GMAC.
+TEST(gcm, builder_authenticates_aad_only_as_gmac) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> message = test::hex(kPlain60);
+
+  gcm128 gcm(key.data(), key.size());
+
+  std::vector<uint8_t> tag(16);
+  gcm.encryptor(iv.data(), iv.size())
+      .aad({message.data(), message.size()})
+      .finish(tag.data());
+
+  // The single call interface has to agree, with the message as AAD and no data.
+  std::vector<uint8_t> expected(16);
+  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(),
+                          {{message.data(), message.size()}}, {}, nullptr,
+                          expected.data()));
+  EXPECT_EQ(test::to_hex(expected), test::to_hex(tag));
+
+  EXPECT_TRUE(gcm.decryptor(iv.data(), iv.size())
+                  .aad({message.data(), message.size()})
+                  .finish(tag.data()));
+}
+
+TEST(gcm, builder_decrypts_and_verifies) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> aad = test::hex(kAad);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  gcm128 gcm(key.data(), key.size());
+
+  std::vector<uint8_t> cipher(plain.size());
+  std::vector<uint8_t> tag(16);
+  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
+                          {{plain.data(), plain.size()}}, cipher.data(),
+                          tag.data()));
+
+  std::vector<uint8_t> recovered(plain.size());
+  auto reader = gcm.decryptor(iv.data(), iv.size())
+                    .aad({aad.data(), aad.size()})
+                    .data();
+  reader.write({cipher.data(), 13}, recovered.data())
+      .write({cipher.data() + 13, cipher.size() - 13}, recovered.data() + 13);
+  ASSERT_TRUE(reader.finish(tag.data()));
+  EXPECT_EQ(test::to_hex(plain), test::to_hex(recovered));
+}
+
+TEST(gcm, builder_decrypt_reports_a_bad_tag) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  gcm128 gcm(key.data(), key.size());
+
+  std::vector<uint8_t> cipher(plain.size());
+  std::vector<uint8_t> tag(16);
+  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {},
+                          {{plain.data(), plain.size()}}, cipher.data(),
+                          tag.data()));
+  tag[15] ^= 0x80;
+
+  std::vector<uint8_t> recovered(plain.size());
+  auto reader = gcm.decryptor(iv.data(), iv.size()).data();
+  reader.write({cipher.data(), cipher.size()}, recovered.data());
+  const auto result = reader.finish(tag.data());
+  ASSERT_FALSE(result);
+  EXPECT_EQ(gcm128::authentication_failed, result.error().value);
+  // Note that recovered still holds plaintext here. The incremental interface
+  // cannot reach the caller's buffers, which is why its documentation puts the
+  // obligation to discard on the caller.
+}
+
+TEST(gcm, builder_rejects_empty_iv) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  gcm128 gcm(key.data(), key.size());
+  EXPECT_THROW(gcm.encryptor(nullptr, 0), std::invalid_argument);
+  EXPECT_THROW(gcm.decryptor(nullptr, 0), std::invalid_argument);
 }
 
 TEST(gcm, rejects_empty_iv) {
