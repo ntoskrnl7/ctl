@@ -1,0 +1,214 @@
+/**
+ * @file ghash
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief GHASH, the keyed hash of GCM (NIST SP 800-38D)
+ *
+ * GHASH walks a byte string one 128 bit block at a time, and after each block
+ * multiplies the accumulator by a subkey H in GF(2^128).
+ *
+ * The bit order here is the opposite of the one XTS uses. Both use the same
+ * irreducible polynomial, but GCM numbers bits from the most significant end,
+ * which makes the multiplication a shift to the right with 0xE1 folded into the
+ * top byte. XTS numbers from the other end and shifts left with 0x87. Code from
+ * one must never be reused for the other; the two produce different results and
+ * nothing but a test vector will say so.
+ *
+ * The multiplication is written without branches. H is derived from the key, so
+ * a running time that depended on its bits would leak key material.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+#include <ctl/detail/endian>
+#include <ctl/detail/memory>
+
+namespace ctl {
+namespace detail {
+
+/**
+ * @brief GHASH accumulator
+ *
+ * Absorbs data incrementally, buffering a partial block between calls, so the
+ * same object serves both a single call over a list of pieces and a session
+ * that is fed over time.
+ */
+class ghash {
+public:
+  /**
+   * @brief Block size in bytes
+   */
+  static constexpr size_t block_size = 16;
+
+  /**
+   * @brief The reduction constant R of SP 800-38D, which is 0xE1 followed by
+   * 120 zero bits
+   */
+  static constexpr uint64_t reduction = 0xe100000000000000ull;
+
+  ghash() : hh_(0), hl_(0), yh_(0), yl_(0), pending_(0) {
+    memset(buffer_, 0, sizeof(buffer_));
+  }
+
+  ~ghash() {
+    ctl::detail::secure_zero(buffer_, sizeof(buffer_));
+    hh_ = 0;
+    hl_ = 0;
+    yh_ = 0;
+    yl_ = 0;
+  }
+
+  /**
+   * @brief Sets the hash subkey and clears the accumulator
+   *
+   * @param h the subkey H, which GCM defines as the block cipher applied to a
+   * block of zeroes
+   */
+  void set_key(const uint8_t *h) {
+    hh_ = ctl::detail::load_be64(h);
+    hl_ = ctl::detail::load_be64(h + 8);
+    reset();
+  }
+
+  /**
+   * @brief Clears the accumulator, keeping the subkey
+   */
+  void reset() {
+    yh_ = 0;
+    yl_ = 0;
+    pending_ = 0;
+  }
+
+  /**
+   * @brief Absorbs data, buffering whatever does not fill a whole block
+   *
+   * @param data data to absorb
+   * @param size number of bytes
+   */
+  void update(const uint8_t *data, size_t size) {
+    if (pending_ != 0) {
+      const size_t needed = block_size - pending_;
+      const size_t taken = size < needed ? size : needed;
+      memcpy(buffer_ + pending_, data, taken);
+      pending_ += taken;
+      data += taken;
+      size -= taken;
+      if (pending_ < block_size)
+        return;
+      absorb(buffer_);
+      pending_ = 0;
+    }
+
+    while (size >= block_size) {
+      absorb(data);
+      data += block_size;
+      size -= block_size;
+    }
+
+    if (size != 0) {
+      memcpy(buffer_, data, size);
+      pending_ = size;
+    }
+  }
+
+  /**
+   * @brief Fills the buffered partial block with zeroes and absorbs it
+   *
+   * GCM pads the additional authenticated data and the ciphertext to a block
+   * boundary separately, so this is called once at the end of each. Padding
+   * anywhere else changes the result.
+   */
+  void pad() {
+    if (pending_ == 0)
+      return;
+    memset(buffer_ + pending_, 0, block_size - pending_);
+    absorb(buffer_);
+    pending_ = 0;
+  }
+
+  /**
+   * @brief Writes out the current accumulator
+   *
+   * @param output block_size bytes
+   */
+  void finish(uint8_t *output) const {
+    ctl::detail::store_be64(yh_, output);
+    ctl::detail::store_be64(yl_, output + 8);
+  }
+
+private:
+  /**
+   * @brief Adds one whole block and multiplies by the subkey
+   */
+  void absorb(const uint8_t *block) {
+    yh_ ^= ctl::detail::load_be64(block);
+    yl_ ^= ctl::detail::load_be64(block + 8);
+    multiply();
+  }
+
+  /**
+   * @brief Multiplies the accumulator by the subkey in GF(2^128)
+   *
+   * This is algorithm 1 of SP 800-38D, taking the bits of the accumulator from
+   * the most significant end and shifting the subkey right one bit at a time.
+   * Both conditionals of the specification are expressed as masks so that the
+   * running time carries no information about either operand.
+   */
+  void multiply() {
+    uint64_t zh = 0;
+    uint64_t zl = 0;
+    uint64_t vh = hh_;
+    uint64_t vl = hl_;
+    const uint64_t xh = yh_;
+    const uint64_t xl = yl_;
+
+    for (unsigned int i = 0; i < 64; ++i) {
+      const uint64_t selected = 0ull - ((xh >> (63 - i)) & 1);
+      zh ^= vh & selected;
+      zl ^= vl & selected;
+      const uint64_t carried = 0ull - (vl & 1);
+      vl = (vl >> 1) | (vh << 63);
+      vh = (vh >> 1) ^ (reduction & carried);
+    }
+
+    for (unsigned int i = 0; i < 64; ++i) {
+      const uint64_t selected = 0ull - ((xl >> (63 - i)) & 1);
+      zh ^= vh & selected;
+      zl ^= vl & selected;
+      const uint64_t carried = 0ull - (vl & 1);
+      vl = (vl >> 1) | (vh << 63);
+      vh = (vh >> 1) ^ (reduction & carried);
+    }
+
+    yh_ = zh;
+    yl_ = zl;
+  }
+
+  /**
+   * @brief The subkey H
+   */
+  uint64_t hh_;
+  uint64_t hl_;
+
+  /**
+   * @brief The accumulator
+   */
+  uint64_t yh_;
+  uint64_t yl_;
+
+  /**
+   * @brief Bytes that have not yet filled a block
+   */
+  uint8_t buffer_[block_size];
+  size_t pending_;
+};
+
+} // namespace detail
+} // namespace ctl

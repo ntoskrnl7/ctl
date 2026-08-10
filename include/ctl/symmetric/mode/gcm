@@ -1,0 +1,458 @@
+/**
+ * @file gcm
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief GCM mode of operation (NIST SP 800-38D)
+ *
+ * Authenticated encryption with associated data. Unlike the other modes here,
+ * GCM takes two inputs and produces two outputs: data that is encrypted and
+ * authenticated, and additional authenticated data (AAD) that is authenticated
+ * but left in the clear, both covered by one authentication tag.
+ *
+ * AAD is for information a recipient or an intermediate system has to read
+ * without being able to forge, such as a record header, a sequence number, or
+ * the row identifier a ciphertext belongs to. Tampering with it makes tag
+ * verification fail, which binds the ciphertext to its context.
+ *
+ * The order in which GHASH consumes its inputs is fixed by the specification:
+ * all of the AAD first, zero padded to a block boundary, then all of the
+ * ciphertext, then the two lengths. AAD therefore cannot be supplied after
+ * encryption has begun. The interface reflects that rather than trying to hide
+ * it.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <initializer_list>
+#include <stdexcept>
+
+#include <ext/result>
+
+#include <ctl/detail/endian>
+#include <ctl/detail/ghash>
+#include <ctl/detail/memory>
+
+namespace ctl {
+namespace symmetric {
+namespace mode {
+
+/**
+ * @brief GCM mode of operation
+ *
+ * @tparam _Cipher a block cipher, which must have a 128 bit block
+ * @tparam _TagBits authentication tag size in bits
+ */
+template <class _Cipher, size_t _TagBits = 128> class gcm {
+public:
+  /**
+   * @brief The block cipher type
+   */
+  typedef _Cipher cipher_type;
+
+  /**
+   * @brief Block size in bytes
+   */
+  static constexpr size_t block_size = cipher_type::block_size;
+
+  static_assert(block_size == 16,
+                "GCM is defined only for 128 bit block ciphers. "
+                "(NIST SP 800-38D)");
+
+  static_assert(_TagBits == 128 || _TagBits == 120 || _TagBits == 112 ||
+                    _TagBits == 104 || _TagBits == 96,
+                "GCM allows tag sizes of 128, 120, 112, 104 and 96 bits. "
+                "Shorter tags are restricted to specific applications; see "
+                "appendix C of NIST SP 800-38D.");
+
+  /**
+   * @brief Authentication tag size in bytes
+   */
+  static constexpr size_t tag_size = _TagBits / 8;
+
+  /**
+   * @brief Key size in bytes
+   */
+  static constexpr size_t key_size = cipher_type::key_size;
+
+  /**
+   * @brief The recommended initialization vector size in bytes
+   *
+   * Any length is allowed, but 96 bits is the one the specification recommends
+   * and the only one that skips deriving the initial counter through GHASH.
+   */
+  static constexpr size_t recommended_iv_size = 12;
+
+  /**
+   * @brief The largest amount of data one invocation may cover, in bytes
+   *
+   * SP 800-38D limits the plaintext of a single invocation to 2^39 - 256 bits.
+   */
+  static constexpr uint64_t max_data_size = ((1ull << 39) - 256) / 8;
+
+  /**
+   * @brief Authentication tag type
+   */
+  typedef uint8_t tag_t[tag_size];
+
+  /**
+   * @brief One contiguous run of bytes
+   *
+   * AAD and data are each supplied as a list of these. GHASH consumes the
+   * concatenation of the list, so where the boundaries fall does not matter but
+   * the order of the list does: {a, b} and {b, a} produce different tags.
+   */
+  struct piece {
+    /**
+     * @brief Wraps a pointer and a length
+     */
+    piece(const uint8_t *data, size_t size) : data(data), size(size) {}
+
+    /**
+     * @brief Wraps an array, taking its length from the type
+     */
+    template <size_t _Size>
+    piece(const uint8_t (&array)[_Size]) : data(array), size(_Size) {}
+
+    const uint8_t *data;
+    size_t size;
+  };
+
+  /**
+   * @brief A list of runs of bytes
+   */
+  typedef std::initializer_list<piece> pieces;
+
+  enum error_status {
+    /**
+     * @brief The tag did not match, so the data is not authentic
+     *
+     * The output buffer has been erased. Nothing that was written to it may be
+     * used.
+     */
+    authentication_failed,
+
+    /**
+     * @brief The initialization vector was empty
+     */
+    invalid_iv_length,
+
+    /**
+     * @brief The data exceeds what one invocation may cover
+     */
+    invalid_input_length,
+  };
+
+  /**
+   * @brief Initializes with a key
+   *
+   * @param key key buffer
+   * @param size size of the key buffer, which must be at least key_size
+   */
+  gcm(const uint8_t *key, size_t size) : cipher_(key, size) {
+    // The hash subkey depends only on the key, so it is derived once here.
+    uint8_t zero[block_size];
+    memset(zero, 0, sizeof(zero));
+    cipher_.encrypt_block(zero, subkey_);
+  }
+
+  /**
+   * @brief Erases the hash subkey on destruction
+   */
+  ~gcm() { ctl::detail::secure_zero(subkey_, sizeof(subkey_)); }
+
+  /**
+   * @brief Encrypts and authenticates
+   *
+   * @param iv initialization vector, any non zero length; 12 bytes recommended
+   * @param iv_size length of the initialization vector
+   * @param aad additional authenticated data, may be empty
+   * @param plain data to encrypt, may be empty
+   * @param output where the ciphertext goes, as long as the total of plain, and
+   * may overlap it
+   * @param tag where the tag goes, tag_size bytes; passing output plus the data
+   * length appends it to the ciphertext
+   */
+  ext::void_result<error_status> encrypt(const uint8_t *iv, size_t iv_size,
+                                        pieces aad, pieces plain,
+                                        uint8_t *output, uint8_t *tag) const {
+    if (iv_size == 0)
+      return ext::err(invalid_iv_length);
+    if (total(plain) > max_data_size)
+      return ext::err(invalid_input_length);
+
+    session state(cipher_, subkey_, iv, iv_size);
+    for (const piece &p : aad)
+      state.absorb_aad(p.data, p.size);
+
+    size_t offset = 0;
+    for (const piece &p : plain) {
+      state.encrypt(p.data, p.size, output + offset);
+      offset += p.size;
+    }
+
+    state.finish(tag);
+    return ext::ok<void>();
+  }
+
+  /**
+   * @brief Verifies and decrypts
+   *
+   * The plaintext is produced into the output buffer as the ciphertext is read,
+   * and if the tag does not match, the output buffer is erased before the error
+   * is returned. A caller that ignores the return value is therefore left with
+   * zeroes rather than unauthenticated plaintext.
+   *
+   * @param iv initialization vector, the same one used to encrypt
+   * @param iv_size length of the initialization vector
+   * @param aad additional authenticated data, in the same order as when
+   * encrypting
+   * @param cipher ciphertext to decrypt
+   * @param output where the plaintext goes, as long as the total of cipher, and
+   * may overlap it
+   * @param tag the tag to verify against, tag_size bytes
+   */
+  ext::void_result<error_status> decrypt(const uint8_t *iv, size_t iv_size,
+                                        pieces aad, pieces cipher,
+                                        uint8_t *output,
+                                        const uint8_t *tag) const {
+    if (iv_size == 0)
+      return ext::err(invalid_iv_length);
+    const size_t data_size = total(cipher);
+    if (data_size > max_data_size)
+      return ext::err(invalid_input_length);
+
+    session state(cipher_, subkey_, iv, iv_size);
+    for (const piece &p : aad)
+      state.absorb_aad(p.data, p.size);
+
+    size_t offset = 0;
+    for (const piece &p : cipher) {
+      state.decrypt(p.data, p.size, output + offset);
+      offset += p.size;
+    }
+
+    uint8_t computed[tag_size];
+    state.finish(computed);
+
+    // Compared in constant time; a plain comparison would tell an attacker how
+    // many leading bytes of a forged tag were right.
+    const bool authentic =
+        ctl::detail::equal_constant_time(computed, tag, tag_size);
+    ctl::detail::secure_zero(computed, sizeof(computed));
+
+    if (!authentic) {
+      ctl::detail::secure_zero(output, data_size);
+      return ext::err(authentication_failed);
+    }
+    return ext::ok<void>();
+  }
+
+private:
+  /**
+   * @brief The running state of one GCM invocation
+   *
+   * Everything that has to survive between pieces lives here: the GHASH
+   * accumulator, the counter, and whatever is left of the current key stream
+   * block. Keeping it in one place is what lets a list of pieces of any length
+   * be handled, and is what an incremental interface would be built on.
+   */
+  class session {
+  public:
+    session(const cipher_type &cipher, const uint8_t *subkey,
+            const uint8_t *iv, size_t iv_size)
+        : cipher_(cipher), aad_bits_(0), data_bits_(0),
+          keystream_used_(block_size), aad_closed_(false) {
+      hash_.set_key(subkey);
+      derive_initial_counter(iv, iv_size);
+      memcpy(counter_, initial_, block_size);
+      // The tag is masked with the block cipher applied to the initial counter,
+      // before that counter is ever incremented.
+      cipher_.encrypt_block(initial_, tag_mask_);
+    }
+
+    ~session() {
+      ctl::detail::secure_zero(initial_, sizeof(initial_));
+      ctl::detail::secure_zero(counter_, sizeof(counter_));
+      ctl::detail::secure_zero(keystream_, sizeof(keystream_));
+      ctl::detail::secure_zero(tag_mask_, sizeof(tag_mask_));
+    }
+
+    /**
+     * @brief Absorbs additional authenticated data
+     */
+    void absorb_aad(const uint8_t *data, size_t size) {
+      hash_.update(data, size);
+      aad_bits_ += static_cast<uint64_t>(size) * 8;
+    }
+
+    /**
+     * @brief Encrypts and absorbs the resulting ciphertext
+     */
+    void encrypt(const uint8_t *input, size_t size, uint8_t *output) {
+      close_aad();
+      apply_keystream(input, size, output);
+      hash_.update(output, size);
+      data_bits_ += static_cast<uint64_t>(size) * 8;
+    }
+
+    /**
+     * @brief Absorbs the ciphertext and decrypts it
+     *
+     * The ciphertext is absorbed first, because the output may be the same
+     * buffer as the input.
+     */
+    void decrypt(const uint8_t *input, size_t size, uint8_t *output) {
+      close_aad();
+      hash_.update(input, size);
+      data_bits_ += static_cast<uint64_t>(size) * 8;
+      apply_keystream(input, size, output);
+    }
+
+    /**
+     * @brief Completes the hash and produces the tag
+     */
+    void finish(uint8_t *tag) {
+      close_aad();
+      hash_.pad();
+
+      uint8_t lengths[block_size];
+      ctl::detail::store_be64(aad_bits_, lengths);
+      ctl::detail::store_be64(data_bits_, lengths + 8);
+      hash_.update(lengths, block_size);
+
+      uint8_t sum[block_size];
+      hash_.finish(sum);
+      ctl::detail::xor_block<block_size>(sum, tag_mask_, sum);
+      memcpy(tag, sum, tag_size);
+      ctl::detail::secure_zero(sum, sizeof(sum));
+    }
+
+  private:
+    /**
+     * @brief Closes the AAD, padding it to a block boundary
+     *
+     * Called on the first data of the invocation and again at the end, so that
+     * an invocation with no data at all still pads correctly.
+     */
+    void close_aad() {
+      if (aad_closed_)
+        return;
+      hash_.pad();
+      aad_closed_ = true;
+    }
+
+    /**
+     * @brief Derives the initial counter block J0
+     *
+     * A 96 bit initialization vector is used directly with a counter of one
+     * appended. Any other length is hashed, which is why the accumulator has to
+     * be cleared afterwards before the AAD goes in.
+     */
+    void derive_initial_counter(const uint8_t *iv, size_t iv_size) {
+      if (iv_size == recommended_iv_size) {
+        memcpy(initial_, iv, recommended_iv_size);
+        initial_[12] = 0;
+        initial_[13] = 0;
+        initial_[14] = 0;
+        initial_[15] = 1;
+        return;
+      }
+
+      uint8_t lengths[block_size];
+      memset(lengths, 0, sizeof(lengths));
+      ctl::detail::store_be64(static_cast<uint64_t>(iv_size) * 8, lengths + 8);
+
+      hash_.update(iv, iv_size);
+      hash_.pad();
+      hash_.update(lengths, block_size);
+      hash_.finish(initial_);
+      hash_.reset();
+    }
+
+    /**
+     * @brief Advances the counter and produces the next key stream block
+     *
+     * Only the last four bytes take part, as a big endian counter that wraps.
+     */
+    void next_keystream() {
+      const uint32_t value = ctl::detail::load_be32(counter_ + 12);
+      ctl::detail::store_be32(value + 1, counter_ + 12);
+      cipher_.encrypt_block(counter_, keystream_);
+    }
+
+    /**
+     * @brief Combines data with the key stream
+     *
+     * The key stream is continuous across calls, so a piece whose length is not
+     * a multiple of the block size leaves the remainder of the current block
+     * for the next piece to consume.
+     */
+    void apply_keystream(const uint8_t *input, size_t size, uint8_t *output) {
+      size_t i = 0;
+
+      while (keystream_used_ < block_size && i < size) {
+        output[i] = static_cast<uint8_t>(input[i] ^ keystream_[keystream_used_]);
+        ++keystream_used_;
+        ++i;
+      }
+
+      while (size - i >= block_size) {
+        next_keystream();
+        ctl::detail::xor_block<block_size>(input + i, keystream_, output + i);
+        keystream_used_ = block_size;
+        i += block_size;
+      }
+
+      if (i < size) {
+        next_keystream();
+        keystream_used_ = 0;
+        while (i < size) {
+          output[i] =
+              static_cast<uint8_t>(input[i] ^ keystream_[keystream_used_]);
+          ++keystream_used_;
+          ++i;
+        }
+      }
+    }
+
+    const cipher_type &cipher_;
+    ctl::detail::ghash hash_;
+
+    uint8_t initial_[block_size];
+    uint8_t counter_[block_size];
+    uint8_t keystream_[block_size];
+    uint8_t tag_mask_[block_size];
+
+    uint64_t aad_bits_;
+    uint64_t data_bits_;
+    size_t keystream_used_;
+    bool aad_closed_;
+  };
+
+  /**
+   * @brief Adds up the lengths of a list of pieces
+   */
+  static uint64_t total(pieces list) {
+    uint64_t sum = 0;
+    for (const piece &p : list)
+      sum += static_cast<uint64_t>(p.size);
+    return sum;
+  }
+
+  cipher_type cipher_;
+
+  /**
+   * @brief The GHASH subkey, the block cipher applied to a block of zeroes
+   */
+  uint8_t subkey_[block_size];
+};
+
+} // namespace mode
+} // namespace symmetric
+} // namespace ctl
