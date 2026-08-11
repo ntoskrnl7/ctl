@@ -100,7 +100,8 @@ public:
     hl_ = ctl::detail::load_be64(h + 8);
 
 #if defined(CTL_HAS_X86_HW_ACCEL)
-    hardware_ = ctl::detail::cpu::has_carryless_multiply();
+    hardware_ = ctl::detail::cpu::has_carryless_multiply() &&
+                ctl::detail::cpu::has_byte_shuffle();
     if (hardware_) {
       // Powers of the subkey, used to fold several blocks into one reduction.
       power_h_[0] = hh_;
@@ -145,10 +146,11 @@ public:
 
 #if defined(CTL_HAS_X86_HW_ACCEL)
     if (hardware_) {
-      while (size >= aggregate * block_size) {
-        absorb_aggregated(data);
-        data += aggregate * block_size;
-        size -= aggregate * block_size;
+      const size_t whole = size / block_size;
+      if (whole != 0) {
+        absorb_blocks(data, whole);
+        data += whole * block_size;
+        size -= whole * block_size;
       }
     }
 #endif
@@ -314,7 +316,27 @@ private:
   }
 
   /**
-   * @brief Absorbs several blocks with one reduction
+   * @brief The shuffle that reverses the sixteen bytes of a block
+   */
+  CTL_TARGET_PCLMUL static __m128i byte_reverse_mask() {
+    return _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+  }
+
+  /**
+   * @brief Loads one block straight into the form the multiply wants
+   *
+   * A shuffle turns the natural load into the reversed order in one
+   * instruction. Assembling the two halves through general registers instead
+   * costs two byte reversals and two moves across register files, per block.
+   */
+  CTL_TARGET_PCLMUL static __m128i load_block(const uint8_t *block,
+                                              __m128i reverse) {
+    return _mm_shuffle_epi8(
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(block)), reverse);
+  }
+
+  /**
+   * @brief Absorbs whole blocks, several at a time where possible
    *
    * Expanding the chain for four blocks gives
    *   ((((Y + B0) H + B1) H + B2) H + B3) H
@@ -324,29 +346,53 @@ private:
    * they distribute across the sum and only have to be applied once, to the
    * total. The reduction is the expensive part, which is where the time goes.
    *
-   * @param blocks aggregate whole blocks
+   * The accumulator stays in a vector register for the whole run and is written
+   * back once at the end, rather than crossing register files on every block.
+   *
+   * @param data whole blocks
+   * @param blocks how many
    */
-  CTL_TARGET_PCLMUL void absorb_aggregated(const uint8_t *blocks) {
-    __m128i low = _mm_setzero_si128();
-    __m128i high = _mm_setzero_si128();
+  CTL_TARGET_PCLMUL void absorb_blocks(const uint8_t *data, size_t blocks) {
+    const __m128i reverse = byte_reverse_mask();
+    __m128i powers[aggregate];
+    for (size_t i = 0; i < aggregate; ++i)
+      powers[i] = to_vector(power_h_[i], power_l_[i]);
 
-    for (size_t i = 0; i < aggregate; ++i) {
-      const uint8_t *block = blocks + i * block_size;
-      __m128i x = to_vector(ctl::detail::load_be64(block),
-                            ctl::detail::load_be64(block + 8));
-      if (i == 0)
-        x = _mm_xor_si128(x, to_vector(yh_, yl_));
+    __m128i y = to_vector(yh_, yl_);
 
-      // The first block takes the highest power, the last takes H itself.
-      const size_t power = aggregate - 1 - i;
-      __m128i l;
-      __m128i h;
-      clmul_256(x, to_vector(power_h_[power], power_l_[power]), l, h);
-      low = _mm_xor_si128(low, l);
-      high = _mm_xor_si128(high, h);
+    while (blocks >= aggregate) {
+      __m128i low = _mm_setzero_si128();
+      __m128i high = _mm_setzero_si128();
+
+      for (size_t i = 0; i < aggregate; ++i) {
+        __m128i x = load_block(data + i * block_size, reverse);
+        if (i == 0)
+          x = _mm_xor_si128(x, y);
+
+        // The first block takes the highest power, the last takes H itself.
+        __m128i l;
+        __m128i h;
+        clmul_256(x, powers[aggregate - 1 - i], l, h);
+        low = _mm_xor_si128(low, l);
+        high = _mm_xor_si128(high, h);
+      }
+
+      y = reduce(low, high);
+      data += aggregate * block_size;
+      blocks -= aggregate;
     }
 
-    store_accumulator(reduce(low, high));
+    while (blocks != 0) {
+      __m128i low;
+      __m128i high;
+      clmul_256(_mm_xor_si128(y, load_block(data, reverse)), powers[0], low,
+                high);
+      y = reduce(low, high);
+      data += block_size;
+      --blocks;
+    }
+
+    store_accumulator(y);
   }
 #endif
 

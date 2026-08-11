@@ -78,6 +78,17 @@ inline bool has_carryless_multiply() {
   return supported;
 }
 
+/**
+ * @brief Whether the byte shuffle of SSSE3 is supported
+ *
+ * Every processor with carry-less multiplication also has this, but the two are
+ * separate feature bits and are checked separately rather than assumed.
+ */
+inline bool has_byte_shuffle() {
+  static const bool supported = feature_bit(9);
+  return supported;
+}
+
 } // namespace cpu
 } // namespace detail
 } // namespace ctl
