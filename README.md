@@ -150,9 +150,17 @@ Chosen at run time through CPUID, so one binary runs anywhere.
   throughput the instruction can sustain rather than its latency.
 - **PCLMULQDQ** for the GHASH of GCM, folding four blocks into a single
   reduction.
+- **AES-NI and SSSE3 for ARIA**, which has no instruction of its own. Its SB1 is
+  the AES S-box and its SB3 is the AES inverse S-box, so the AES round
+  instructions provide two of the four; the other two follow from an affine
+  relation recovered from the tables and checked at compile time. The diffusion
+  layer becomes seven byte shuffles. The state then stays in one register for
+  the whole block instead of being written out and read back every round, which
+  is where the time was going.
 
 Define `CTL_NO_HW_ACCEL` to leave all of it out. The published vectors pass
-either way. ARIA has no accelerated path.
+either way, and every cipher with two paths has a test that runs the same inputs
+through both and compares.
 
 ## Measured throughput
 
@@ -160,14 +168,14 @@ AES-128 over a 4096 byte buffer, Intel Core Ultra 7 265K, MSVC `/O2`.
 
 | Mode | Software | Accelerated |
 | --- | --- | --- |
-| ECB | 542 MB/s | 12,076 MB/s |
-| XTS | 438 | 6,581 |
-| CTR | 470 | 4,643 |
-| CBC, which chains and cannot be parallelized | 503 | 1,627 |
-| GCM | 101 | 912 |
+| ECB | 534 MB/s | 12,301 MB/s |
+| XTS | 453 | 6,519 |
+| CTR | 467 | 4,627 |
+| CBC, which chains and cannot be parallelized | 502 | 1,621 |
+| GCM | 102 | 845 |
 
-XTS over 512 byte sectors reaches 4,530 MB/s. ARIA runs at about 121 MB/s, where
-most of the time goes to its byte at a time substitution layer. No operation
+XTS over 512 byte sectors reaches 4,457 MB/s. ARIA runs at 127 MB/s in software
+and 245 MB/s with the vector path, and ARIA-XTS at 220 MB/s. No operation
 performs a heap allocation.
 
 ## Status and limits

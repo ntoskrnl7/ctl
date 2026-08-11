@@ -79,6 +79,57 @@ TEST(aria, key_size_constants) {
   EXPECT_EQ(17u, aria<256>::round_key_count);
 }
 
+namespace {
+
+// The vector path and the table driven path have to agree on every input. Where
+// the vector path is not compiled in, or the processor does not support it, both
+// calls go through the same code and the test still passes meaningfully.
+template <class Cipher> void check_paths_agree() {
+  std::vector<uint8_t> key(Cipher::key_size);
+  for (size_t i = 0; i < key.size(); ++i)
+    key[i] = static_cast<uint8_t>(0x3c + i * 5);
+
+  Cipher cipher(key.data(), key.size());
+
+  std::vector<uint8_t> block(Cipher::block_size);
+  std::vector<uint8_t> by_dispatch(Cipher::block_size);
+  std::vector<uint8_t> by_software(Cipher::block_size);
+
+  uint32_t state = 0x9e3779b9u;
+  for (size_t round = 0; round < 512; ++round) {
+    for (size_t i = 0; i < block.size(); ++i) {
+      state = state * 1664525u + 1013904223u;
+      block[i] = static_cast<uint8_t>(state >> 24);
+    }
+
+    cipher.encrypt_block(block.data(), by_dispatch.data());
+    cipher.encrypt_block_software(block.data(), by_software.data());
+    ASSERT_EQ(test::to_hex(by_software), test::to_hex(by_dispatch))
+        << "encrypt mismatch at round " << round;
+
+    cipher.decrypt_block(by_dispatch.data(), by_dispatch.data());
+    cipher.decrypt_block_software(by_software.data(), by_software.data());
+    ASSERT_EQ(test::to_hex(by_software), test::to_hex(by_dispatch))
+        << "decrypt mismatch at round " << round;
+    ASSERT_EQ(test::to_hex(block), test::to_hex(by_dispatch))
+        << "roundtrip mismatch at round " << round;
+  }
+}
+
+} // namespace
+
+TEST(aria, vector_path_agrees_with_software_128) {
+  check_paths_agree<aria<128>>();
+}
+
+TEST(aria, vector_path_agrees_with_software_192) {
+  check_paths_agree<aria<192>>();
+}
+
+TEST(aria, vector_path_agrees_with_software_256) {
+  check_paths_agree<aria<256>>();
+}
+
 TEST(aria, rejects_short_key_buffer) {
   const std::vector<uint8_t> key = test::hex("00112233445566778899aabbccdd");
   ASSERT_LT(key.size(), aria<128>::key_size);

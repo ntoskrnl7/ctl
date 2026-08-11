@@ -33,8 +33,17 @@
 #include <stdexcept>
 
 #include <ctl/detail/config>
+#include <ctl/detail/cpu>
 #include <ctl/detail/memory>
 #include <ctl/detail/sbox>
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <immintrin.h>
+#endif
+#endif
 
 namespace ctl {
 namespace symmetric {
@@ -176,6 +185,217 @@ static_assert(reproduces_sb2(sb2_from_sb1),
               "substitution layer cannot derive one from the other");
 
 /**
+ * @brief SB1 composed with the inverse of SB2, which is the inverse of the map
+ * above
+ */
+constexpr uint8_t sb1_after_sb2_inverse(uint8_t value) {
+  return ctl::detail::aes_sbox.forward[sb2.inverse[value]];
+}
+
+/**
+ * @brief Recovers the affine map that undoes the one from SB1 to SB2
+ */
+constexpr affine_map derive_sb1_from_sb2() {
+  affine_map map = {};
+  map.constant = sb1_after_sb2_inverse(0);
+  for (unsigned int i = 0; i < 8; ++i)
+    map.column[i] = static_cast<uint8_t>(
+        sb1_after_sb2_inverse(static_cast<uint8_t>(1u << i)) ^ map.constant);
+  return map;
+}
+
+/**
+ * @brief The map that satisfies SB4(x) == SB3(apply_affine(map, x))
+ *
+ * SB4 is the inverse of SB2, and SB2 is this affine map composed onto SB1, so
+ * undoing the map and then applying the inverse of SB1 gives SB4. That is what
+ * lets a vectorized substitution derive all four S-boxes from the two the AES
+ * instructions provide.
+ */
+inline constexpr affine_map sb1_from_sb2 = derive_sb1_from_sb2();
+
+/**
+ * @brief Confirms the two maps undo each other on every input
+ */
+constexpr bool maps_are_inverse() {
+  for (unsigned int i = 0; i < 256; ++i) {
+    const uint8_t value = static_cast<uint8_t>(i);
+    if (apply_affine(sb1_from_sb2, apply_affine(sb2_from_sb1, value)) != value)
+      return false;
+    if (sb2.inverse[i] !=
+        ctl::detail::aes_sbox.inverse[apply_affine(sb1_from_sb2, value)])
+      return false;
+  }
+  return true;
+}
+
+static_assert(maps_are_inverse(),
+              "the affine maps between ARIA SB1 and SB2 are not inverses, so "
+              "SB4 cannot be derived from SB3");
+
+/**
+ * @brief The sixteen entry tables that apply the linear part of an affine map
+ *
+ * A linear map splits across the two nibbles of a byte, so a byte shuffle over
+ * a sixteen entry table handles each half and the results are added. This is
+ * how the map is applied to all sixteen bytes at once.
+ */
+struct nibble_tables {
+  uint8_t low[16];
+  uint8_t high[16];
+  uint8_t constant;
+};
+
+/**
+ * @brief Splits an affine map into the tables above
+ */
+constexpr nibble_tables to_nibble_tables(const affine_map &map) {
+  nibble_tables tables = {};
+  for (unsigned int n = 0; n < 16; ++n) {
+    tables.low[n] =
+        static_cast<uint8_t>(apply_affine(map, static_cast<uint8_t>(n)) ^
+                             map.constant);
+    tables.high[n] =
+        static_cast<uint8_t>(apply_affine(map, static_cast<uint8_t>(n << 4)) ^
+                             map.constant);
+  }
+  tables.constant = map.constant;
+  return tables;
+}
+
+inline constexpr nibble_tables sb2_tables = to_nibble_tables(sb2_from_sb1);
+inline constexpr nibble_tables sb4_tables = to_nibble_tables(sb1_from_sb2);
+
+/**
+ * @brief Confirms the split tables reproduce the map they came from
+ */
+constexpr bool tables_reproduce(const nibble_tables &tables,
+                                const affine_map &map) {
+  for (unsigned int i = 0; i < 256; ++i) {
+    const uint8_t combined = static_cast<uint8_t>(
+        tables.low[i & 0x0f] ^ tables.high[i >> 4] ^ tables.constant);
+    if (combined != apply_affine(map, static_cast<uint8_t>(i)))
+      return false;
+  }
+  return true;
+}
+
+static_assert(tables_reproduce(sb2_tables, sb2_from_sb1),
+              "the nibble split of the SB1 to SB2 map is wrong");
+static_assert(tables_reproduce(sb4_tables, sb1_from_sb2),
+              "the nibble split of the SB2 to SB1 map is wrong");
+
+/**
+ * @brief Byte shuffles that undo and redo the row shift of AES
+ *
+ * The AES instructions apply a row shift alongside the substitution. Undoing it
+ * beforehand leaves the substitution on its own, which is what ARIA needs.
+ * Row r of the AES state is byte 4c+r, and the shift moves it by r columns.
+ */
+constexpr uint8_t undo_row_shift(unsigned int j) {
+  const unsigned int row = j % 4;
+  const unsigned int column = j / 4;
+  return static_cast<uint8_t>(4 * ((column + 4 - row) % 4) + row);
+}
+
+constexpr uint8_t redo_row_shift(unsigned int j) {
+  const unsigned int row = j % 4;
+  const unsigned int column = j / 4;
+  return static_cast<uint8_t>(4 * ((column + row) % 4) + row);
+}
+
+/**
+ * @brief The diffusion layer written as seven byte shuffles
+ *
+ * Every output of A is the sum of seven inputs and every input feeds seven
+ * outputs, so the matrix is seven regular and splits into seven permutations.
+ * Adding the seven shuffled copies of the input reproduces A exactly, in seven
+ * shuffles and six additions rather than sixty byte operations.
+ *
+ * The split was computed once and written down here; the test that compares the
+ * vector path against the scalar one covers whether it is right.
+ */
+inline constexpr uint8_t diffusion_shuffles[7][16] = {
+    {8, 7, 4, 11, 14, 10, 9, 13, 15, 6, 3, 2, 12, 0, 5, 1},
+    {14, 12, 10, 7, 15, 1, 0, 11, 4, 5, 13, 9, 6, 8, 3, 2},
+    {3, 5, 11, 10, 0, 15, 7, 1, 13, 14, 8, 12, 2, 6, 9, 4},
+    {13, 9, 1, 0, 8, 14, 2, 6, 7, 12, 15, 3, 11, 10, 4, 5},
+    {6, 2, 15, 13, 11, 9, 10, 12, 1, 0, 5, 4, 7, 3, 14, 8},
+    {4, 15, 12, 5, 2, 3, 13, 8, 0, 1, 6, 14, 9, 7, 11, 10},
+    {9, 8, 6, 14, 5, 4, 12, 3, 10, 11, 2, 7, 1, 13, 0, 15}};
+
+/**
+ * @brief Confirms each shuffle really is a permutation and that together they
+ * use every edge of A exactly once
+ */
+constexpr bool shuffles_are_a_decomposition() {
+  unsigned int seen[16][16] = {};
+  for (unsigned int k = 0; k < 7; ++k) {
+    bool used[16] = {};
+    for (unsigned int i = 0; i < 16; ++i) {
+      const unsigned int source = diffusion_shuffles[k][i];
+      if (used[source])
+        return false;
+      used[source] = true;
+      ++seen[i][source];
+    }
+  }
+  for (unsigned int i = 0; i < 16; ++i) {
+    unsigned int count = 0;
+    for (unsigned int j = 0; j < 16; ++j) {
+      if (seen[i][j] > 1)
+        return false;
+      count += seen[i][j];
+    }
+    if (count != 7)
+      return false;
+  }
+  return true;
+}
+
+static_assert(shuffles_are_a_decomposition(),
+              "the diffusion shuffles are not seven distinct permutations");
+
+/**
+ * @brief A sixteen byte constant, laid out for a byte shuffle
+ */
+struct byte_vector {
+  uint8_t byte[16];
+};
+
+constexpr byte_vector make_undo_row_shift() {
+  byte_vector v = {};
+  for (unsigned int j = 0; j < 16; ++j)
+    v.byte[j] = undo_row_shift(j);
+  return v;
+}
+
+constexpr byte_vector make_redo_row_shift() {
+  byte_vector v = {};
+  for (unsigned int j = 0; j < 16; ++j)
+    v.byte[j] = redo_row_shift(j);
+  return v;
+}
+
+/**
+ * @brief Selects the byte positions where the index leaves the given remainder
+ *
+ * Both substitution layers apply their four S-boxes in a repeating pattern of
+ * four, so the four results are combined by selecting from each in turn.
+ */
+constexpr byte_vector make_selector(unsigned int remainder) {
+  byte_vector v = {};
+  for (unsigned int i = 0; i < 16; ++i)
+    v.byte[i] = (i % 4 == remainder) ? 0xff : 0x00;
+  return v;
+}
+
+inline constexpr byte_vector undo_shift_vector = make_undo_row_shift();
+inline constexpr byte_vector redo_shift_vector = make_redo_row_shift();
+inline constexpr byte_vector selector[4] = {
+    make_selector(0), make_selector(1), make_selector(2), make_selector(3)};
+
+/**
  * @brief The key schedule constants C1, C2 and C3 (section 2.2 of RFC 5794)
  *
  * Taken from the leading 128*3 bits of the fractional part of 1/PI.
@@ -300,6 +520,12 @@ public:
    * @param key must hold at least key_size bytes
    */
   void set_key(const uint8_t *key) {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    // The vector path needs the AES instructions for two of the four S-boxes
+    // and the byte shuffle for the other two and for the diffusion layer.
+    simd_ = ctl::detail::cpu::has_aes() && ctl::detail::cpu::has_byte_shuffle();
+#endif
+
     // KL is the leading 128 bits and KR is the remainder, right padded with
     // zeroes to 128 bits.
     uint8_t kl[16];
@@ -364,6 +590,29 @@ public:
    */
   void decrypt_block(const uint8_t *input, uint8_t *output) const {
     crypt(dk_, input, output);
+  }
+
+  /**
+   * @brief Encrypts one block using the table driven path
+   *
+   * This path stays public even where a vector path exists, because testing
+   * that the two agree requires a reference to compare against.
+   *
+   * @param input input block of block_size bytes
+   * @param output output block of block_size bytes, may be the same as input
+   */
+  void encrypt_block_software(const uint8_t *input, uint8_t *output) const {
+    crypt_software(ek_, input, output);
+  }
+
+  /**
+   * @brief Decrypts one block using the table driven path
+   *
+   * @param input input block of block_size bytes
+   * @param output output block of block_size bytes, may be the same as input
+   */
+  void decrypt_block_software(const uint8_t *input, uint8_t *output) const {
+    crypt_software(dk_, input, output);
   }
 
   /**
@@ -467,9 +716,9 @@ private:
   /**
    * @brief Transforms one block with a mask applied on both sides
    */
-  static void block_masked(const uint8_t (&round_key)[round_key_count][16],
-                           const uint8_t *input, const uint8_t *mask,
-                           uint8_t *output) {
+  void block_masked(const uint8_t (&round_key)[round_key_count][16],
+                    const uint8_t *input, const uint8_t *mask,
+                    uint8_t *output) const {
     uint8_t buffer[block_size];
     ctl::detail::xor_block<block_size>(input, mask, buffer);
     crypt(round_key, buffer, buffer);
@@ -623,8 +872,25 @@ private:
    *
    * The last round has no diffusion layer, only SL2 and the key additions.
    */
-  static void crypt(const uint8_t (&round_key)[round_key_count][16],
-                    const uint8_t *input, uint8_t *output) {
+  void crypt(const uint8_t (&round_key)[round_key_count][16],
+             const uint8_t *input, uint8_t *output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (simd_) {
+      crypt_vector(round_key, input, output);
+      return;
+    }
+#endif
+    crypt_software(round_key, input, output);
+  }
+
+  /**
+   * @brief Transforms one block with the table driven path
+   *
+   * Kept available even where the vector path exists, so that the two can be
+   * checked against each other.
+   */
+  static void crypt_software(const uint8_t (&round_key)[round_key_count][16],
+                             const uint8_t *input, uint8_t *output) {
     uint8_t state[16];
     memcpy(state, input, sizeof(state));
 
@@ -643,6 +909,139 @@ private:
     ctl::detail::secure_zero(state, sizeof(state));
   }
 
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  /**
+   * @brief Loads a sixteen byte constant
+   */
+  CTL_TARGET_AESNI static __m128i constant(const aria_detail::byte_vector &v) {
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(v.byte));
+  }
+
+  /**
+   * @brief Applies SB1 to all sixteen bytes
+   *
+   * ARIA's SB1 is the AES S-box, so the last round instruction of AES performs
+   * it. That instruction also shifts the rows, which is undone beforehand so
+   * that only the substitution remains.
+   */
+  CTL_TARGET_AESNI static __m128i substitute_1(__m128i x) {
+    return _mm_aesenclast_si128(
+        _mm_shuffle_epi8(x, constant(aria_detail::undo_shift_vector)),
+        _mm_setzero_si128());
+  }
+
+  /**
+   * @brief Applies SB3 to all sixteen bytes
+   *
+   * SB3 is the inverse of SB1 and so is the AES inverse S-box, which the last
+   * round instruction of AES decryption performs.
+   */
+  CTL_TARGET_AESNI static __m128i substitute_3(__m128i x) {
+    return _mm_aesdeclast_si128(
+        _mm_shuffle_epi8(x, constant(aria_detail::redo_shift_vector)),
+        _mm_setzero_si128());
+  }
+
+  /**
+   * @brief Applies an affine map to all sixteen bytes
+   *
+   * The linear part splits across the two nibbles of a byte, so one shuffle
+   * over a sixteen entry table handles each half.
+   */
+  CTL_TARGET_AESNI static __m128i
+  affine(__m128i x, const aria_detail::nibble_tables &tables) {
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    const __m128i low = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(tables.low));
+    const __m128i high = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(tables.high));
+    return _mm_xor_si128(
+        _mm_xor_si128(
+            _mm_shuffle_epi8(low, _mm_and_si128(x, mask)),
+            _mm_shuffle_epi8(high,
+                             _mm_and_si128(_mm_srli_epi16(x, 4), mask))),
+        _mm_set1_epi8(static_cast<char>(tables.constant)));
+  }
+
+  /**
+   * @brief Selects from four results by byte position
+   */
+  CTL_TARGET_AESNI static __m128i pick(__m128i a, __m128i b, __m128i c,
+                                       __m128i d) {
+    return _mm_or_si128(
+        _mm_or_si128(
+            _mm_and_si128(a, constant(aria_detail::selector[0])),
+            _mm_and_si128(b, constant(aria_detail::selector[1]))),
+        _mm_or_si128(_mm_and_si128(c, constant(aria_detail::selector[2])),
+                     _mm_and_si128(d, constant(aria_detail::selector[3]))));
+  }
+
+  /**
+   * @brief The substitution layers, both built from the same four results
+   *
+   * SB2 is the affine map applied to SB1, and SB4 is SB3 applied after the
+   * inverse of that map, so the two AES instructions cover all four S-boxes.
+   */
+  template <bool _Type1> CTL_TARGET_AESNI static __m128i substitute(__m128i x) {
+    const __m128i s1 = substitute_1(x);
+    const __m128i s2 = affine(s1, aria_detail::sb2_tables);
+    const __m128i s3 = substitute_3(x);
+    const __m128i s4 = substitute_3(affine(x, aria_detail::sb4_tables));
+    if constexpr (_Type1)
+      return pick(s1, s2, s3, s4);
+    else
+      return pick(s3, s4, s1, s2);
+  }
+
+  /**
+   * @brief The diffusion layer as seven shuffles added together
+   */
+  CTL_TARGET_AESNI static __m128i diffuse_vector(__m128i x) {
+    __m128i result = _mm_shuffle_epi8(
+        x, _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+               aria_detail::diffusion_shuffles[0])));
+    for (size_t k = 1; k < 7; ++k)
+      result = _mm_xor_si128(
+          result, _mm_shuffle_epi8(
+                      x, _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                             aria_detail::diffusion_shuffles[k]))));
+    return result;
+  }
+
+  /**
+   * @brief Transforms one block without the state ever leaving a register
+   *
+   * This is where the time goes in the table driven path: a byte at a time
+   * substitution forces the sixteen byte state out to memory and back on every
+   * round. Here it stays in one vector register from the first round to the
+   * last.
+   */
+  CTL_TARGET_AESNI void
+  crypt_vector(const uint8_t (&round_key)[round_key_count][16],
+               const uint8_t *input, uint8_t *output) const {
+    __m128i state =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(input));
+
+    for (size_t round = 1; round < rounds; ++round) {
+      state = _mm_xor_si128(state,
+                            _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                                round_key[round - 1])));
+      state = (round & 1) ? substitute<true>(state) : substitute<false>(state);
+      state = diffuse_vector(state);
+    }
+
+    state = _mm_xor_si128(state,
+                          _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                              round_key[rounds - 1])));
+    state = substitute<false>(state);
+    state = _mm_xor_si128(state,
+                          _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+                              round_key[rounds])));
+
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(output), state);
+  }
+#endif
+
   /**
    * @brief Round keys for encryption
    */
@@ -652,6 +1051,13 @@ private:
    * @brief Round keys for decryption
    */
   uint8_t dk_[round_key_count][16];
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  /**
+   * @brief Whether the vector path is used, determined once when the key is set
+   */
+  bool simd_;
+#endif
 };
 
 /**
