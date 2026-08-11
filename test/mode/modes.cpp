@@ -8,6 +8,7 @@
  */
 #include <gtest/gtest.h>
 
+#include <ctl/bytes>
 #include <ctl/symmetric/cipher/aes>
 #include <ctl/symmetric/cipher/aria>
 #include <ctl/symmetric/mode/cbc>
@@ -50,21 +51,20 @@ void check_ecb(const char *key_hex, const char *cipher_hex) {
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
   ASSERT_EQ(key.size(), Cipher::key_size);
 
-  mode::ecb<Cipher> ecb(key.data(), key.size());
+  mode::ecb<Cipher> ecb(key);
 
   std::vector<uint8_t> encrypted(plain.size());
-  ASSERT_TRUE(ecb.encrypt(plain.data(), plain.size(), encrypted.data()));
+  ASSERT_TRUE(ecb.encrypt(plain, encrypted));
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(encrypted));
 
   std::vector<uint8_t> decrypted(plain.size());
-  ASSERT_TRUE(
-      ecb.decrypt(encrypted.data(), encrypted.size(), decrypted.data()));
+  ASSERT_TRUE(ecb.decrypt(encrypted, decrypted));
   EXPECT_EQ(std::string(kPlaintext), test::to_hex(decrypted));
 
   std::vector<uint8_t> buffer = plain;
-  ASSERT_TRUE(ecb.encrypt(buffer.data(), buffer.size(), buffer.data()));
+  ASSERT_TRUE(ecb.encrypt(buffer, buffer));
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(buffer));
-  ASSERT_TRUE(ecb.decrypt(buffer.data(), buffer.size(), buffer.data()));
+  ASSERT_TRUE(ecb.decrypt(buffer, buffer));
   EXPECT_EQ(std::string(kPlaintext), test::to_hex(buffer));
 }
 
@@ -79,27 +79,24 @@ template <class Cipher>
 void check_cbc(const char *key_hex, const char *cipher_hex) {
   const std::vector<uint8_t> key = test::hex(key_hex);
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
-  const std::vector<uint8_t> iv_bytes = test::hex(kIv);
+  const std::vector<uint8_t> iv = test::hex(kIv);
   ASSERT_EQ(key.size(), Cipher::key_size);
+  ASSERT_EQ(iv.size(), mode::cbc<Cipher>::iv_size);
 
-  typename mode::cbc<Cipher>::iv_t iv;
-  memcpy(&iv[0], iv_bytes.data(), sizeof(iv));
-
-  mode::cbc<Cipher> cbc(key.data(), key.size());
+  mode::cbc<Cipher> cbc(key);
 
   std::vector<uint8_t> encrypted(plain.size());
-  ASSERT_TRUE(cbc.encrypt(iv, plain.data(), plain.size(), encrypted.data()));
+  ASSERT_TRUE(cbc.encrypt(iv, plain, encrypted));
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(encrypted));
 
   std::vector<uint8_t> decrypted(plain.size());
-  ASSERT_TRUE(
-      cbc.decrypt(iv, encrypted.data(), encrypted.size(), decrypted.data()));
+  ASSERT_TRUE(cbc.decrypt(iv, encrypted, decrypted));
   EXPECT_EQ(std::string(kPlaintext), test::to_hex(decrypted));
 
   std::vector<uint8_t> buffer = plain;
-  ASSERT_TRUE(cbc.encrypt(iv, buffer.data(), buffer.size(), buffer.data()));
+  ASSERT_TRUE(cbc.encrypt(iv, buffer, buffer));
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(buffer));
-  ASSERT_TRUE(cbc.decrypt(iv, buffer.data(), buffer.size(), buffer.data()));
+  ASSERT_TRUE(cbc.decrypt(iv, buffer, buffer));
   EXPECT_EQ(std::string(kPlaintext), test::to_hex(buffer));
 }
 
@@ -110,24 +107,22 @@ template <class Cipher>
 void check_ctr(const char *key_hex, const char *cipher_hex) {
   const std::vector<uint8_t> key = test::hex(key_hex);
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
-  const std::vector<uint8_t> nonce_bytes = test::hex(kInitialCounter);
+  const std::vector<uint8_t> nonce = test::hex(kInitialCounter);
   ASSERT_EQ(key.size(), Cipher::key_size);
+  ASSERT_EQ(nonce.size(), mode::ctr<Cipher>::nonce_size);
 
-  typename mode::ctr<Cipher>::nonce_t nonce;
-  memcpy(&nonce[0], nonce_bytes.data(), sizeof(nonce));
-
-  mode::ctr<Cipher> ctr(key.data(), key.size());
+  mode::ctr<Cipher> ctr(key);
 
   std::vector<uint8_t> encrypted(plain.size());
-  ctr.crypt(nonce, 0, plain.data(), plain.size(), encrypted.data());
+  ctr.crypt(nonce, 0, plain, encrypted);
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(encrypted));
 
   std::vector<uint8_t> decrypted(plain.size());
-  ctr.crypt(nonce, 0, encrypted.data(), encrypted.size(), decrypted.data());
+  ctr.crypt(nonce, 0, encrypted, decrypted);
   EXPECT_EQ(std::string(kPlaintext), test::to_hex(decrypted));
 
   std::vector<uint8_t> buffer = plain;
-  ctr.crypt(nonce, 0, buffer.data(), buffer.size(), buffer.data());
+  ctr.crypt(nonce, 0, buffer, buffer);
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(buffer));
 }
 
@@ -139,32 +134,26 @@ template <class Mode>
 void check_xts(const char *key_hex, const char *tweak_hex,
                const char *plain_hex, const char *cipher_hex) {
   const std::vector<uint8_t> key = test::hex(key_hex);
-  const std::vector<uint8_t> tweak_bytes = test::hex(tweak_hex);
+  const std::vector<uint8_t> tweak = test::hex(tweak_hex);
   const std::vector<uint8_t> plain = test::hex(plain_hex);
 
   ASSERT_EQ(key.size(), Mode::key_size);
-  ASSERT_EQ(tweak_bytes.size(), Mode::tweak_size);
+  ASSERT_EQ(tweak.size(), Mode::tweak_size);
 
-  typename Mode::tweak_t tweak;
-  memcpy(&tweak[0], tweak_bytes.data(), Mode::tweak_size);
-
-  Mode mode(key.data(), key.size());
+  Mode mode(key);
 
   std::vector<uint8_t> encrypted(plain.size());
-  ASSERT_TRUE(mode.encrypt(tweak, plain.data(), plain.size(),
-                           encrypted.data()));
+  ASSERT_TRUE(mode.encrypt(tweak, plain, encrypted));
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(encrypted));
 
   std::vector<uint8_t> decrypted(plain.size());
-  ASSERT_TRUE(mode.decrypt(tweak, encrypted.data(), encrypted.size(),
-                           decrypted.data()));
+  ASSERT_TRUE(mode.decrypt(tweak, encrypted, decrypted));
   EXPECT_EQ(std::string(plain_hex), test::to_hex(decrypted));
 
   // Operating in place. Ciphertext stealing crosses over the last two blocks,
   // so getting the order of the reads and writes wrong shows up here.
   std::vector<uint8_t> inplace = plain;
-  ASSERT_TRUE(mode.encrypt(tweak, inplace.data(), inplace.size(),
-                           inplace.data()));
+  ASSERT_TRUE(mode.encrypt(tweak, inplace, inplace));
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(inplace));
 }
 
@@ -196,25 +185,25 @@ TEST(ecb, sp800_38a_f15_aes256) {
 TEST(ecb, rejects_non_block_multiple_length) {
   const std::vector<uint8_t> key = test::hex(kKey128);
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
-  mode::ecb<aes128> ecb(key.data(), key.size());
+  mode::ecb<aes128> ecb(key);
 
   std::vector<uint8_t> output(plain.size());
-  const auto result =
-      ecb.encrypt(plain.data(), plain.size() - 1, output.data());
+  const auto result = ecb.encrypt(ctl::bytes(plain).first(plain.size() - 1),
+                                  output);
   ASSERT_FALSE(result);
   EXPECT_EQ(mode::ecb<aes128>::invalid_input_length, result.error().value);
 
-  const auto decrypted =
-      ecb.decrypt(plain.data(), plain.size() - 1, output.data());
+  const auto decrypted = ecb.decrypt(ctl::bytes(plain).first(plain.size() - 1),
+                                     output);
   ASSERT_FALSE(decrypted);
   EXPECT_EQ(mode::ecb<aes128>::invalid_input_length, decrypted.error().value);
 }
 
 TEST(ecb, accepts_empty_input) {
   const std::vector<uint8_t> key = test::hex(kKey128);
-  mode::ecb<aes128> ecb(key.data(), key.size());
-  EXPECT_TRUE(ecb.encrypt(nullptr, 0, nullptr));
-  EXPECT_TRUE(ecb.decrypt(nullptr, 0, nullptr));
+  mode::ecb<aes128> ecb(key);
+  EXPECT_TRUE(ecb.encrypt(ctl::bytes(), ctl::writable_bytes()));
+  EXPECT_TRUE(ecb.decrypt(ctl::bytes(), ctl::writable_bytes()));
 }
 
 // ---------------------------------------------------------------- CBC
@@ -244,16 +233,16 @@ TEST(cbc, rejects_non_block_multiple_length) {
   const std::vector<uint8_t> key = test::hex(kKey128);
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
   mode::cbc<aes128>::iv_t iv = {0};
-  mode::cbc<aes128> cbc(key.data(), key.size());
+  mode::cbc<aes128> cbc(key);
 
   std::vector<uint8_t> output(plain.size());
   const auto result =
-      cbc.encrypt(iv, plain.data(), plain.size() - 1, output.data());
+      cbc.encrypt(iv, ctl::bytes(plain).first(plain.size() - 1), output);
   ASSERT_FALSE(result);
   EXPECT_EQ(mode::cbc<aes128>::invalid_input_length, result.error().value);
 
   const auto decrypted =
-      cbc.decrypt(iv, plain.data(), plain.size() - 1, output.data());
+      cbc.decrypt(iv, ctl::bytes(plain).first(plain.size() - 1), output);
   ASSERT_FALSE(decrypted);
   EXPECT_EQ(mode::cbc<aes128>::invalid_input_length, decrypted.error().value);
 }
@@ -263,7 +252,7 @@ TEST(cbc, rejects_non_block_multiple_length) {
 TEST(cbc, the_iv_reaches_the_first_block) {
   const std::vector<uint8_t> key = test::hex(kKey128);
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
-  mode::cbc<aes128> cbc(key.data(), key.size());
+  mode::cbc<aes128> cbc(key);
 
   mode::cbc<aes128>::iv_t first = {0};
   mode::cbc<aes128>::iv_t second = {0};
@@ -271,8 +260,8 @@ TEST(cbc, the_iv_reaches_the_first_block) {
 
   std::vector<uint8_t> a(plain.size());
   std::vector<uint8_t> b(plain.size());
-  ASSERT_TRUE(cbc.encrypt(first, plain.data(), plain.size(), a.data()));
-  ASSERT_TRUE(cbc.encrypt(second, plain.data(), plain.size(), b.data()));
+  ASSERT_TRUE(cbc.encrypt(first, plain, a));
+  ASSERT_TRUE(cbc.encrypt(second, plain, b));
   EXPECT_NE(test::to_hex(a), test::to_hex(b));
 }
 
@@ -306,22 +295,18 @@ TEST(ctr, sp800_38a_f55_aes256) {
 TEST(ctr, random_access_matches_sequential) {
   const std::vector<uint8_t> key = test::hex(kKey128);
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
-  const std::vector<uint8_t> nonce_bytes = test::hex(kInitialCounter);
+  const std::vector<uint8_t> nonce = test::hex(kInitialCounter);
 
-  mode::ctr<aes128>::nonce_t nonce;
-  memcpy(&nonce[0], nonce_bytes.data(), sizeof(nonce));
-
-  mode::ctr<aes128> ctr(key.data(), key.size());
+  mode::ctr<aes128> ctr(key);
 
   std::vector<uint8_t> whole(plain.size());
-  ctr.crypt(nonce, 0, plain.data(), plain.size(), whole.data());
+  ctr.crypt(nonce, 0, plain, whole);
 
   // Checked at offsets that do not line up with a block boundary.
   for (size_t offset : {size_t(1), size_t(15), size_t(16), size_t(17),
                         size_t(31), size_t(48), size_t(63)}) {
     std::vector<uint8_t> partial(plain.size() - offset);
-    ctr.crypt(nonce, offset, plain.data() + offset, partial.size(),
-              partial.data());
+    ctr.crypt(nonce, offset, ctl::bytes(plain).last(partial.size()), partial);
     EXPECT_EQ(test::to_hex(whole.data() + offset, partial.size()),
               test::to_hex(partial))
         << "offset = " << offset;
@@ -333,20 +318,17 @@ TEST(ctr, random_access_matches_sequential) {
 TEST(ctr, partial_lengths_match_a_truncated_run) {
   const std::vector<uint8_t> key = test::hex(kKey128);
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
-  const std::vector<uint8_t> nonce_bytes = test::hex(kInitialCounter);
+  const std::vector<uint8_t> nonce = test::hex(kInitialCounter);
 
-  mode::ctr<aes128>::nonce_t nonce;
-  memcpy(&nonce[0], nonce_bytes.data(), sizeof(nonce));
-
-  mode::ctr<aes128> ctr(key.data(), key.size());
+  mode::ctr<aes128> ctr(key);
 
   std::vector<uint8_t> whole(plain.size());
-  ctr.crypt(nonce, 0, plain.data(), plain.size(), whole.data());
+  ctr.crypt(nonce, 0, plain, whole);
 
   for (size_t length : {size_t(0), size_t(1), size_t(15), size_t(16),
                         size_t(17), size_t(33), size_t(63)}) {
     std::vector<uint8_t> partial(length);
-    ctr.crypt(nonce, 0, plain.data(), length, partial.data());
+    ctr.crypt(nonce, 0, ctl::bytes(plain).first(length), partial);
     EXPECT_EQ(test::to_hex(whole.data(), length), test::to_hex(partial))
         << "length = " << length;
   }
@@ -400,17 +382,15 @@ TEST(xts, cavp_aes128_sequence_number_form) {
   const std::vector<uint8_t> plain =
       test::hex("46409f7426eb4e3d33480534b80fe6e09fed6583907eb83c84");
 
-  mode::xts<aes128> xts(key.data(), key.size());
+  mode::xts<aes128> xts(key);
 
   std::vector<uint8_t> encrypted(plain.size());
-  ASSERT_TRUE(xts.encrypt(static_cast<uint64_t>(117), plain.data(),
-                          plain.size(), encrypted.data()));
+  ASSERT_TRUE(xts.encrypt(static_cast<uint64_t>(117), plain, encrypted));
   EXPECT_EQ(std::string("a19d9b3209d388740a581975091fe26deecbb0f117c22b0ae4"),
             test::to_hex(encrypted));
 
   std::vector<uint8_t> decrypted(plain.size());
-  ASSERT_TRUE(xts.decrypt(static_cast<uint64_t>(117), encrypted.data(),
-                          encrypted.size(), decrypted.data()));
+  ASSERT_TRUE(xts.decrypt(static_cast<uint64_t>(117), encrypted, decrypted));
   EXPECT_EQ(test::to_hex(plain), test::to_hex(decrypted));
 }
 
@@ -425,19 +405,24 @@ TEST(xts, rejects_data_unit_shorter_than_one_block) {
   const std::vector<uint8_t> key = test::hex("fb46fb3cab7f67ad5207bc232c50dcbb"
                                             "24dbd1564590855d4cb777b3ba6431c3");
   std::vector<uint8_t> buffer(15);
-  mode::xts<aes128> xts(key.data(), key.size());
+  mode::xts<aes128> xts(key);
 
-  const auto result = xts.encrypt(static_cast<uint64_t>(0), buffer.data(),
-                                  buffer.size(), buffer.data());
+  const auto result = xts.encrypt(static_cast<uint64_t>(0), buffer, buffer);
   ASSERT_FALSE(result);
   EXPECT_EQ(mode::xts<aes128>::data_unit_too_short, result.error().value);
 }
 
-TEST(xts, rejects_short_key_buffer) {
-  const std::vector<uint8_t> key = test::hex("00112233445566778899aabbccddeeff");
-  ASSERT_LT(key.size(), mode::xts<aes128>::key_size);
-  EXPECT_THROW(mode::xts<aes128>(key.data(), key.size()),
+TEST(xts, rejects_key_of_the_wrong_length) {
+  const std::vector<uint8_t> short_key =
+      test::hex("00112233445566778899aabbccddeeff");
+  ASSERT_LT(short_key.size(), mode::xts<aes128>::key_size);
+  EXPECT_THROW(mode::xts<aes128>{ctl::bytes(short_key)},
                std::invalid_argument);
+
+  // A key that is too long used to be accepted and silently truncated, which
+  // is how a key meant for a different cipher ends up in use unnoticed.
+  const std::vector<uint8_t> long_key(mode::xts<aes128>::key_size + 1);
+  EXPECT_THROW(mode::xts<aes128>{ctl::bytes(long_key)}, std::invalid_argument);
 }
 
 // Data units of many lengths, including several that are not a multiple of the
@@ -446,7 +431,7 @@ TEST(xts, rejects_short_key_buffer) {
 TEST(xts, round_trips_at_every_length) {
   const std::vector<uint8_t> key = test::hex("fb46fb3cab7f67ad5207bc232c50dcbb"
                                             "24dbd1564590855d4cb777b3ba6431c3");
-  mode::xts<aes128> xts(key.data(), key.size());
+  mode::xts<aes128> xts(key);
 
   std::vector<uint8_t> plain(200);
   for (size_t i = 0; i < plain.size(); ++i)
@@ -455,15 +440,86 @@ TEST(xts, round_trips_at_every_length) {
   for (size_t length = 16; length <= plain.size(); ++length) {
     std::vector<uint8_t> encrypted(length);
     std::vector<uint8_t> decrypted(length);
-    ASSERT_TRUE(xts.encrypt(static_cast<uint64_t>(length), plain.data(), length,
-                            encrypted.data()))
+    ASSERT_TRUE(xts.encrypt(static_cast<uint64_t>(length),
+                            ctl::bytes(plain).first(length), encrypted))
         << "length = " << length;
-    ASSERT_TRUE(xts.decrypt(static_cast<uint64_t>(length), encrypted.data(),
-                            length, decrypted.data()))
+    ASSERT_TRUE(xts.decrypt(static_cast<uint64_t>(length), encrypted,
+                            decrypted))
         << "length = " << length;
     EXPECT_EQ(test::to_hex(plain.data(), length), test::to_hex(decrypted))
         << "length = " << length;
   }
+}
+
+// ------------------------------------------------------- lengths that no
+// ------------------------------------------------------- longer have to be
+// ------------------------------------------------------- kept in step
+
+// The length of a key is part of the type of the argument, so the only way to
+// get it wrong is with a container whose length is decided at run time, and
+// that is checked where it is handed over rather than read past its end.
+TEST(lengths, a_key_of_the_wrong_length_is_refused) {
+  const std::vector<uint8_t> correct(aes128::key_size);
+  const std::vector<uint8_t> too_short(aes128::key_size - 1);
+  const std::vector<uint8_t> too_long(aes128::key_size + 1);
+
+  EXPECT_NO_THROW(mode::ecb<aes128>{ctl::bytes(correct)});
+  EXPECT_THROW(mode::ecb<aes128>{ctl::bytes(too_short)},
+               std::invalid_argument);
+  EXPECT_THROW(mode::ecb<aes128>{ctl::bytes(too_long)}, std::invalid_argument);
+}
+
+// An initialization vector, a nonce and a tweak are fixed length in the same
+// way as a key.
+TEST(lengths, a_nonce_of_the_wrong_length_is_refused) {
+  const std::vector<uint8_t> key(aes128::key_size);
+  const std::vector<uint8_t> plain(32);
+  std::vector<uint8_t> output(32);
+
+  mode::cbc<aes128> cbc(key);
+  const std::vector<uint8_t> short_iv(mode::cbc<aes128>::iv_size - 1);
+  EXPECT_THROW(cbc.encrypt(short_iv, plain, output), std::invalid_argument);
+
+  mode::ctr<aes128> ctr(key);
+  const std::vector<uint8_t> long_nonce(mode::ctr<aes128>::nonce_size + 1);
+  EXPECT_THROW(ctr.crypt(long_nonce, 0, plain, output), std::invalid_argument);
+}
+
+// An output buffer now carries its own length, so writing past its end is
+// reported instead of corrupting whatever follows it.
+TEST(lengths, an_output_buffer_that_is_too_small_is_refused) {
+  const std::vector<uint8_t> key(aes128::key_size);
+  const std::vector<uint8_t> plain(64);
+  std::vector<uint8_t> too_small(48);
+
+  mode::ecb<aes128> ecb(key);
+  EXPECT_THROW(ecb.encrypt(plain, too_small), std::invalid_argument);
+
+  mode::cbc<aes128>::iv_t iv = {0};
+  mode::cbc<aes128> cbc(key);
+  EXPECT_THROW(cbc.encrypt(iv, plain, too_small), std::invalid_argument);
+
+  mode::ctr<aes128>::nonce_t nonce = {0};
+  mode::ctr<aes128> ctr(key);
+  EXPECT_THROW(ctr.crypt(nonce, 0, plain, too_small), std::invalid_argument);
+
+  const std::vector<uint8_t> xts_key(mode::xts<aes128>::key_size);
+  mode::xts<aes128> xts(xts_key);
+  EXPECT_THROW(xts.encrypt(static_cast<uint64_t>(0), plain, too_small),
+               std::invalid_argument);
+}
+
+// An output buffer larger than the input is fine, and only the part that was
+// asked for is written.
+TEST(lengths, a_larger_output_buffer_is_left_alone_past_the_result) {
+  const std::vector<uint8_t> key(aes128::key_size);
+  const std::vector<uint8_t> plain(32);
+  std::vector<uint8_t> output(48, 0xcd);
+
+  mode::ecb<aes128> ecb(key);
+  ASSERT_TRUE(ecb.encrypt(plain, output));
+  for (size_t i = plain.size(); i < output.size(); ++i)
+    EXPECT_EQ(0xcd, output[i]) << "index = " << i;
 }
 
 // ---------------------------------------------------------------- composition
@@ -476,34 +532,34 @@ TEST(modes, compose_with_aria_roundtrip_only) {
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
 
   {
-    mode::ecb<aria128> ecb(key.data(), key.size());
+    mode::ecb<aria128> ecb(key);
     std::vector<uint8_t> out(plain.size());
     std::vector<uint8_t> back(plain.size());
-    ASSERT_TRUE(ecb.encrypt(plain.data(), plain.size(), out.data()));
+    ASSERT_TRUE(ecb.encrypt(plain, out));
     EXPECT_NE(test::to_hex(plain), test::to_hex(out));
-    ASSERT_TRUE(ecb.decrypt(out.data(), out.size(), back.data()));
+    ASSERT_TRUE(ecb.decrypt(out, back));
     EXPECT_EQ(test::to_hex(plain), test::to_hex(back));
   }
 
   {
-    mode::cbc<aria128> cbc(key.data(), key.size());
+    mode::cbc<aria128> cbc(key);
     mode::cbc<aria128>::iv_t iv = {0};
     std::vector<uint8_t> out(plain.size());
     std::vector<uint8_t> back(plain.size());
-    ASSERT_TRUE(cbc.encrypt(iv, plain.data(), plain.size(), out.data()));
+    ASSERT_TRUE(cbc.encrypt(iv, plain, out));
     EXPECT_NE(test::to_hex(plain), test::to_hex(out));
-    ASSERT_TRUE(cbc.decrypt(iv, out.data(), out.size(), back.data()));
+    ASSERT_TRUE(cbc.decrypt(iv, out, back));
     EXPECT_EQ(test::to_hex(plain), test::to_hex(back));
   }
 
   {
-    mode::ctr<aria128> ctr(key.data(), key.size());
+    mode::ctr<aria128> ctr(key);
     mode::ctr<aria128>::nonce_t nonce = {0};
     std::vector<uint8_t> out(plain.size());
     std::vector<uint8_t> back(plain.size());
-    ctr.crypt(nonce, 0, plain.data(), plain.size(), out.data());
+    ctr.crypt(nonce, 0, plain, out);
     EXPECT_NE(test::to_hex(plain), test::to_hex(out));
-    ctr.crypt(nonce, 0, out.data(), out.size(), back.data());
+    ctr.crypt(nonce, 0, out, back);
     EXPECT_EQ(test::to_hex(plain), test::to_hex(back));
   }
 }
@@ -514,15 +570,13 @@ TEST(xts, composes_with_aria_roundtrip_only) {
   const std::vector<uint8_t> plain =
       test::hex("46409f7426eb4e3d33480534b80fe6e09fed6583907eb83c84");
 
-  mode::xts<aria128> xts(key.data(), key.size());
+  mode::xts<aria128> xts(key);
 
   std::vector<uint8_t> encrypted(plain.size());
-  ASSERT_TRUE(xts.encrypt(static_cast<uint64_t>(7), plain.data(), plain.size(),
-                          encrypted.data()));
+  ASSERT_TRUE(xts.encrypt(static_cast<uint64_t>(7), plain, encrypted));
   EXPECT_NE(test::to_hex(plain), test::to_hex(encrypted));
 
   std::vector<uint8_t> decrypted(plain.size());
-  ASSERT_TRUE(xts.decrypt(static_cast<uint64_t>(7), encrypted.data(),
-                          encrypted.size(), decrypted.data()));
+  ASSERT_TRUE(xts.decrypt(static_cast<uint64_t>(7), encrypted, decrypted));
   EXPECT_EQ(test::to_hex(plain), test::to_hex(decrypted));
 }

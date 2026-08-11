@@ -21,6 +21,8 @@
 
 #include <ext/result>
 
+#include <ctl/bytes>
+
 namespace ctl {
 namespace symmetric {
 namespace mode {
@@ -47,6 +49,11 @@ public:
    */
   static constexpr size_t key_size = cipher_type::key_size;
 
+  /**
+   * @brief A key handed over for reading
+   */
+  typedef ctl::fixed_bytes<key_size> key_view;
+
   enum error_status {
     /**
      * @brief The input length is not a multiple of the block size
@@ -57,41 +64,51 @@ public:
   /**
    * @brief Initializes with a key
    *
-   * @param key key buffer
-   * @param size size of the key buffer, which must be at least key_size
+   * @param key the key, key_size bytes
+   * @exception std::invalid_argument if the key is not key_size bytes
    */
-  ecb(const uint8_t *key, size_t size) : cipher_(key, size) {}
+  explicit ecb(key_view key) : cipher_(key) {}
 
   /**
    * @brief Encrypts
    *
-   * @param input input buffer
-   * @param size input size, which must be a multiple of block_size
-   * @param output output buffer, may be the same as input
+   * @param input the data to encrypt, whose length must be a multiple of
+   * block_size
+   * @param output where the ciphertext goes, at least as long as input and may
+   * be the same buffer
+   * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> encrypt(const uint8_t *input, size_t size,
-                                        uint8_t *output) const {
-    if (size % block_size != 0)
+  ext::void_result<error_status> encrypt(ctl::bytes input,
+                                        ctl::writable_bytes output) const {
+    if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
+    ctl::detail::require_capacity("ctl::symmetric::mode::ecb::encrypt",
+                                  output.size(), input.size());
     // The blocks are mutually independent, so all of them are handed over at
     // once. Where a hardware path exists, this is where several blocks end up
     // being interleaved.
-    cipher_.encrypt_blocks(input, output, size / block_size);
+    cipher_.encrypt_blocks(input.data(), output.data(),
+                           input.size() / block_size);
     return ext::ok<void>();
   }
 
   /**
    * @brief Decrypts
    *
-   * @param input input buffer
-   * @param size input size, which must be a multiple of block_size
-   * @param output output buffer, may be the same as input
+   * @param input the data to decrypt, whose length must be a multiple of
+   * block_size
+   * @param output where the plaintext goes, at least as long as input and may
+   * be the same buffer
+   * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> decrypt(const uint8_t *input, size_t size,
-                                        uint8_t *output) const {
-    if (size % block_size != 0)
+  ext::void_result<error_status> decrypt(ctl::bytes input,
+                                        ctl::writable_bytes output) const {
+    if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
-    cipher_.decrypt_blocks(input, output, size / block_size);
+    ctl::detail::require_capacity("ctl::symmetric::mode::ecb::decrypt",
+                                  output.size(), input.size());
+    cipher_.decrypt_blocks(input.data(), output.data(),
+                           input.size() / block_size);
     return ext::ok<void>();
   }
 

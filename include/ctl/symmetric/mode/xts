@@ -34,10 +34,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <stdexcept>
 
 #include <ext/result>
 
+#include <ctl/bytes>
 #include <ctl/detail/endian>
 #include <ctl/detail/memory>
 
@@ -94,9 +94,19 @@ public:
   static constexpr size_t batch_blocks = cipher_type::preferred_batch;
 
   /**
-   * @brief Tweak type
+   * @brief Tweak type, for declaring storage for one
    */
   typedef uint8_t tweak_t[tweak_size];
+
+  /**
+   * @brief A key handed over for reading, K1 followed by K2
+   */
+  typedef ctl::fixed_bytes<key_size> key_view;
+
+  /**
+   * @brief A tweak handed over for reading
+   */
+  typedef ctl::fixed_bytes<tweak_size> tweak_view;
 
   /**
    * @brief Data unit number type
@@ -121,31 +131,38 @@ public:
   /**
    * @brief Initializes with a key
    *
-   * @param key K1 || K2, key_size bytes
-   * @param size size of the key buffer, which must be at least key_size
-   * @exception std::invalid_argument if size is smaller than key_size
+   * The XTS key is two block cipher keys concatenated, and its length is part
+   * of key_view, so a key of the wrong length no longer reaches the split
+   * below.
+   *
+   * @param key K1 followed by K2, key_size bytes
+   * @exception std::invalid_argument if the key is not key_size bytes
    */
-  xts(const uint8_t *key, size_t size)
-      : data_cipher_(validate_key(key, size), cipher_key_size),
-        tweak_cipher_(key + cipher_key_size, cipher_key_size) {}
+  explicit xts(key_view key)
+      : data_cipher_(typename cipher_type::key_view(key.data())),
+        tweak_cipher_(
+            typename cipher_type::key_view(key.data() + cipher_key_size)) {}
 
   /**
    * @brief Encrypts a data unit
    *
    * @param tweak the 128 bit tweak, i in the specification
-   * @param input input buffer
-   * @param size input size, at least block_size
-   * @param output output buffer, may be the same as input
+   * @param input the data to encrypt, at least block_size bytes
+   * @param output where the ciphertext goes, at least as long as input and may
+   * be the same buffer
+   * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> encrypt(const tweak_t &tweak,
-                                        const uint8_t *input, size_t size,
-                                        uint8_t *output) const {
+  ext::void_result<error_status> encrypt(tweak_view tweak, ctl::bytes input,
+                                        ctl::writable_bytes output) const {
     error_status status;
+    const size_t size = input.size();
     if (size_error(size, status))
       return ext::err(status);
+    ctl::detail::require_capacity("ctl::symmetric::mode::xts::encrypt",
+                                  output.size(), size);
 
     uint8_t encrypted_tweak[block_size];
-    tweak_cipher_.encrypt_block(&tweak[0], encrypted_tweak);
+    tweak_cipher_.encrypt_block(tweak, encrypted_tweak);
     tweak_state t = load_tweak(encrypted_tweak);
     ctl::detail::secure_zero(encrypted_tweak, sizeof(encrypted_tweak));
 
@@ -155,7 +172,7 @@ public:
     const size_t whole = remainder == 0 ? size / block_size
                                         : size / block_size - 1;
 
-    transform_blocks<true>(input, whole, t, output);
+    transform_blocks<true>(input.data(), whole, t, output.data());
 
     if (remainder != 0) {
       const size_t last = whole * block_size;
@@ -164,17 +181,17 @@ public:
       // that result becomes the ciphertext of the partial block, and the back
       // is used to fill out the partial plaintext.
       uint8_t stolen[block_size];
-      transform<true>(input + last, t, stolen);
+      transform<true>(input.data() + last, t, stolen);
       advance(t);
 
       // All of the input is read before any output is written, which is what
       // makes operating in place safe.
       uint8_t combined[block_size];
-      memcpy(combined, input + last + block_size, remainder);
+      memcpy(combined, input.data() + last + block_size, remainder);
       memcpy(combined + remainder, stolen + remainder, block_size - remainder);
 
-      transform<true>(combined, t, output + last);
-      memcpy(output + last + block_size, stolen, remainder);
+      transform<true>(combined, t, output.data() + last);
+      memcpy(output.data() + last + block_size, stolen, remainder);
 
       ctl::detail::secure_zero(stolen, sizeof(stolen));
       ctl::detail::secure_zero(combined, sizeof(combined));
@@ -188,19 +205,22 @@ public:
    * @brief Decrypts a data unit
    *
    * @param tweak the 128 bit tweak, i in the specification
-   * @param input input buffer
-   * @param size input size, at least block_size
-   * @param output output buffer, may be the same as input
+   * @param input the data to decrypt, at least block_size bytes
+   * @param output where the plaintext goes, at least as long as input and may
+   * be the same buffer
+   * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> decrypt(const tweak_t &tweak,
-                                        const uint8_t *input, size_t size,
-                                        uint8_t *output) const {
+  ext::void_result<error_status> decrypt(tweak_view tweak, ctl::bytes input,
+                                        ctl::writable_bytes output) const {
     error_status status;
+    const size_t size = input.size();
     if (size_error(size, status))
       return ext::err(status);
+    ctl::detail::require_capacity("ctl::symmetric::mode::xts::decrypt",
+                                  output.size(), size);
 
     uint8_t encrypted_tweak[block_size];
-    tweak_cipher_.encrypt_block(&tweak[0], encrypted_tweak);
+    tweak_cipher_.encrypt_block(tweak, encrypted_tweak);
     tweak_state t = load_tweak(encrypted_tweak);
     ctl::detail::secure_zero(encrypted_tweak, sizeof(encrypted_tweak));
 
@@ -208,7 +228,7 @@ public:
     const size_t whole = remainder == 0 ? size / block_size
                                         : size / block_size - 1;
 
-    transform_blocks<false>(input, whole, t, output);
+    transform_blocks<false>(input.data(), whole, t, output.data());
 
     if (remainder != 0) {
       const size_t last = whole * block_size;
@@ -219,14 +239,14 @@ public:
       advance(next);
 
       uint8_t stolen[block_size];
-      transform<false>(input + last, next, stolen);
+      transform<false>(input.data() + last, next, stolen);
 
       uint8_t combined[block_size];
-      memcpy(combined, input + last + block_size, remainder);
+      memcpy(combined, input.data() + last + block_size, remainder);
       memcpy(combined + remainder, stolen + remainder, block_size - remainder);
 
-      transform<false>(combined, t, output + last);
-      memcpy(output + last + block_size, stolen, remainder);
+      transform<false>(combined, t, output.data() + last);
+      memcpy(output.data() + last + block_size, stolen, remainder);
 
       ctl::detail::secure_zero(&next, sizeof(next));
       ctl::detail::secure_zero(stolen, sizeof(stolen));
@@ -241,32 +261,32 @@ public:
    * @brief Encrypts using a data unit number
    *
    * @param sequence_number data unit number, such as a sector number
-   * @param input input buffer
-   * @param size input size, at least block_size
-   * @param output output buffer, may be the same as input
+   * @param input the data to encrypt, at least block_size bytes
+   * @param output where the ciphertext goes, at least as long as input and may
+   * be the same buffer
    */
   ext::void_result<error_status> encrypt(sequence_number_t sequence_number,
-                                        const uint8_t *input, size_t size,
-                                        uint8_t *output) const {
+                                        ctl::bytes input,
+                                        ctl::writable_bytes output) const {
     tweak_t tweak;
     make_tweak(sequence_number, tweak);
-    return encrypt(tweak, input, size, output);
+    return encrypt(tweak, input, output);
   }
 
   /**
    * @brief Decrypts using a data unit number
    *
    * @param sequence_number data unit number, such as a sector number
-   * @param input input buffer
-   * @param size input size, at least block_size
-   * @param output output buffer, may be the same as input
+   * @param input the data to decrypt, at least block_size bytes
+   * @param output where the plaintext goes, at least as long as input and may
+   * be the same buffer
    */
   ext::void_result<error_status> decrypt(sequence_number_t sequence_number,
-                                        const uint8_t *input, size_t size,
-                                        uint8_t *output) const {
+                                        ctl::bytes input,
+                                        ctl::writable_bytes output) const {
     tweak_t tweak;
     make_tweak(sequence_number, tweak);
-    return decrypt(tweak, input, size, output);
+    return decrypt(tweak, input, output);
   }
 
   /**
@@ -342,18 +362,6 @@ private:
     const uint64_t carry = t.high >> 63;
     t.high = (t.high << 1) | (low >> 63);
     t.low = (low << 1) ^ (0x87ull & (0ull - carry));
-  }
-
-  /**
-   * @brief Checks the key length, relying on the order in which the members of
-   * the constructor are initialized
-   */
-  static const uint8_t *validate_key(const uint8_t *key, size_t size) {
-    if (size < key_size)
-      throw std::invalid_argument(
-          "ctl::symmetric::mode::xts : "
-          "key buffer is shorter than the XTS key length.");
-    return key;
   }
 
   /**

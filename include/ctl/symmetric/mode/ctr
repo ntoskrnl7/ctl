@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include <ctl/bytes>
 #include <ctl/detail/memory>
 
 namespace ctl {
@@ -62,9 +63,19 @@ public:
   static constexpr size_t nonce_size = block_size;
 
   /**
-   * @brief Initial counter block type
+   * @brief Initial counter block type, for declaring storage for one
    */
   typedef uint8_t nonce_t[nonce_size];
+
+  /**
+   * @brief A key handed over for reading
+   */
+  typedef ctl::fixed_bytes<key_size> key_view;
+
+  /**
+   * @brief An initial counter block handed over for reading
+   */
+  typedef ctl::fixed_bytes<nonce_size> nonce_view;
 
   /**
    * @brief Byte offset type
@@ -79,27 +90,33 @@ public:
   /**
    * @brief Initializes with a key
    *
-   * @param key key buffer
-   * @param size size of the key buffer, which must be at least key_size
+   * @param key the key, key_size bytes
+   * @exception std::invalid_argument if the key is not key_size bytes
    */
-  ctr(const uint8_t *key, size_t size) : cipher_(key, size) {}
+  explicit ctr(key_view key) : cipher_(key) {}
 
   /**
    * @brief Encrypts or decrypts
    *
    * CTR mode performs the same operation in both directions, so there is only
-   * one method. Nothing here can fail, so the result is not wrapped in a
-   * result type.
+   * one method. Nothing about the data can make this fail, so there is no
+   * result to inspect; the only way to call it wrongly is to give an output
+   * buffer that cannot hold the result, which throws.
    *
-   * @param nonce initial counter block
+   * @param nonce initial counter block, nonce_size bytes
    * @param byte_offset position in the stream to start at, in bytes
-   * @param input input buffer
-   * @param size input size, unconstrained
-   * @param output output buffer, may be the same as input
+   * @param input the data to process, of any length
+   * @param output where the result goes, at least as long as input and may be
+   * the same buffer
+   * @exception std::invalid_argument if output is shorter than input
    */
-  void crypt(const nonce_t &nonce, offset_t byte_offset, const uint8_t *input,
-             size_t size, uint8_t *output) const {
-    counter_state counter = load_counter(&nonce[0]);
+  void crypt(nonce_view nonce, offset_t byte_offset, ctl::bytes input,
+             ctl::writable_bytes output) const {
+    ctl::detail::require_capacity("ctl::symmetric::mode::ctr::crypt",
+                                  output.size(), input.size());
+
+    const size_t size = input.size();
+    counter_state counter = load_counter(nonce.data());
     increment(counter, byte_offset / block_size);
 
     // The counter itself lives in registers; this is where it is materialized
@@ -117,7 +134,8 @@ public:
       increment(counter, 1);
       const size_t available = block_size - position;
       const size_t count = available < size ? available : size;
-      ctl::detail::xor_bytes(input, keystream + position, output, count);
+      ctl::detail::xor_bytes(input.data(), keystream + position, output.data(),
+                             count);
       i = count;
     }
 
@@ -134,8 +152,8 @@ public:
       // Combining with the data inside the cipher keeps the key stream in
       // registers. Generating it into a buffer first would mean writing it out
       // and reading it back just to exclusive or it.
-      cipher_.encrypt_blocks_then_xor(counters, input + i, output + i,
-                                      batch_blocks);
+      cipher_.encrypt_blocks_then_xor(counters, input.data() + i,
+                                      output.data() + i, batch_blocks);
     }
 
     // Whole blocks left over that do not fill a batch
@@ -143,14 +161,16 @@ public:
       store_counter(counter, block);
       cipher_.encrypt_block(block, keystream);
       increment(counter, 1);
-      ctl::detail::xor_block<block_size>(input + i, keystream, output + i);
+      ctl::detail::xor_block<block_size>(input.data() + i, keystream,
+                                        output.data() + i);
     }
 
     // The partial block at the end
     if (i < size) {
       store_counter(counter, block);
       cipher_.encrypt_block(block, keystream);
-      ctl::detail::xor_bytes(input + i, keystream, output + i, size - i);
+      ctl::detail::xor_bytes(input.data() + i, keystream, output.data() + i,
+                             size - i);
     }
 
     ctl::detail::secure_zero(counters, sizeof(counters));

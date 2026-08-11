@@ -34,6 +34,7 @@
 
 #include <ext/result>
 
+#include <ctl/bytes>
 #include <ctl/detail/endian>
 #include <ctl/detail/ghash>
 #include <ctl/detail/memory>
@@ -96,9 +97,24 @@ public:
   static constexpr uint64_t max_data_size = ((1ull << 39) - 256) / 8;
 
   /**
-   * @brief Authentication tag type
+   * @brief Authentication tag type, for declaring storage for one
    */
   typedef uint8_t tag_t[tag_size];
+
+  /**
+   * @brief A key handed over for reading
+   */
+  typedef ctl::fixed_bytes<key_size> key_view;
+
+  /**
+   * @brief A tag handed over for reading, to be verified against
+   */
+  typedef ctl::fixed_bytes<tag_size> tag_view;
+
+  /**
+   * @brief A tag handed over to be written
+   */
+  typedef ctl::writable_fixed_bytes<tag_size> writable_tag_view;
 
   /**
    * @brief One contiguous run of bytes
@@ -107,21 +123,7 @@ public:
    * concatenation of the list, so where the boundaries fall does not matter but
    * the order of the list does: {a, b} and {b, a} produce different tags.
    */
-  struct piece {
-    /**
-     * @brief Wraps a pointer and a length
-     */
-    piece(const uint8_t *data, size_t size) : data(data), size(size) {}
-
-    /**
-     * @brief Wraps an array, taking its length from the type
-     */
-    template <size_t _Size>
-    piece(const uint8_t (&array)[_Size]) : data(array), size(_Size) {}
-
-    const uint8_t *data;
-    size_t size;
-  };
+  typedef ctl::bytes piece;
 
   /**
    * @brief A list of runs of bytes
@@ -151,10 +153,10 @@ public:
   /**
    * @brief Initializes with a key
    *
-   * @param key key buffer
-   * @param size size of the key buffer, which must be at least key_size
+   * @param key the key, key_size bytes
+   * @exception std::invalid_argument if the key is not key_size bytes
    */
-  gcm(const uint8_t *key, size_t size) : cipher_(key, size) {
+  explicit gcm(key_view key) : cipher_(key) {
     // The hash subkey, and everything GHASH derives from it, depends only on
     // the key. Preparing it once here and copying that state into each
     // invocation keeps the cost off the per message path, which matters most
@@ -171,33 +173,39 @@ public:
    * @brief Encrypts and authenticates
    *
    * @param iv initialization vector, any non zero length; 12 bytes recommended
-   * @param iv_size length of the initialization vector
    * @param aad additional authenticated data, may be empty
    * @param plain data to encrypt, may be empty
-   * @param output where the ciphertext goes, as long as the total of plain, and
-   * may overlap it
-   * @param tag where the tag goes, tag_size bytes; passing output plus the data
-   * length appends it to the ciphertext
+   * @param output where the ciphertext goes, at least as long as the total of
+   * plain and may overlap it
+   * @param tag where the tag goes, tag_size bytes; the last tag_size bytes of a
+   * buffer that also holds the ciphertext appends it there, which is the layout
+   * a wire format usually wants
+   * @exception std::invalid_argument if output cannot hold the ciphertext
    */
-  ext::void_result<error_status> encrypt(const uint8_t *iv, size_t iv_size,
-                                        pieces aad, pieces plain,
-                                        uint8_t *output, uint8_t *tag) const {
-    if (iv_size == 0)
+  ext::void_result<error_status> encrypt(ctl::bytes iv, pieces aad,
+                                        pieces plain,
+                                        ctl::writable_bytes output,
+                                        writable_tag_view tag) const {
+    if (iv.empty())
       return ext::err(invalid_iv_length);
-    if (total(plain) > max_data_size)
+    const uint64_t data_size = total(plain);
+    if (data_size > max_data_size)
       return ext::err(invalid_input_length);
+    ctl::detail::require_capacity("ctl::symmetric::mode::gcm::encrypt",
+                                  output.size(),
+                                  static_cast<size_t>(data_size));
 
-    session state(cipher_, hash_, iv, iv_size);
+    session state(cipher_, hash_, iv);
     for (const piece &p : aad)
-      state.absorb_aad(p.data, p.size);
+      state.absorb_aad(p.data(), p.size());
 
     size_t offset = 0;
     for (const piece &p : plain) {
-      state.encrypt(p.data, p.size, output + offset);
-      offset += p.size;
+      state.encrypt(p.data(), p.size(), output.data() + offset);
+      offset += p.size();
     }
 
-    state.finish(tag);
+    state.finish(tag.data());
     return ext::ok<void>();
   }
 
@@ -210,32 +218,35 @@ public:
    * zeroes rather than unauthenticated plaintext.
    *
    * @param iv initialization vector, the same one used to encrypt
-   * @param iv_size length of the initialization vector
    * @param aad additional authenticated data, in the same order as when
    * encrypting
    * @param cipher ciphertext to decrypt
-   * @param output where the plaintext goes, as long as the total of cipher, and
-   * may overlap it
+   * @param output where the plaintext goes, at least as long as the total of
+   * cipher and may overlap it
    * @param tag the tag to verify against, tag_size bytes
+   * @exception std::invalid_argument if output cannot hold the plaintext
    */
-  ext::void_result<error_status> decrypt(const uint8_t *iv, size_t iv_size,
-                                        pieces aad, pieces cipher,
-                                        uint8_t *output,
-                                        const uint8_t *tag) const {
-    if (iv_size == 0)
+  ext::void_result<error_status> decrypt(ctl::bytes iv, pieces aad,
+                                        pieces cipher,
+                                        ctl::writable_bytes output,
+                                        tag_view tag) const {
+    if (iv.empty())
       return ext::err(invalid_iv_length);
-    const size_t data_size = total(cipher);
-    if (data_size > max_data_size)
+    const uint64_t total_size = total(cipher);
+    if (total_size > max_data_size)
       return ext::err(invalid_input_length);
+    const size_t data_size = static_cast<size_t>(total_size);
+    ctl::detail::require_capacity("ctl::symmetric::mode::gcm::decrypt",
+                                  output.size(), data_size);
 
-    session state(cipher_, hash_, iv, iv_size);
+    session state(cipher_, hash_, iv);
     for (const piece &p : aad)
-      state.absorb_aad(p.data, p.size);
+      state.absorb_aad(p.data(), p.size());
 
     size_t offset = 0;
     for (const piece &p : cipher) {
-      state.decrypt(p.data, p.size, output + offset);
-      offset += p.size;
+      state.decrypt(p.data(), p.size(), output.data() + offset);
+      offset += p.size();
     }
 
     const ext::void_result<error_status> result = verify(state, tag);
@@ -243,7 +254,7 @@ public:
       // Unlike the incremental interface, this one knows the whole output range
       // and can make sure nothing unauthenticated is left where a caller who
       // ignores the error could reach it.
-      ctl::detail::secure_zero(output, data_size);
+      ctl::detail::secure_zero(output.data(), data_size);
     }
     return result;
   }
@@ -260,10 +271,10 @@ private:
   class session {
   public:
     session(const cipher_type &cipher, const ctl::detail::ghash &prepared,
-            const uint8_t *iv, size_t iv_size)
+            ctl::bytes iv)
         : cipher_(cipher), hash_(prepared), aad_bits_(0), data_bits_(0),
           keystream_used_(block_size), aad_closed_(false) {
-      derive_initial_counter(iv, iv_size);
+      derive_initial_counter(iv);
       memcpy(counter_, initial_, block_size);
       // The tag is masked with the block cipher applied to the initial counter,
       // before that counter is ever incremented.
@@ -348,9 +359,9 @@ private:
      * appended. Any other length is hashed, which is why the accumulator has to
      * be cleared afterwards before the AAD goes in.
      */
-    void derive_initial_counter(const uint8_t *iv, size_t iv_size) {
-      if (iv_size == recommended_iv_size) {
-        memcpy(initial_, iv, recommended_iv_size);
+    void derive_initial_counter(ctl::bytes iv) {
+      if (iv.size() == recommended_iv_size) {
+        memcpy(initial_, iv.data(), recommended_iv_size);
         initial_[12] = 0;
         initial_[13] = 0;
         initial_[14] = 0;
@@ -360,9 +371,10 @@ private:
 
       uint8_t lengths[block_size];
       memset(lengths, 0, sizeof(lengths));
-      ctl::detail::store_be64(static_cast<uint64_t>(iv_size) * 8, lengths + 8);
+      ctl::detail::store_be64(static_cast<uint64_t>(iv.size()) * 8,
+                              lengths + 8);
 
-      hash_.update(iv, iv_size);
+      hash_.update(iv.data(), iv.size());
       hash_.pad();
       hash_.update(lengths, block_size);
       hash_.finish(initial_);
@@ -450,19 +462,24 @@ public:
      * The key stream carries on between calls, so a run of any length is fine.
      *
      * @param input data to encrypt
-     * @param output where the ciphertext goes, may overlap input
+     * @param output where the ciphertext goes, at least as long as input and
+     * may overlap it
+     * @exception std::invalid_argument if output is shorter than input
      */
-    encrypt_data &write(piece input, uint8_t *output) {
-      state_.encrypt(input.data, input.size, output);
+    encrypt_data &write(ctl::bytes input, ctl::writable_bytes output) {
+      ctl::detail::require_capacity(
+          "ctl::symmetric::mode::gcm::encrypt_data::write", output.size(),
+          input.size());
+      state_.encrypt(input.data(), input.size(), output.data());
       return *this;
     }
 
     /**
      * @brief Produces the authentication tag
      *
-     * @param tag tag_size bytes
+     * @param tag where the tag goes, tag_size bytes
      */
-    void finish(uint8_t *tag) { state_.finish(tag); }
+    void finish(writable_tag_view tag) { state_.finish(tag.data()); }
 
   private:
     session state_;
@@ -476,8 +493,8 @@ public:
   class encrypt_aad {
   public:
     encrypt_aad(const cipher_type &cipher, const ctl::detail::ghash &prepared,
-                const uint8_t *iv, size_t iv_size)
-        : state_(cipher, prepared, iv, iv_size) {}
+                ctl::bytes iv)
+        : state_(cipher, prepared, iv) {}
 
     /**
      * @brief Authenticates one run of additional data
@@ -485,8 +502,8 @@ public:
      * Runs are concatenated, so where they are split makes no difference but
      * the order they are supplied in does.
      */
-    encrypt_aad &aad(piece data) {
-      state_.absorb_aad(data.data, data.size);
+    encrypt_aad &aad(ctl::bytes data) {
+      state_.absorb_aad(data.data(), data.size());
       return *this;
     }
 
@@ -498,9 +515,9 @@ public:
     /**
      * @brief Produces the tag with no data at all, which is GMAC
      *
-     * @param tag tag_size bytes
+     * @param tag where the tag goes, tag_size bytes
      */
-    void finish(uint8_t *tag) { state_.finish(tag); }
+    void finish(writable_tag_view tag) { state_.finish(tag.data()); }
 
   private:
     session state_;
@@ -533,10 +550,15 @@ public:
      * finish reports success.
      *
      * @param input ciphertext to decrypt
-     * @param output where the plaintext goes, may overlap input
+     * @param output where the plaintext goes, at least as long as input and
+     * may overlap it
+     * @exception std::invalid_argument if output is shorter than input
      */
-    decrypt_data &write(piece input, uint8_t *output) {
-      state_.decrypt(input.data, input.size, output);
+    decrypt_data &write(ctl::bytes input, ctl::writable_bytes output) {
+      ctl::detail::require_capacity(
+          "ctl::symmetric::mode::gcm::decrypt_data::write", output.size(),
+          input.size());
+      state_.decrypt(input.data(), input.size(), output.data());
       return *this;
     }
 
@@ -547,7 +569,7 @@ public:
      * @return success only if the data is authentic; on failure the caller must
      * discard every byte of plaintext it received
      */
-    ext::void_result<error_status> finish(const uint8_t *tag) {
+    ext::void_result<error_status> finish(tag_view tag) {
       return verify(state_, tag);
     }
 
@@ -563,14 +585,14 @@ public:
   class decrypt_aad {
   public:
     decrypt_aad(const cipher_type &cipher, const ctl::detail::ghash &prepared,
-                const uint8_t *iv, size_t iv_size)
-        : state_(cipher, prepared, iv, iv_size) {}
+                ctl::bytes iv)
+        : state_(cipher, prepared, iv) {}
 
     /**
      * @brief Authenticates one run of additional data
      */
-    decrypt_aad &aad(piece data) {
-      state_.absorb_aad(data.data, data.size);
+    decrypt_aad &aad(ctl::bytes data) {
+      state_.absorb_aad(data.data(), data.size());
       return *this;
     }
 
@@ -582,7 +604,7 @@ public:
     /**
      * @brief Verifies the tag with no data at all, which is GMAC
      */
-    ext::void_result<error_status> finish(const uint8_t *tag) {
+    ext::void_result<error_status> finish(tag_view tag) {
       return verify(state_, tag);
     }
 
@@ -597,14 +619,13 @@ public:
    * call interface is both simpler and impossible to misuse.
    *
    * @param iv initialization vector, any non zero length; 12 bytes recommended
-   * @param iv_size length of the initialization vector
-   * @exception std::invalid_argument if iv_size is zero
+   * @exception std::invalid_argument if iv is empty
    */
-  encrypt_aad encryptor(const uint8_t *iv, size_t iv_size) const {
-    if (iv_size == 0)
+  encrypt_aad encryptor(ctl::bytes iv) const {
+    if (iv.empty())
       throw std::invalid_argument("ctl::symmetric::mode::gcm : "
                                   "the initialization vector is empty.");
-    return encrypt_aad(cipher_, hash_, iv, iv_size);
+    return encrypt_aad(cipher_, hash_, iv);
   }
 
   /**
@@ -613,26 +634,24 @@ public:
    * Read what decrypt_data says about failure before using this.
    *
    * @param iv initialization vector, the same one used to encrypt
-   * @param iv_size length of the initialization vector
-   * @exception std::invalid_argument if iv_size is zero
+   * @exception std::invalid_argument if iv is empty
    */
-  decrypt_aad decryptor(const uint8_t *iv, size_t iv_size) const {
-    if (iv_size == 0)
+  decrypt_aad decryptor(ctl::bytes iv) const {
+    if (iv.empty())
       throw std::invalid_argument("ctl::symmetric::mode::gcm : "
                                   "the initialization vector is empty.");
-    return decrypt_aad(cipher_, hash_, iv, iv_size);
+    return decrypt_aad(cipher_, hash_, iv);
   }
 
 private:
   /**
    * @brief Completes a session and compares the tag in constant time
    */
-  static ext::void_result<error_status> verify(session &state,
-                                              const uint8_t *tag) {
+  static ext::void_result<error_status> verify(session &state, tag_view tag) {
     uint8_t computed[tag_size];
     state.finish(computed);
     const bool authentic =
-        ctl::detail::equal_constant_time(computed, tag, tag_size);
+        ctl::detail::equal_constant_time(computed, tag.data(), tag_size);
     ctl::detail::secure_zero(computed, sizeof(computed));
     if (!authentic)
       return ext::err(authentication_failed);
@@ -645,7 +664,7 @@ private:
   static uint64_t total(pieces list) {
     uint64_t sum = 0;
     for (const piece &p : list)
-      sum += static_cast<uint64_t>(p.size);
+      sum += static_cast<uint64_t>(p.size());
     return sum;
   }
 

@@ -30,8 +30,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <stdexcept>
 
+#include <ctl/bytes>
 #include <ctl/detail/config>
 #include <ctl/detail/cpu>
 #include <ctl/detail/memory>
@@ -471,40 +471,41 @@ public:
   static constexpr size_t preferred_batch = 8;
 
   /**
-   * @brief Key type
+   * @brief Key type, for declaring storage for a key
    */
   typedef uint8_t key_t[key_size];
 
   /**
-   * @brief Block type
+   * @brief Block type, for declaring storage for a block
    */
   typedef uint8_t block_t[block_size];
 
   /**
-   * @brief Initializes with a key whose length is checked at compile time
-   *
-   * @param key the key
+   * @brief A key handed over for reading
    */
-  explicit aria(const key_t &key) { set_key(&key[0]); }
+  typedef ctl::fixed_bytes<key_size> key_view;
 
   /**
-   * @brief Initializes with a key held in a run time buffer
-   *
-   * The length is taken as well for two reasons. It keeps this overload from
-   * being ambiguous with the one above that takes an array, and it prevents a
-   * short buffer from being read past its end so that uninitialized memory is
-   * used as key material.
-   *
-   * @param key key buffer
-   * @param size size of the key buffer, which must be at least key_size
-   * @exception std::invalid_argument if size is smaller than key_size
+   * @brief A block handed over for reading
    */
-  aria(const uint8_t *key, size_t size) {
-    if (size < key_size)
-      throw std::invalid_argument("ctl::symmetric::cipher::aria : "
-                                  "key buffer is shorter than the key length.");
-    set_key(key);
-  }
+  typedef ctl::fixed_bytes<block_size> block_view;
+
+  /**
+   * @brief A block handed over to be written
+   */
+  typedef ctl::writable_fixed_bytes<block_size> writable_block_view;
+
+  /**
+   * @brief Initializes with a key
+   *
+   * The length the key has to be is part of key_view, so an array or a
+   * std::array of the wrong length does not compile and a container whose
+   * length is only known at run time is checked here.
+   *
+   * @param key the key
+   * @exception std::invalid_argument if the key is not key_size bytes
+   */
+  explicit aria(key_view key) { set_key(key); }
 
   /**
    * @brief Erases the round keys on destruction
@@ -517,9 +518,9 @@ public:
   /**
    * @brief Sets the key again (section 2.2 of RFC 5794)
    *
-   * @param key must hold at least key_size bytes
+   * @param key the key
    */
-  void set_key(const uint8_t *key) {
+  void set_key(key_view key) {
 #if defined(CTL_HAS_X86_HW_ACCEL)
     // The vector path needs the AES instructions for two of the four S-boxes
     // and the byte shuffle for the other two and for the diffusion layer.
@@ -530,10 +531,10 @@ public:
     // zeroes to 128 bits.
     uint8_t kl[16];
     uint8_t kr[16];
-    memcpy(kl, key, 16);
+    memcpy(kl, key.data(), 16);
     memset(kr, 0, sizeof(kr));
     if constexpr (key_size > 16)
-      memcpy(kr, key + 16, key_size - 16);
+      memcpy(kr, key.data() + 16, key_size - 16);
 
     // W0 through W3 are derived by a three round 256 bit Feistel cipher.
     uint8_t w[4][16];
@@ -571,11 +572,11 @@ public:
   /**
    * @brief Encrypts one block
    *
-   * @param input input block of block_size bytes
-   * @param output output block of block_size bytes, may be the same as input
+   * @param input the block to encrypt
+   * @param output where the result goes, may be the same buffer as input
    */
-  void encrypt_block(const uint8_t *input, uint8_t *output) const {
-    crypt(ek_, input, output);
+  void encrypt_block(block_view input, writable_block_view output) const {
+    crypt(ek_, input.data(), output.data());
   }
 
   /**
@@ -585,11 +586,11 @@ public:
    * and only the round keys are exchanged for the decryption ones (section
    * 2.3.2 of RFC 5794).
    *
-   * @param input input block of block_size bytes
-   * @param output output block of block_size bytes, may be the same as input
+   * @param input the block to decrypt
+   * @param output where the result goes, may be the same buffer as input
    */
-  void decrypt_block(const uint8_t *input, uint8_t *output) const {
-    crypt(dk_, input, output);
+  void decrypt_block(block_view input, writable_block_view output) const {
+    crypt(dk_, input.data(), output.data());
   }
 
   /**
@@ -598,21 +599,23 @@ public:
    * This path stays public even where a vector path exists, because testing
    * that the two agree requires a reference to compare against.
    *
-   * @param input input block of block_size bytes
-   * @param output output block of block_size bytes, may be the same as input
+   * @param input the block to encrypt
+   * @param output where the result goes, may be the same buffer as input
    */
-  void encrypt_block_software(const uint8_t *input, uint8_t *output) const {
-    crypt_software(ek_, input, output);
+  void encrypt_block_software(block_view input,
+                              writable_block_view output) const {
+    crypt_software(ek_, input.data(), output.data());
   }
 
   /**
    * @brief Decrypts one block using the table driven path
    *
-   * @param input input block of block_size bytes
-   * @param output output block of block_size bytes, may be the same as input
+   * @param input the block to decrypt
+   * @param output where the result goes, may be the same buffer as input
    */
-  void decrypt_block_software(const uint8_t *input, uint8_t *output) const {
-    crypt_software(dk_, input, output);
+  void decrypt_block_software(block_view input,
+                              writable_block_view output) const {
+    crypt_software(dk_, input.data(), output.data());
   }
 
   /**
@@ -629,6 +632,11 @@ public:
    * ARIA has no hardware path, so this simply iterates. The interface is kept
    * in line so that a mode of operation works with any block cipher through
    * the same code.
+   *
+   * The batch entry points take pointers rather than views. They are the
+   * interface between a mode of operation and its cipher, not something a
+   * caller reaches for, and the mode computes every length here from its own
+   * block count, so there is no pair for a caller to get wrong.
    *
    * @param input input of count * block_size bytes
    * @param output output of count * block_size bytes, may be the same as input

@@ -14,6 +14,7 @@
 #include <type_traits>
 #include <utility>
 
+#include <ctl/bytes>
 #include <ctl/symmetric/cipher/aes>
 #include <ctl/symmetric/mode/gcm>
 
@@ -40,20 +41,16 @@ void check(const char *key_hex, const char *iv_hex, const char *aad_hex,
 
   ASSERT_EQ(key.size(), Mode::key_size);
 
-  Mode gcm(key.data(), key.size());
+  Mode gcm(key);
 
   std::vector<uint8_t> encrypted(plain.size());
   std::vector<uint8_t> tag(Mode::tag_size);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                          {{plain.data(), plain.size()}}, encrypted.data(),
-                          tag.data()));
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {plain}, encrypted, tag));
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(encrypted));
   EXPECT_EQ(std::string(tag_hex), test::to_hex(tag));
 
   std::vector<uint8_t> decrypted(plain.size());
-  ASSERT_TRUE(gcm.decrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                          {{encrypted.data(), encrypted.size()}},
-                          decrypted.data(), tag.data()));
+  ASSERT_TRUE(gcm.decrypt(iv, {aad}, {encrypted}, decrypted, tag));
   EXPECT_EQ(std::string(plain_hex), test::to_hex(decrypted));
 }
 
@@ -156,13 +153,11 @@ TEST(gcm, pieces_split_off_block_boundary_match_a_single_piece) {
   const std::vector<uint8_t> aad = test::hex(kAad);
   const std::vector<uint8_t> plain = test::hex(kPlain60);
 
-  mode::gcm<aes128> gcm(key.data(), key.size());
+  mode::gcm<aes128> gcm(key);
 
   std::vector<uint8_t> whole(plain.size());
   std::vector<uint8_t> whole_tag(16);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                          {{plain.data(), plain.size()}}, whole.data(),
-                          whole_tag.data()));
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {plain}, whole, whole_tag));
 
   // Boundaries deliberately chosen to fall inside blocks.
   for (size_t cut : {size_t(1), size_t(5), size_t(15), size_t(16), size_t(17),
@@ -170,10 +165,11 @@ TEST(gcm, pieces_split_off_block_boundary_match_a_single_piece) {
     std::vector<uint8_t> split(plain.size());
     std::vector<uint8_t> split_tag(16);
     ASSERT_TRUE(gcm.encrypt(
-        iv.data(), iv.size(),
-        {{aad.data(), 3}, {aad.data() + 3, aad.size() - 3}},
-        {{plain.data(), cut}, {plain.data() + cut, plain.size() - cut}},
-        split.data(), split_tag.data()))
+        iv,
+        {ctl::bytes(aad).first(3), ctl::bytes(aad).last(aad.size() - 3)},
+        {ctl::bytes(plain).first(cut),
+         ctl::bytes(plain).last(plain.size() - cut)},
+        split, split_tag))
         << "cut = " << cut;
     EXPECT_EQ(test::to_hex(whole), test::to_hex(split)) << "cut = " << cut;
     EXPECT_EQ(test::to_hex(whole_tag), test::to_hex(split_tag))
@@ -189,24 +185,17 @@ TEST(gcm, aad_order_changes_the_tag) {
   const std::vector<uint8_t> iv = test::hex(kIv96);
   const std::vector<uint8_t> first = test::hex("0011223344556677");
   const std::vector<uint8_t> second = test::hex("8899aabb");
-  const std::vector<uint8_t> plain = test::hex("00112233445566778899aabbccddeeff");
+  const std::vector<uint8_t> plain =
+      test::hex("00112233445566778899aabbccddeeff");
 
-  mode::gcm<aes128> gcm(key.data(), key.size());
+  mode::gcm<aes128> gcm(key);
 
   std::vector<uint8_t> out(plain.size());
   std::vector<uint8_t> forward(16);
   std::vector<uint8_t> reversed(16);
 
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(),
-                          {{first.data(), first.size()},
-                           {second.data(), second.size()}},
-                          {{plain.data(), plain.size()}}, out.data(),
-                          forward.data()));
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(),
-                          {{second.data(), second.size()},
-                           {first.data(), first.size()}},
-                          {{plain.data(), plain.size()}}, out.data(),
-                          reversed.data()));
+  ASSERT_TRUE(gcm.encrypt(iv, {first, second}, {plain}, out, forward));
+  ASSERT_TRUE(gcm.encrypt(iv, {second, first}, {plain}, out, reversed));
 
   EXPECT_NE(test::to_hex(forward), test::to_hex(reversed));
 }
@@ -217,21 +206,16 @@ TEST(gcm, tampered_tag_fails_and_erases_the_output) {
   const std::vector<uint8_t> aad = test::hex(kAad);
   const std::vector<uint8_t> plain = test::hex(kPlain60);
 
-  mode::gcm<aes128> gcm(key.data(), key.size());
+  mode::gcm<aes128> gcm(key);
 
   std::vector<uint8_t> encrypted(plain.size());
   std::vector<uint8_t> tag(16);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                          {{plain.data(), plain.size()}}, encrypted.data(),
-                          tag.data()));
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {plain}, encrypted, tag));
 
   tag[0] ^= 0x01;
 
   std::vector<uint8_t> decrypted(plain.size(), 0xcc);
-  const auto result =
-      gcm.decrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                  {{encrypted.data(), encrypted.size()}}, decrypted.data(),
-                  tag.data());
+  const auto result = gcm.decrypt(iv, {aad}, {encrypted}, decrypted, tag);
   ASSERT_FALSE(result);
   EXPECT_EQ(mode::gcm<aes128>::authentication_failed, result.error().value);
 
@@ -245,21 +229,16 @@ TEST(gcm, tampered_aad_fails) {
   std::vector<uint8_t> aad = test::hex(kAad);
   const std::vector<uint8_t> plain = test::hex(kPlain60);
 
-  mode::gcm<aes128> gcm(key.data(), key.size());
+  mode::gcm<aes128> gcm(key);
 
   std::vector<uint8_t> encrypted(plain.size());
   std::vector<uint8_t> tag(16);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                          {{plain.data(), plain.size()}}, encrypted.data(),
-                          tag.data()));
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {plain}, encrypted, tag));
 
   aad[0] ^= 0x01;
 
   std::vector<uint8_t> decrypted(plain.size());
-  const auto result =
-      gcm.decrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                  {{encrypted.data(), encrypted.size()}}, decrypted.data(),
-                  tag.data());
+  const auto result = gcm.decrypt(iv, {aad}, {encrypted}, decrypted, tag);
   ASSERT_FALSE(result);
   EXPECT_EQ(mode::gcm<aes128>::authentication_failed, result.error().value);
 }
@@ -270,44 +249,40 @@ TEST(gcm, works_in_place) {
   const std::vector<uint8_t> aad = test::hex(kAad);
   const std::vector<uint8_t> plain = test::hex(kPlain60);
 
-  mode::gcm<aes128> gcm(key.data(), key.size());
+  mode::gcm<aes128> gcm(key);
 
   std::vector<uint8_t> buffer = plain;
   std::vector<uint8_t> tag(16);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                          {{buffer.data(), buffer.size()}}, buffer.data(),
-                          tag.data()));
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {buffer}, buffer, tag));
   EXPECT_EQ(std::string("42831ec2217774244b7221b784d0d49c"
                         "e3aa212f2c02a4e035c17e2329aca12e"
                         "21d514b25466931c7d8f6a5aac84aa05"
                         "1ba30b396a0aac973d58e091"),
             test::to_hex(buffer));
 
-  ASSERT_TRUE(gcm.decrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                          {{buffer.data(), buffer.size()}}, buffer.data(),
-                          tag.data()));
+  ASSERT_TRUE(gcm.decrypt(iv, {aad}, {buffer}, buffer, tag));
   EXPECT_EQ(test::to_hex(plain), test::to_hex(buffer));
 }
 
-// Passing the tag pointer just past the ciphertext appends it, which is the
-// layout a wire format usually wants. This is the property that made a separate
-// tag argument the better choice.
+// Naming the last tag_size bytes of one buffer as the tag appends it to the
+// ciphertext, which is the layout a wire format usually wants. This is the
+// property that made a separate tag argument the better choice.
 TEST(gcm, tag_can_be_appended_to_the_output) {
   const std::vector<uint8_t> key = test::hex(kKey128);
   const std::vector<uint8_t> iv = test::hex(kIv96);
   const std::vector<uint8_t> plain = test::hex(kPlain60);
 
-  mode::gcm<aes128> gcm(key.data(), key.size());
+  mode::gcm<aes128> gcm(key);
 
-  std::vector<uint8_t> packet(plain.size() + mode::gcm<aes128>::tag_size);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {},
-                          {{plain.data(), plain.size()}}, packet.data(),
-                          packet.data() + plain.size()));
+  const size_t tag_size = mode::gcm<aes128>::tag_size;
+  std::vector<uint8_t> packet(plain.size() + tag_size);
+  ASSERT_TRUE(gcm.encrypt(iv, {}, {plain},
+                          ctl::writable_bytes(packet).first(plain.size()),
+                          ctl::writable_bytes(packet).last(tag_size)));
 
   std::vector<uint8_t> decrypted(plain.size());
-  ASSERT_TRUE(gcm.decrypt(iv.data(), iv.size(), {},
-                          {{packet.data(), plain.size()}}, decrypted.data(),
-                          packet.data() + plain.size()));
+  ASSERT_TRUE(gcm.decrypt(iv, {}, {ctl::bytes(packet).first(plain.size())},
+                          decrypted, ctl::bytes(packet).last(tag_size)));
   EXPECT_EQ(test::to_hex(plain), test::to_hex(decrypted));
 }
 
@@ -345,26 +320,29 @@ TEST(gcm, builder_matches_the_single_call) {
   const std::vector<uint8_t> aad = test::hex(kAad);
   const std::vector<uint8_t> plain = test::hex(kPlain60);
 
-  gcm128 gcm(key.data(), key.size());
+  gcm128 gcm(key);
 
   std::vector<uint8_t> once(plain.size());
   std::vector<uint8_t> once_tag(16);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                          {{plain.data(), plain.size()}}, once.data(),
-                          once_tag.data()));
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {plain}, once, once_tag));
 
   std::vector<uint8_t> streamed(plain.size());
   std::vector<uint8_t> streamed_tag(16);
   {
-    auto writer = gcm.encryptor(iv.data(), iv.size())
-                      .aad({aad.data(), 4})
-                      .aad({aad.data() + 4, aad.size() - 4})
+    const ctl::bytes aad_view(aad);
+    const ctl::bytes plain_view(plain);
+    const ctl::writable_bytes out(streamed);
+
+    auto writer = gcm.encryptor(iv)
+                      .aad(aad_view.first(4))
+                      .aad(aad_view.last(aad.size() - 4))
                       .data();
     // Deliberately uneven runs so the key stream has to carry on mid block.
-    writer.write({plain.data(), 7}, streamed.data())
-        .write({plain.data() + 7, 20}, streamed.data() + 7)
-        .write({plain.data() + 27, plain.size() - 27}, streamed.data() + 27);
-    writer.finish(streamed_tag.data());
+    writer.write(plain_view.subview(0, 7), out.subview(0, 7))
+        .write(plain_view.subview(7, 20), out.subview(7, 20))
+        .write(plain_view.subview(27, plain.size() - 27),
+               out.subview(27, plain.size() - 27));
+    writer.finish(streamed_tag);
   }
 
   EXPECT_EQ(test::to_hex(once), test::to_hex(streamed));
@@ -377,19 +355,18 @@ TEST(gcm, builder_reproduces_the_official_vector) {
   const std::vector<uint8_t> aad = test::hex(kAad);
   const std::vector<uint8_t> plain = test::hex(kPlain60);
 
-  gcm128 gcm(key.data(), key.size());
+  gcm128 gcm(key);
 
   std::vector<uint8_t> out(plain.size());
   std::vector<uint8_t> tag(16);
-  auto writer = gcm.encryptor(iv.data(), iv.size())
-                    .aad({aad.data(), aad.size()})
-                    .data();
+  auto writer = gcm.encryptor(iv).aad(aad).data();
   for (size_t offset = 0; offset < plain.size(); offset += 9) {
     const size_t run =
         (plain.size() - offset) < 9 ? (plain.size() - offset) : 9;
-    writer.write({plain.data() + offset, run}, out.data() + offset);
+    writer.write(ctl::bytes(plain).subview(offset, run),
+                 ctl::writable_bytes(out).subview(offset, run));
   }
-  writer.finish(tag.data());
+  writer.finish(tag);
 
   EXPECT_EQ(std::string("42831ec2217774244b7221b784d0d49c"
                         "e3aa212f2c02a4e035c17e2329aca12e"
@@ -406,23 +383,18 @@ TEST(gcm, builder_authenticates_aad_only_as_gmac) {
   const std::vector<uint8_t> iv = test::hex(kIv96);
   const std::vector<uint8_t> message = test::hex(kPlain60);
 
-  gcm128 gcm(key.data(), key.size());
+  gcm128 gcm(key);
 
   std::vector<uint8_t> tag(16);
-  gcm.encryptor(iv.data(), iv.size())
-      .aad({message.data(), message.size()})
-      .finish(tag.data());
+  gcm.encryptor(iv).aad(message).finish(tag);
 
   // The single call interface has to agree, with the message as AAD and no data.
   std::vector<uint8_t> expected(16);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(),
-                          {{message.data(), message.size()}}, {}, nullptr,
-                          expected.data()));
+  ASSERT_TRUE(
+      gcm.encrypt(iv, {message}, {}, ctl::writable_bytes(), expected));
   EXPECT_EQ(test::to_hex(expected), test::to_hex(tag));
 
-  EXPECT_TRUE(gcm.decryptor(iv.data(), iv.size())
-                  .aad({message.data(), message.size()})
-                  .finish(tag.data()));
+  EXPECT_TRUE(gcm.decryptor(iv).aad(message).finish(tag));
 }
 
 TEST(gcm, builder_decrypts_and_verifies) {
@@ -431,21 +403,21 @@ TEST(gcm, builder_decrypts_and_verifies) {
   const std::vector<uint8_t> aad = test::hex(kAad);
   const std::vector<uint8_t> plain = test::hex(kPlain60);
 
-  gcm128 gcm(key.data(), key.size());
+  gcm128 gcm(key);
 
   std::vector<uint8_t> cipher(plain.size());
   std::vector<uint8_t> tag(16);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {{aad.data(), aad.size()}},
-                          {{plain.data(), plain.size()}}, cipher.data(),
-                          tag.data()));
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {plain}, cipher, tag));
 
   std::vector<uint8_t> recovered(plain.size());
-  auto reader = gcm.decryptor(iv.data(), iv.size())
-                    .aad({aad.data(), aad.size()})
-                    .data();
-  reader.write({cipher.data(), 13}, recovered.data())
-      .write({cipher.data() + 13, cipher.size() - 13}, recovered.data() + 13);
-  ASSERT_TRUE(reader.finish(tag.data()));
+  const ctl::bytes cipher_view(cipher);
+  const ctl::writable_bytes out(recovered);
+
+  auto reader = gcm.decryptor(iv).aad(aad).data();
+  reader.write(cipher_view.first(13), out.first(13))
+      .write(cipher_view.last(cipher.size() - 13),
+             out.last(cipher.size() - 13));
+  ASSERT_TRUE(reader.finish(tag));
   EXPECT_EQ(test::to_hex(plain), test::to_hex(recovered));
 }
 
@@ -454,19 +426,17 @@ TEST(gcm, builder_decrypt_reports_a_bad_tag) {
   const std::vector<uint8_t> iv = test::hex(kIv96);
   const std::vector<uint8_t> plain = test::hex(kPlain60);
 
-  gcm128 gcm(key.data(), key.size());
+  gcm128 gcm(key);
 
   std::vector<uint8_t> cipher(plain.size());
   std::vector<uint8_t> tag(16);
-  ASSERT_TRUE(gcm.encrypt(iv.data(), iv.size(), {},
-                          {{plain.data(), plain.size()}}, cipher.data(),
-                          tag.data()));
+  ASSERT_TRUE(gcm.encrypt(iv, {}, {plain}, cipher, tag));
   tag[15] ^= 0x80;
 
   std::vector<uint8_t> recovered(plain.size());
-  auto reader = gcm.decryptor(iv.data(), iv.size()).data();
-  reader.write({cipher.data(), cipher.size()}, recovered.data());
-  const auto result = reader.finish(tag.data());
+  auto reader = gcm.decryptor(iv).data();
+  reader.write(cipher, recovered);
+  const auto result = reader.finish(tag);
   ASSERT_FALSE(result);
   EXPECT_EQ(gcm128::authentication_failed, result.error().value);
   // Note that recovered still holds plaintext here. The incremental interface
@@ -476,20 +446,64 @@ TEST(gcm, builder_decrypt_reports_a_bad_tag) {
 
 TEST(gcm, builder_rejects_empty_iv) {
   const std::vector<uint8_t> key = test::hex(kKey128);
-  gcm128 gcm(key.data(), key.size());
-  EXPECT_THROW(gcm.encryptor(nullptr, 0), std::invalid_argument);
-  EXPECT_THROW(gcm.decryptor(nullptr, 0), std::invalid_argument);
+  gcm128 gcm(key);
+  EXPECT_THROW(gcm.encryptor(ctl::bytes()), std::invalid_argument);
+  EXPECT_THROW(gcm.decryptor(ctl::bytes()), std::invalid_argument);
 }
 
 TEST(gcm, rejects_empty_iv) {
   const std::vector<uint8_t> key = test::hex(kKey128);
-  mode::gcm<aes128> gcm(key.data(), key.size());
+  mode::gcm<aes128> gcm(key);
 
   uint8_t output[16] = {0};
   uint8_t tag[16] = {0};
   const uint8_t plain[16] = {0};
   const auto result =
-      gcm.encrypt(nullptr, 0, {}, {{plain, sizeof(plain)}}, output, tag);
+      gcm.encrypt(ctl::bytes(), {}, {plain}, output, tag);
   ASSERT_FALSE(result);
   EXPECT_EQ(mode::gcm<aes128>::invalid_iv_length, result.error().value);
+}
+
+// A tag is fixed length, so a buffer of the wrong length is refused instead of
+// being written past its end or compared over the wrong range.
+TEST(gcm, rejects_a_tag_buffer_of_the_wrong_length) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+  std::vector<uint8_t> out(plain.size());
+
+  mode::gcm<aes128> gcm(key);
+
+  std::vector<uint8_t> short_tag(mode::gcm<aes128>::tag_size - 1);
+  EXPECT_THROW(gcm.encrypt(iv, {}, {plain}, out, short_tag),
+               std::invalid_argument);
+
+  // A tag sized for the full 128 bits handed to a mode configured for 96 is
+  // the mistake a separate length argument could never catch.
+  mode::gcm<aes128, 96> truncated(key);
+  std::vector<uint8_t> wide_tag(16);
+  EXPECT_THROW(truncated.encrypt(iv, {}, {plain}, out, wide_tag),
+               std::invalid_argument);
+}
+
+// The output buffer carries its own length, so a ciphertext that does not fit
+// is reported rather than written past the end of the buffer.
+TEST(gcm, rejects_an_output_buffer_that_is_too_small) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  mode::gcm<aes128> gcm(key);
+
+  std::vector<uint8_t> too_small(plain.size() - 1);
+  std::vector<uint8_t> tag(16);
+  EXPECT_THROW(gcm.encrypt(iv, {}, {plain}, too_small, tag),
+               std::invalid_argument);
+
+  // The same holds for the incremental interface, where the output of each run
+  // is a separate buffer.
+  std::vector<uint8_t> run(4);
+  auto writer = gcm.encryptor(iv).data();
+  EXPECT_THROW(writer.write(ctl::bytes(plain).first(8), run),
+               std::invalid_argument);
 }

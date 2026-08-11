@@ -8,6 +8,7 @@
  */
 #include <gtest/gtest.h>
 
+#include <ctl/bytes>
 #include <ctl/symmetric/cipher/aria>
 
 #include "../vectors.h"
@@ -29,18 +30,21 @@ void check(const char *key_hex, const char *plain_hex,
   ASSERT_GE(key.size(), Cipher::key_size);
   ASSERT_EQ(plain.size(), Cipher::block_size);
 
-  Cipher cipher(key.data(), Cipher::key_size);
+  // The vectors share one key that is long enough for every size, so the part
+  // this cipher uses is named rather than being left to a length argument that
+  // happens to be smaller than the buffer.
+  Cipher cipher(ctl::bytes(key).first(Cipher::key_size));
 
   std::vector<uint8_t> encrypted(Cipher::block_size);
-  cipher.encrypt_block(plain.data(), encrypted.data());
+  cipher.encrypt_block(plain, encrypted);
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(encrypted));
 
   std::vector<uint8_t> decrypted(Cipher::block_size);
-  cipher.decrypt_block(encrypted.data(), decrypted.data());
+  cipher.decrypt_block(encrypted, decrypted);
   EXPECT_EQ(std::string(plain_hex), test::to_hex(decrypted));
 
   std::vector<uint8_t> inplace = plain;
-  cipher.encrypt_block(inplace.data(), inplace.data());
+  cipher.encrypt_block(inplace, inplace);
   EXPECT_EQ(std::string(cipher_hex), test::to_hex(inplace));
 }
 
@@ -89,7 +93,7 @@ template <class Cipher> void check_paths_agree() {
   for (size_t i = 0; i < key.size(); ++i)
     key[i] = static_cast<uint8_t>(0x3c + i * 5);
 
-  Cipher cipher(key.data(), key.size());
+  Cipher cipher(key);
 
   std::vector<uint8_t> block(Cipher::block_size);
   std::vector<uint8_t> by_dispatch(Cipher::block_size);
@@ -102,13 +106,13 @@ template <class Cipher> void check_paths_agree() {
       block[i] = static_cast<uint8_t>(state >> 24);
     }
 
-    cipher.encrypt_block(block.data(), by_dispatch.data());
-    cipher.encrypt_block_software(block.data(), by_software.data());
+    cipher.encrypt_block(block, by_dispatch);
+    cipher.encrypt_block_software(block, by_software);
     ASSERT_EQ(test::to_hex(by_software), test::to_hex(by_dispatch))
         << "encrypt mismatch at round " << round;
 
-    cipher.decrypt_block(by_dispatch.data(), by_dispatch.data());
-    cipher.decrypt_block_software(by_software.data(), by_software.data());
+    cipher.decrypt_block(by_dispatch, by_dispatch);
+    cipher.decrypt_block_software(by_software, by_software);
     ASSERT_EQ(test::to_hex(by_software), test::to_hex(by_dispatch))
         << "decrypt mismatch at round " << round;
     ASSERT_EQ(test::to_hex(block), test::to_hex(by_dispatch))
@@ -130,8 +134,12 @@ TEST(aria, vector_path_agrees_with_software_256) {
   check_paths_agree<aria<256>>();
 }
 
-TEST(aria, rejects_short_key_buffer) {
-  const std::vector<uint8_t> key = test::hex("00112233445566778899aabbccdd");
-  ASSERT_LT(key.size(), aria<128>::key_size);
-  EXPECT_THROW(aria<128>(key.data(), key.size()), std::invalid_argument);
+TEST(aria, rejects_key_of_the_wrong_length) {
+  const std::vector<uint8_t> too_short =
+      test::hex("00112233445566778899aabbccdd");
+  ASSERT_LT(too_short.size(), aria<128>::key_size);
+  EXPECT_THROW(aria<128>{ctl::bytes(too_short)}, std::invalid_argument);
+
+  const std::vector<uint8_t> too_long(aria<256>::key_size);
+  EXPECT_THROW(aria<128>{ctl::bytes(too_long)}, std::invalid_argument);
 }

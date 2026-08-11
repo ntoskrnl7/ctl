@@ -12,8 +12,10 @@ mode through the same code and nothing dispatches virtually per block.
 
 using namespace ctl::symmetric;
 
-mode::xts<cipher::aes<256>> xts(key, key_size);
-xts.encrypt(sector_number, plain, sector_size, out);
+std::vector<uint8_t> key(64), sector(512), out(512);
+
+mode::xts<cipher::aes<256>> xts(key);
+xts.encrypt(sector_number, sector, out);
 ```
 
 ## What is implemented
@@ -48,6 +50,7 @@ C++17 and CMake. The only dependency is
 Headers carry no extension, in the same style as `ext`.
 
 ```cpp
+#include <ctl/bytes>                    // bytes, writable_bytes
 #include <ctl/symmetric/cipher/aes>     // cipher::aes<128|192|256>
 #include <ctl/symmetric/cipher/aria>    // cipher::aria<128|192|256>
 #include <ctl/symmetric/mode/ecb>       // mode::ecb<Cipher>
@@ -58,13 +61,58 @@ Headers carry no extension, in the same style as `ext`.
 ```
 
 Operations that can fail return `ext::void_result`; those that cannot say so by
-returning nothing. Setting a key cannot fail, since any byte string is a valid
-key, so a wrong length is treated as a programming error and throws.
+returning nothing.
+
+### Buffers carry their own length
+
+No call takes a pointer and a length side by side. Hand over the object that
+holds the bytes and the length comes from that object, so the two cannot
+disagree.
+
+```cpp
+std::vector<uint8_t> key(16), plain(64), out(64);
+uint8_t iv[16];
+
+mode::cbc<cipher::aes<128>> cbc(key);
+cbc.encrypt(iv, plain, out);
+```
+
+Anything contiguous works: `std::vector`, `std::array`, a C array, a
+`std::string`, or `ctl::bytes(pointer, length)` where nothing else describes the
+buffer. Output buffers carry a length too, so writing past the end is reported
+rather than silently corrupting whatever follows.
+
+Where the length is fixed by the algorithm, it is part of the type, and getting
+it wrong fails to compile.
+
+```cpp
+uint8_t wrong[15];
+cipher::aes<128> aes(wrong);       // error: the array is not key_size bytes
+```
+
+A container whose length is only decided at run time is checked once, where it
+is handed over, and throws `std::invalid_argument` rather than being read past
+its end. The same applies to an output buffer that cannot hold the result: its
+length is decided entirely by the calling code and never by the data, so a
+buffer that is too small is a mistake in that code rather than a condition to
+recover from.
+
+Parts of a buffer are named rather than computed:
+
+```cpp
+ctl::bytes(packet).first(header_size)
+ctl::bytes(packet).last(tag_size)
+ctl::writable_bytes(out).subview(offset, run)
+```
+
+A view holds only what it needs, so `ctl::bytes` is a pointer and a length and a
+fixed length view such as `aes<128>::key_view` is just the pointer. Neither owns
+anything, and neither may outlive the buffer it was made from.
 
 ### A block cipher on its own
 
 ```cpp
-cipher::aes<128> aes(key, key_size);
+cipher::aes<128> aes(key);
 aes.encrypt_block(in, out);
 aes.decrypt_block(out, back);
 ```
@@ -75,8 +123,8 @@ An offset can be given, so a stream is picked up in the middle without
 processing what comes before it.
 
 ```cpp
-mode::ctr<cipher::aes<128>> ctr(key, key_size);
-ctr.crypt(nonce, byte_offset, in, size, out);
+mode::ctr<cipher::aes<128>> ctr(key);
+ctr.crypt(nonce, byte_offset, in, out);
 ```
 
 ### XTS, for storage
@@ -85,8 +133,8 @@ The key is two block cipher keys concatenated, and a data unit number such as a
 sector number becomes the tweak.
 
 ```cpp
-mode::xts<cipher::aes<256>> xts(key, key_size);   // key_size is 64 here
-xts.encrypt(sector_number, plain, 512, out);
+mode::xts<cipher::aes<256>> xts(key);   // the key is 64 bytes here
+xts.encrypt(sector_number, sector, out);
 ```
 
 ### GCM, authenticated with associated data
@@ -99,33 +147,35 @@ though their order does.
 
 ```cpp
 using gcm_t = mode::gcm<cipher::aes<128>>;
-gcm_t gcm(key, key_size);
+gcm_t gcm(key);
 
 uint8_t tag[gcm_t::tag_size];
-gcm.encrypt(iv, iv_size,
-            {{header, header_size}, {sequence, sequence_size}},   // AAD
-            {{plain, plain_size}},                                // data
-            out, tag);
+gcm.encrypt(iv, {header, sequence}, {plain}, out, tag);
 
-if (auto r = gcm.decrypt(iv, iv_size,
-                         {{header, header_size}, {sequence, sequence_size}},
-                         {{cipher_text, size}}, out, tag);
-    !r) {
+if (auto r = gcm.decrypt(iv, {header, sequence}, {cipher_text}, out, tag); !r) {
   // Verification failed, and out has already been erased.
 }
 ```
 
-Passing `out + size` as the tag pointer appends the tag to the ciphertext, which
-is the layout a wire format usually wants.
+Naming the last `tag_size` bytes of the buffer that also holds the ciphertext
+appends the tag there, which is the layout a wire format usually wants.
+
+```cpp
+std::vector<uint8_t> packet(plain.size() + gcm_t::tag_size);
+gcm.encrypt(iv, {}, {plain},
+            ctl::writable_bytes(packet).first(plain.size()),
+            ctl::writable_bytes(packet).last(gcm_t::tag_size));
+```
 
 When the data does not all exist at once there is an incremental form. The two
 phases are separate types, so supplying AAD once encryption has begun is a
 compile error rather than a wrong tag at run time.
 
 ```cpp
-auto writer = gcm.encryptor(iv, iv_size).aad({header, header_size}).data();
+auto writer = gcm.encryptor(iv).aad(header).data();
 while (read(chunk, &n)) {
-  writer.write({chunk, n}, out + written);
+  writer.write(ctl::bytes(chunk, n),
+               ctl::writable_bytes(out).subview(written, n));
   written += n;
 }
 writer.finish(tag);
@@ -135,7 +185,7 @@ Finishing straight from the AAD phase authenticates without encrypting, which is
 GMAC.
 
 ```cpp
-gcm.encryptor(iv, iv_size).aad({message, size}).finish(tag);
+gcm.encryptor(iv).aad(message).finish(tag);
 ```
 
 The incremental form cannot make the guarantee the single call makes. When a tag
@@ -168,15 +218,20 @@ AES-128 over a 4096 byte buffer, Intel Core Ultra 7 265K, MSVC `/O2`.
 
 | Mode | Software | Accelerated |
 | --- | --- | --- |
-| ECB | 534 MB/s | 12,301 MB/s |
-| XTS | 453 | 6,519 |
-| CTR | 467 | 4,627 |
-| CBC, which chains and cannot be parallelized | 502 | 1,621 |
-| GCM | 102 | 845 |
+| ECB | 543 MB/s | 11,400 MB/s |
+| XTS | 472 | 6,270 |
+| CTR | 470 | 4,510 |
+| CBC, which chains and cannot be parallelized | 426 | 1,590 |
+| GCM | 103 | 936 |
 
-XTS over 512 byte sectors reaches 4,457 MB/s. ARIA runs at 127 MB/s in software
-and 245 MB/s with the vector path, and ARIA-XTS at 220 MB/s. No operation
+XTS over 512 byte sectors reaches 4,500 MB/s. ARIA runs at 132 MB/s in software
+and 291 MB/s with the vector path, and ARIA-XTS at 220 MB/s. No operation
 performs a heap allocation.
+
+Describing a buffer by a view rather than by a pointer and a length costs
+nothing measurable. Running the same benchmark against the interface it
+replaced, interleaved so that neither sees a different thermal state, puts every
+mode within the ±2% the runs vary by on their own.
 
 ## Status and limits
 

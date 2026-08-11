@@ -25,6 +25,7 @@
 
 #include <ext/result>
 
+#include <ctl/bytes>
 #include <ctl/detail/memory>
 
 namespace ctl {
@@ -59,9 +60,19 @@ public:
   static constexpr size_t iv_size = block_size;
 
   /**
-   * @brief Initialization vector type
+   * @brief Initialization vector type, for declaring storage for one
    */
   typedef uint8_t iv_t[iv_size];
+
+  /**
+   * @brief A key handed over for reading
+   */
+  typedef ctl::fixed_bytes<key_size> key_view;
+
+  /**
+   * @brief An initialization vector handed over for reading
+   */
+  typedef ctl::fixed_bytes<iv_size> iv_view;
 
   enum error_status {
     /**
@@ -73,31 +84,35 @@ public:
   /**
    * @brief Initializes with a key
    *
-   * @param key key buffer
-   * @param size size of the key buffer, which must be at least key_size
+   * @param key the key, key_size bytes
+   * @exception std::invalid_argument if the key is not key_size bytes
    */
-  cbc(const uint8_t *key, size_t size) : cipher_(key, size) {}
+  explicit cbc(key_view key) : cipher_(key) {}
 
   /**
    * @brief Encrypts
    *
-   * @param iv initialization vector
-   * @param input input buffer
-   * @param size input size, which must be a multiple of block_size
-   * @param output output buffer, may be the same as input
+   * @param iv initialization vector, iv_size bytes
+   * @param input the data to encrypt, whose length must be a multiple of
+   * block_size
+   * @param output where the ciphertext goes, at least as long as input and may
+   * be the same buffer
+   * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> encrypt(const iv_t &iv, const uint8_t *input,
-                                        size_t size, uint8_t *output) const {
-    if (size % block_size != 0)
+  ext::void_result<error_status> encrypt(iv_view iv, ctl::bytes input,
+                                        ctl::writable_bytes output) const {
+    if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
+    ctl::detail::require_capacity("ctl::symmetric::mode::cbc::encrypt",
+                                  output.size(), input.size());
 
     uint8_t chain[block_size];
-    memcpy(chain, &iv[0], block_size);
+    memcpy(chain, iv.data(), block_size);
 
-    for (size_t offset = 0; offset < size; offset += block_size) {
-      ctl::detail::xor_block<block_size>(input + offset, chain, chain);
+    for (size_t offset = 0; offset < input.size(); offset += block_size) {
+      ctl::detail::xor_block<block_size>(input.data() + offset, chain, chain);
       cipher_.encrypt_block(chain, chain);
-      memcpy(output + offset, chain, block_size);
+      memcpy(output.data() + offset, chain, block_size);
     }
 
     ctl::detail::secure_zero(chain, sizeof(chain));
@@ -107,29 +122,35 @@ public:
   /**
    * @brief Decrypts
    *
-   * @param iv initialization vector
-   * @param input input buffer
-   * @param size input size, which must be a multiple of block_size
-   * @param output output buffer, may be the same as input
+   * @param iv initialization vector, iv_size bytes
+   * @param input the data to decrypt, whose length must be a multiple of
+   * block_size
+   * @param output where the plaintext goes, at least as long as input and may
+   * be the same buffer
+   * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> decrypt(const iv_t &iv, const uint8_t *input,
-                                        size_t size, uint8_t *output) const {
-    if (size % block_size != 0)
+  ext::void_result<error_status> decrypt(iv_view iv, ctl::bytes input,
+                                        ctl::writable_bytes output) const {
+    if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
+    ctl::detail::require_capacity("ctl::symmetric::mode::cbc::decrypt",
+                                  output.size(), input.size());
 
     uint8_t chain[block_size];
-    memcpy(chain, &iv[0], block_size);
+    memcpy(chain, iv.data(), block_size);
 
-    for (size_t offset = 0; offset < size; offset += block_size) {
+    typedef typename cipher_type::writable_block_view writable_block_view;
+
+    for (size_t offset = 0; offset < input.size(); offset += block_size) {
       // Supporting in place decryption means the input block has to be kept
       // before it is overwritten, since it becomes the chaining value of the
       // next block.
       uint8_t current[block_size];
-      memcpy(current, input + offset, block_size);
+      memcpy(current, input.data() + offset, block_size);
 
-      cipher_.decrypt_block(current, output + offset);
-      ctl::detail::xor_block<block_size>(output + offset, chain,
-                                        output + offset);
+      cipher_.decrypt_block(current, writable_block_view(output.data() + offset));
+      ctl::detail::xor_block<block_size>(output.data() + offset, chain,
+                                        output.data() + offset);
 
       memcpy(chain, current, block_size);
       // current holds a copy of a ciphertext block, so erasing it gains

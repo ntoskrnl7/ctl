@@ -1,0 +1,466 @@
+/**
+ * @file bytes
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief Views over contiguous bytes
+ *
+ * Every buffer that crosses the public interface is described by one of these
+ * rather than by a pointer and a length passed next to each other. The caller
+ * hands over the object that already owns the bytes, and the length is taken
+ * from that object, so the two cannot disagree. A key can no longer be handed
+ * over with the length of a different buffer, and an output buffer can no
+ * longer be written past its end because nothing told the library where it
+ * ends.
+ *
+ * Where the length is fixed by the algorithm, as it is for a key, an
+ * initialization vector, a tweak or a tag, the length is part of the type. An
+ * array or a std::array of the wrong length then fails to compile, and a
+ * container whose length is only known at run time is checked once, where it is
+ * handed over, rather than being read past its end.
+ *
+ * A view owns nothing and does not extend the lifetime of what it points at, so
+ * it must not outlive the buffer it was made from.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+namespace ctl {
+
+namespace detail {
+
+/**
+ * @brief Whether a type is one of the byte types
+ */
+template <class _Type> struct is_byte : std::false_type {};
+template <> struct is_byte<char> : std::true_type {};
+template <> struct is_byte<signed char> : std::true_type {};
+template <> struct is_byte<unsigned char> : std::true_type {};
+#if defined(__cpp_lib_byte)
+template <> struct is_byte<std::byte> : std::true_type {};
+#endif
+
+/**
+ * @brief Whether a type is one of the views defined in this file
+ *
+ * The views expose data() and size() themselves, so without this they would
+ * satisfy the container tests below and the converting constructors would
+ * become ambiguous with the conversions between the views.
+ */
+template <class _Type, class = void> struct is_byte_view : std::false_type {};
+template <class _Type>
+struct is_byte_view<_Type, std::void_t<typename _Type::ctl_byte_view_tag>>
+    : std::true_type {};
+
+/**
+ * @brief The type that a container's data() points at
+ */
+template <class _Container>
+using data_element_t =
+    std::remove_pointer_t<decltype(std::declval<_Container &>().data())>;
+
+/**
+ * @brief Whether a container exposes contiguous bytes that can be read
+ */
+template <class _Container, class = void>
+struct is_readable_bytes : std::false_type {};
+
+template <class _Container>
+struct is_readable_bytes<
+    _Container,
+    std::void_t<decltype(std::declval<const _Container &>().data()),
+                decltype(std::declval<const _Container &>().size())>>
+    : std::integral_constant<
+          bool,
+          is_byte<std::remove_cv_t<data_element_t<const _Container>>>::value &&
+              !is_byte_view<_Container>::value> {};
+
+/**
+ * @brief Whether a container exposes contiguous bytes that can be written
+ */
+template <class _Container, class = void>
+struct is_writable_bytes : std::false_type {};
+
+template <class _Container>
+struct is_writable_bytes<
+    _Container, std::void_t<decltype(std::declval<_Container &>().data()),
+                            decltype(std::declval<_Container &>().size())>>
+    : std::integral_constant<
+          bool,
+          is_byte<std::remove_cv_t<data_element_t<_Container>>>::value &&
+              !std::is_const<data_element_t<_Container>>::value &&
+              !is_byte_view<_Container>::value> {};
+
+/**
+ * @brief A container's length where its type states it, and zero otherwise
+ *
+ * std::array states its length, so handing one of the wrong length to a fixed
+ * length argument is caught at compile time. std::vector does not, so it is
+ * checked when it is handed over.
+ */
+template <class _Container, class = void>
+struct static_size : std::integral_constant<size_t, 0> {};
+
+template <class _Container>
+struct static_size<_Container, std::void_t<decltype(std::tuple_size<
+                                           std::remove_cv_t<_Container>>::value)>>
+    : std::integral_constant<size_t,
+                             std::tuple_size<std::remove_cv_t<_Container>>::value> {
+};
+
+/**
+ * @brief Reports a buffer whose length is not the one the argument requires
+ */
+[[noreturn]] inline void throw_length_mismatch(size_t expected, size_t actual) {
+  throw std::invalid_argument(
+      "ctl : this argument requires exactly " + std::to_string(expected) +
+      " bytes, but a buffer of " + std::to_string(actual) + " was given.");
+}
+
+/**
+ * @brief Reports an output buffer that is too small to hold the result
+ *
+ * The length of an output buffer is decided entirely by the calling code and
+ * never by the data, so a buffer that is too small is always a mistake in that
+ * code rather than a condition to recover from. It is therefore reported the
+ * same way a wrong key length is, rather than through the result type the modes
+ * use for what the data can legitimately be.
+ */
+inline void require_capacity(const char *where, size_t available,
+                             size_t needed) {
+  if (available < needed)
+    throw std::invalid_argument(
+        std::string(where) + " : the output buffer holds " +
+        std::to_string(available) + " bytes, but " + std::to_string(needed) +
+        " are needed.");
+}
+
+} // namespace detail
+
+/**
+ * @brief A view over bytes that are only read
+ */
+class bytes {
+public:
+  /**
+   * @brief Marks this as one of the views defined here
+   */
+  typedef void ctl_byte_view_tag;
+
+  /**
+   * @brief An empty view
+   */
+  constexpr bytes() noexcept : data_(nullptr), size_(0) {}
+
+  /**
+   * @brief Wraps a pointer and a length
+   *
+   * This is the one place the two are still stated side by side, for a buffer
+   * that no object describes. Everywhere else they come from something that
+   * already holds both.
+   */
+  constexpr bytes(const uint8_t *data, size_t size) noexcept
+      : data_(data), size_(size) {}
+
+  /**
+   * @brief Wraps an array, taking the length from its type
+   *
+   * Arrays of char are deliberately not accepted. A string literal is one, and
+   * its terminating null would silently become part of the message. A
+   * std::string is accepted through the constructor below, where the length
+   * comes from the object and the null is not part of it.
+   */
+  template <class _Byte, size_t _Size,
+            typename std::enable_if<detail::is_byte<_Byte>::value &&
+                                        !std::is_same<_Byte, char>::value,
+                                    int>::type = 0>
+  bytes(const _Byte (&array)[_Size]) noexcept
+      : data_(reinterpret_cast<const uint8_t *>(array)), size_(_Size) {}
+
+  /**
+   * @brief Wraps a container that holds contiguous bytes, such as
+   * std::vector<uint8_t>, std::array<uint8_t, N> or std::string
+   */
+  template <class _Container,
+            typename std::enable_if<detail::is_readable_bytes<_Container>::value,
+                                    int>::type = 0>
+  bytes(const _Container &container) noexcept
+      : data_(reinterpret_cast<const uint8_t *>(container.data())),
+        size_(container.size()) {}
+
+  const uint8_t *data() const noexcept { return data_; }
+  size_t size() const noexcept { return size_; }
+  bool empty() const noexcept { return size_ == 0; }
+
+  const uint8_t *begin() const noexcept { return data_; }
+  const uint8_t *end() const noexcept { return data_ + size_; }
+  uint8_t operator[](size_t index) const noexcept { return data_[index]; }
+
+  /**
+   * @brief A view over part of this one
+   *
+   * @param offset where the part starts
+   * @param count how many bytes it covers
+   * @exception std::out_of_range if the part is not inside this view
+   */
+  bytes subview(size_t offset, size_t count) const {
+    if (offset > size_ || count > size_ - offset)
+      throw std::out_of_range(
+          "ctl::bytes::subview : the range lies outside the view.");
+    return bytes(data_ + offset, count);
+  }
+
+  /**
+   * @brief A view over the first count bytes
+   */
+  bytes first(size_t count) const { return subview(0, count); }
+
+  /**
+   * @brief A view over the last count bytes
+   */
+  bytes last(size_t count) const {
+    if (count > size_)
+      throw std::out_of_range(
+          "ctl::bytes::last : the range lies outside the view.");
+    return bytes(data_ + size_ - count, count);
+  }
+
+private:
+  const uint8_t *data_;
+  size_t size_;
+};
+
+/**
+ * @brief A view over bytes that are written
+ *
+ * Only accepted where the library produces output, and it converts to bytes
+ * wherever the same buffer is also read.
+ */
+class writable_bytes {
+public:
+  typedef void ctl_byte_view_tag;
+
+  constexpr writable_bytes() noexcept : data_(nullptr), size_(0) {}
+
+  constexpr writable_bytes(uint8_t *data, size_t size) noexcept
+      : data_(data), size_(size) {}
+
+  template <class _Byte, size_t _Size,
+            typename std::enable_if<detail::is_byte<_Byte>::value &&
+                                        !std::is_same<_Byte, char>::value,
+                                    int>::type = 0>
+  writable_bytes(_Byte (&array)[_Size]) noexcept
+      : data_(reinterpret_cast<uint8_t *>(array)), size_(_Size) {}
+
+  template <class _Container,
+            typename std::enable_if<detail::is_writable_bytes<_Container>::value,
+                                    int>::type = 0>
+  writable_bytes(_Container &container) noexcept
+      : data_(reinterpret_cast<uint8_t *>(container.data())),
+        size_(container.size()) {}
+
+  operator bytes() const noexcept { return bytes(data_, size_); }
+
+  uint8_t *data() const noexcept { return data_; }
+  size_t size() const noexcept { return size_; }
+  bool empty() const noexcept { return size_ == 0; }
+
+  uint8_t *begin() const noexcept { return data_; }
+  uint8_t *end() const noexcept { return data_ + size_; }
+  uint8_t &operator[](size_t index) const noexcept { return data_[index]; }
+
+  writable_bytes subview(size_t offset, size_t count) const {
+    if (offset > size_ || count > size_ - offset)
+      throw std::out_of_range(
+          "ctl::writable_bytes::subview : the range lies outside the view.");
+    return writable_bytes(data_ + offset, count);
+  }
+
+  writable_bytes first(size_t count) const { return subview(0, count); }
+
+  writable_bytes last(size_t count) const {
+    if (count > size_)
+      throw std::out_of_range(
+          "ctl::writable_bytes::last : the range lies outside the view.");
+    return writable_bytes(data_ + size_ - count, count);
+  }
+
+private:
+  uint8_t *data_;
+  size_t size_;
+};
+
+template <size_t _Size> class writable_fixed_bytes;
+
+/**
+ * @brief A view over exactly _Size bytes that are only read
+ *
+ * Used for everything whose length the algorithm fixes: keys, initialization
+ * vectors, tweaks and tags. Only the pointer is stored, since the length is
+ * part of the type, so one of these is the same size as the pointer it replaces
+ * and costs nothing to pass.
+ *
+ * @tparam _Size the required length in bytes
+ */
+template <size_t _Size> class fixed_bytes {
+public:
+  typedef void ctl_byte_view_tag;
+
+  /**
+   * @brief Wraps a pointer to a buffer that is known to hold _Size bytes
+   *
+   * Explicit, so that a bare pointer never becomes one of these on its own at a
+   * call site. It exists for the places inside the library that have already
+   * established the length.
+   */
+  explicit constexpr fixed_bytes(const uint8_t *data) noexcept : data_(data) {}
+
+  /**
+   * @brief Wraps an array whose length the type states
+   *
+   * An array of the wrong length fails to compile.
+   */
+  template <class _Byte, size_t _ArraySize,
+            typename std::enable_if<detail::is_byte<_Byte>::value &&
+                                        !std::is_same<_Byte, char>::value,
+                                    int>::type = 0>
+  fixed_bytes(const _Byte (&array)[_ArraySize]) noexcept
+      : data_(reinterpret_cast<const uint8_t *>(array)) {
+    static_assert(_ArraySize == _Size,
+                  "The array does not have the length this argument requires. "
+                  "The required length is the constant the type states, such "
+                  "as cipher::aes<128>::key_size or mode::cbc<>::iv_size.");
+  }
+
+  /**
+   * @brief Wraps a container that holds contiguous bytes
+   *
+   * A std::array states its length in its type and is checked at compile time.
+   * A container whose length is only known at run time, such as std::vector or
+   * std::string, is checked here.
+   *
+   * @exception std::invalid_argument if the container does not hold exactly
+   * _Size bytes
+   */
+  template <class _Container,
+            typename std::enable_if<detail::is_readable_bytes<_Container>::value,
+                                    int>::type = 0>
+  fixed_bytes(const _Container &container)
+      : data_(reinterpret_cast<const uint8_t *>(container.data())) {
+    static_assert(detail::static_size<_Container>::value == 0 ||
+                      detail::static_size<_Container>::value == _Size,
+                  "The container does not have the length this argument "
+                  "requires. The required length is the constant the type "
+                  "states, such as cipher::aes<128>::key_size.");
+    if (container.size() != _Size)
+      detail::throw_length_mismatch(_Size, container.size());
+  }
+
+  /**
+   * @brief Narrows a view of unknown length to this one
+   *
+   * @exception std::invalid_argument if the view is not exactly _Size bytes
+   */
+  fixed_bytes(bytes view) : data_(view.data()) {
+    if (view.size() != _Size)
+      detail::throw_length_mismatch(_Size, view.size());
+  }
+
+  /**
+   * @brief Drops the ability to write
+   */
+  fixed_bytes(writable_fixed_bytes<_Size> view) noexcept;
+
+  operator bytes() const noexcept { return bytes(data_, _Size); }
+
+  const uint8_t *data() const noexcept { return data_; }
+  static constexpr size_t size() noexcept { return _Size; }
+
+  const uint8_t *begin() const noexcept { return data_; }
+  const uint8_t *end() const noexcept { return data_ + _Size; }
+  uint8_t operator[](size_t index) const noexcept { return data_[index]; }
+
+private:
+  const uint8_t *data_;
+};
+
+/**
+ * @brief A view over exactly _Size bytes that are written
+ *
+ * @tparam _Size the required length in bytes
+ */
+template <size_t _Size> class writable_fixed_bytes {
+public:
+  typedef void ctl_byte_view_tag;
+
+  explicit constexpr writable_fixed_bytes(uint8_t *data) noexcept
+      : data_(data) {}
+
+  template <class _Byte, size_t _ArraySize,
+            typename std::enable_if<detail::is_byte<_Byte>::value &&
+                                        !std::is_same<_Byte, char>::value,
+                                    int>::type = 0>
+  writable_fixed_bytes(_Byte (&array)[_ArraySize]) noexcept
+      : data_(reinterpret_cast<uint8_t *>(array)) {
+    static_assert(_ArraySize == _Size,
+                  "The array does not have the length this argument requires. "
+                  "The required length is the constant the type states, such "
+                  "as mode::gcm<>::tag_size.");
+  }
+
+  template <class _Container,
+            typename std::enable_if<detail::is_writable_bytes<_Container>::value,
+                                    int>::type = 0>
+  writable_fixed_bytes(_Container &container)
+      : data_(reinterpret_cast<uint8_t *>(container.data())) {
+    static_assert(detail::static_size<_Container>::value == 0 ||
+                      detail::static_size<_Container>::value == _Size,
+                  "The container does not have the length this argument "
+                  "requires. The required length is the constant the type "
+                  "states, such as mode::gcm<>::tag_size.");
+    if (container.size() != _Size)
+      detail::throw_length_mismatch(_Size, container.size());
+  }
+
+  /**
+   * @brief Narrows a view of unknown length to this one
+   *
+   * @exception std::invalid_argument if the view is not exactly _Size bytes
+   */
+  writable_fixed_bytes(writable_bytes view) : data_(view.data()) {
+    if (view.size() != _Size)
+      detail::throw_length_mismatch(_Size, view.size());
+  }
+
+  operator writable_bytes() const noexcept {
+    return writable_bytes(data_, _Size);
+  }
+
+  operator bytes() const noexcept { return bytes(data_, _Size); }
+
+  uint8_t *data() const noexcept { return data_; }
+  static constexpr size_t size() noexcept { return _Size; }
+
+  uint8_t *begin() const noexcept { return data_; }
+  uint8_t *end() const noexcept { return data_ + _Size; }
+  uint8_t &operator[](size_t index) const noexcept { return data_[index]; }
+
+private:
+  uint8_t *data_;
+};
+
+template <size_t _Size>
+inline fixed_bytes<_Size>::fixed_bytes(
+    writable_fixed_bytes<_Size> view) noexcept
+    : data_(view.data()) {}
+
+} // namespace ctl
