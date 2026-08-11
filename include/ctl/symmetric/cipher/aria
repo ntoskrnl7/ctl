@@ -97,6 +97,85 @@ static_assert(sb2.inverse[0x00] == 0x30, "ARIA SB4 derivation error");
 static_assert(sb2.inverse[0x0d] == 0x09, "ARIA SB4 derivation error");
 
 /**
+ * @brief An affine map over GF(2)^8, a linear map followed by adding a constant
+ */
+struct affine_map {
+  /**
+   * @brief Where the map sends the vector with only bit i set, with the
+   * constant already taken out
+   */
+  uint8_t column[8];
+
+  /**
+   * @brief Where the map sends zero
+   */
+  uint8_t constant;
+};
+
+/**
+ * @brief Applies an affine map
+ */
+constexpr uint8_t apply_affine(const affine_map &map, uint8_t value) {
+  uint8_t result = map.constant;
+  for (unsigned int i = 0; i < 8; ++i)
+    if ((value >> i) & 1)
+      result = static_cast<uint8_t>(result ^ map.column[i]);
+  return result;
+}
+
+/**
+ * @brief SB2 composed with the inverse of SB1
+ */
+constexpr uint8_t sb2_after_sb1_inverse(uint8_t value) {
+  return sb2_table[ctl::detail::aes_sbox.inverse[value]];
+}
+
+/**
+ * @brief Recovers the affine map that turns SB1 into SB2
+ *
+ * A linear map is determined by where it sends each basis vector, so eight
+ * evaluations plus the image of zero are enough to recover the whole thing.
+ */
+constexpr affine_map derive_sb2_from_sb1() {
+  affine_map map = {};
+  map.constant = sb2_after_sb1_inverse(0);
+  for (unsigned int i = 0; i < 8; ++i)
+    map.column[i] = static_cast<uint8_t>(
+        sb2_after_sb1_inverse(static_cast<uint8_t>(1u << i)) ^ map.constant);
+  return map;
+}
+
+/**
+ * @brief The affine map with SB2(x) == apply_affine(map, SB1(x))
+ *
+ * This is groundwork rather than something the current implementation uses. A
+ * vectorized substitution layer would apply SB1 to all sixteen bytes at once
+ * with the AES instruction, since ARIA's SB1 is the AES S-box, and would then
+ * need SB2 as a transformation of that result rather than as its own table.
+ *
+ * RFC 5794 gives all four S-boxes as tables only and never says they share a
+ * structure, so the relation is recovered from the tables here and checked
+ * against every one of the 256 entries below. If ARIA had not been built this
+ * way the check would fail, which is the point of writing it down as a check
+ * rather than as a comment.
+ */
+inline constexpr affine_map sb2_from_sb1 = derive_sb2_from_sb1();
+
+/**
+ * @brief Confirms the map reproduces SB2 for every input
+ */
+constexpr bool reproduces_sb2(const affine_map &map) {
+  for (unsigned int i = 0; i < 256; ++i)
+    if (apply_affine(map, ctl::detail::aes_sbox.forward[i]) != sb2_table[i])
+      return false;
+  return true;
+}
+
+static_assert(reproduces_sb2(sb2_from_sb1),
+              "ARIA SB2 is not an affine image of SB1, so a vectorized "
+              "substitution layer cannot derive one from the other");
+
+/**
  * @brief The key schedule constants C1, C2 and C3 (section 2.2 of RFC 5794)
  *
  * Taken from the leading 128*3 bits of the fractional part of 1/PI.
@@ -516,11 +595,14 @@ private:
    */
   static void odd_round(const uint8_t *data, const uint8_t *round_key,
                         uint8_t *output) {
+    // The substitution reads and writes the same index, so it runs in place and
+    // the round needs one scratch block rather than two. This was measured and
+    // makes no difference to the speed, the compiler was already keeping the
+    // second one in registers; it is kept because it is less to read.
     uint8_t t[16];
-    uint8_t s[16];
-    ctl::detail::xor_bytes(data, round_key, t, 16);
-    substitute1(t, s);
-    diffuse(s, output);
+    ctl::detail::xor_block<16>(data, round_key, t);
+    substitute1(t, t);
+    diffuse(t, output);
   }
 
   /**
@@ -530,10 +612,9 @@ private:
   static void even_round(const uint8_t *data, const uint8_t *round_key,
                          uint8_t *output) {
     uint8_t t[16];
-    uint8_t s[16];
-    ctl::detail::xor_bytes(data, round_key, t, 16);
-    substitute2(t, s);
-    diffuse(s, output);
+    ctl::detail::xor_block<16>(data, round_key, t);
+    substitute2(t, t);
+    diffuse(t, output);
   }
 
   /**
