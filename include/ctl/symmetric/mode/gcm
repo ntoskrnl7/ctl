@@ -155,16 +155,17 @@ public:
    * @param size size of the key buffer, which must be at least key_size
    */
   gcm(const uint8_t *key, size_t size) : cipher_(key, size) {
-    // The hash subkey depends only on the key, so it is derived once here.
+    // The hash subkey, and everything GHASH derives from it, depends only on
+    // the key. Preparing it once here and copying that state into each
+    // invocation keeps the cost off the per message path, which matters most
+    // for short messages.
     uint8_t zero[block_size];
+    uint8_t subkey[block_size];
     memset(zero, 0, sizeof(zero));
-    cipher_.encrypt_block(zero, subkey_);
+    cipher_.encrypt_block(zero, subkey);
+    hash_.set_key(subkey);
+    ctl::detail::secure_zero(subkey, sizeof(subkey));
   }
-
-  /**
-   * @brief Erases the hash subkey on destruction
-   */
-  ~gcm() { ctl::detail::secure_zero(subkey_, sizeof(subkey_)); }
 
   /**
    * @brief Encrypts and authenticates
@@ -186,7 +187,7 @@ public:
     if (total(plain) > max_data_size)
       return ext::err(invalid_input_length);
 
-    session state(cipher_, subkey_, iv, iv_size);
+    session state(cipher_, hash_, iv, iv_size);
     for (const piece &p : aad)
       state.absorb_aad(p.data, p.size);
 
@@ -227,7 +228,7 @@ public:
     if (data_size > max_data_size)
       return ext::err(invalid_input_length);
 
-    session state(cipher_, subkey_, iv, iv_size);
+    session state(cipher_, hash_, iv, iv_size);
     for (const piece &p : aad)
       state.absorb_aad(p.data, p.size);
 
@@ -258,11 +259,10 @@ private:
    */
   class session {
   public:
-    session(const cipher_type &cipher, const uint8_t *subkey,
+    session(const cipher_type &cipher, const ctl::detail::ghash &prepared,
             const uint8_t *iv, size_t iv_size)
-        : cipher_(cipher), aad_bits_(0), data_bits_(0),
+        : cipher_(cipher), hash_(prepared), aad_bits_(0), data_bits_(0),
           keystream_used_(block_size), aad_closed_(false) {
-      hash_.set_key(subkey);
       derive_initial_counter(iv, iv_size);
       memcpy(counter_, initial_, block_size);
       // The tag is masked with the block cipher applied to the initial counter,
@@ -475,9 +475,9 @@ public:
    */
   class encrypt_aad {
   public:
-    encrypt_aad(const cipher_type &cipher, const uint8_t *subkey,
+    encrypt_aad(const cipher_type &cipher, const ctl::detail::ghash &prepared,
                 const uint8_t *iv, size_t iv_size)
-        : state_(cipher, subkey, iv, iv_size) {}
+        : state_(cipher, prepared, iv, iv_size) {}
 
     /**
      * @brief Authenticates one run of additional data
@@ -562,9 +562,9 @@ public:
    */
   class decrypt_aad {
   public:
-    decrypt_aad(const cipher_type &cipher, const uint8_t *subkey,
+    decrypt_aad(const cipher_type &cipher, const ctl::detail::ghash &prepared,
                 const uint8_t *iv, size_t iv_size)
-        : state_(cipher, subkey, iv, iv_size) {}
+        : state_(cipher, prepared, iv, iv_size) {}
 
     /**
      * @brief Authenticates one run of additional data
@@ -604,7 +604,7 @@ public:
     if (iv_size == 0)
       throw std::invalid_argument("ctl::symmetric::mode::gcm : "
                                   "the initialization vector is empty.");
-    return encrypt_aad(cipher_, subkey_, iv, iv_size);
+    return encrypt_aad(cipher_, hash_, iv, iv_size);
   }
 
   /**
@@ -620,7 +620,7 @@ public:
     if (iv_size == 0)
       throw std::invalid_argument("ctl::symmetric::mode::gcm : "
                                   "the initialization vector is empty.");
-    return decrypt_aad(cipher_, subkey_, iv, iv_size);
+    return decrypt_aad(cipher_, hash_, iv, iv_size);
   }
 
 private:
@@ -652,9 +652,9 @@ private:
   cipher_type cipher_;
 
   /**
-   * @brief The GHASH subkey, the block cipher applied to a block of zeroes
+   * @brief GHASH with the subkey already set, copied into each invocation
    */
-  uint8_t subkey_[block_size];
+  ctl::detail::ghash hash_;
 };
 
 } // namespace mode

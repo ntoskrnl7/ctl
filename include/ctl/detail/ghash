@@ -63,15 +63,26 @@ public:
    */
   static constexpr uint64_t reduction = 0xe100000000000000ull;
 
+  /**
+   * @brief Number of blocks folded together before a single reduction
+   */
+  static constexpr size_t aggregate = 4;
+
   ghash() : hh_(0), hl_(0), yh_(0), yl_(0), pending_(0) {
     memset(buffer_, 0, sizeof(buffer_));
 #if defined(CTL_HAS_X86_HW_ACCEL)
     hardware_ = false;
+    memset(power_h_, 0, sizeof(power_h_));
+    memset(power_l_, 0, sizeof(power_l_));
 #endif
   }
 
   ~ghash() {
     ctl::detail::secure_zero(buffer_, sizeof(buffer_));
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    ctl::detail::secure_zero(power_h_, sizeof(power_h_));
+    ctl::detail::secure_zero(power_l_, sizeof(power_l_));
+#endif
     hh_ = 0;
     hl_ = 0;
     yh_ = 0;
@@ -87,9 +98,19 @@ public:
   void set_key(const uint8_t *h) {
     hh_ = ctl::detail::load_be64(h);
     hl_ = ctl::detail::load_be64(h + 8);
+
 #if defined(CTL_HAS_X86_HW_ACCEL)
     hardware_ = ctl::detail::cpu::has_carryless_multiply();
+    if (hardware_) {
+      // Powers of the subkey, used to fold several blocks into one reduction.
+      power_h_[0] = hh_;
+      power_l_[0] = hl_;
+      for (size_t i = 1; i < aggregate; ++i)
+        multiply_pair(power_h_[i - 1], power_l_[i - 1], hh_, hl_, power_h_[i],
+                      power_l_[i]);
+    }
 #endif
+
     reset();
   }
 
@@ -121,6 +142,16 @@ public:
       absorb(buffer_);
       pending_ = 0;
     }
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (hardware_) {
+      while (size >= aggregate * block_size) {
+        absorb_aggregated(data);
+        data += aggregate * block_size;
+        size -= aggregate * block_size;
+      }
+    }
+#endif
 
     while (size >= block_size) {
       absorb(data);
@@ -184,43 +215,48 @@ private:
 
 #if defined(CTL_HAS_X86_HW_ACCEL)
   /**
-   * @brief Multiplies using the carry-less multiply instruction
+   * @brief Packs a big endian pair into the form the multiply instruction wants
    *
-   * Two things make this work. First, the value that a big endian load produces
-   * is already the representation this needs: GCM numbers bits from the most
-   * significant end, so placing the first eight bytes in the high lane and the
-   * last eight in the low lane puts the coefficient of x^0 at bit 127, which is
-   * the reversed form the instruction wants.
-   *
-   * Second, multiplying two values held that way yields a product that sits one
-   * bit higher than it should, because reversing a 128 bit value spreads a
-   * 255 bit product across 256 bits. That is what the shift by one below
-   * corrects, and it is the step that is easy to leave out; leaving it out
-   * produces tags that are wrong every time rather than occasionally, so the
-   * published vectors catch it immediately.
-   *
-   * The reduction that follows folds the top half back in using the reversed
-   * form of the field polynomial.
+   * The value a big endian load produces is already the right representation:
+   * GCM numbers bits from the most significant end, so putting the first eight
+   * bytes in the high lane and the last eight in the low lane places the
+   * coefficient of x^0 at bit 127, which is the reversed form the instruction
+   * operates on.
    */
-  CTL_TARGET_PCLMUL void multiply_carryless() {
-    const __m128i x = _mm_set_epi64x(static_cast<long long>(yh_),
-                                     static_cast<long long>(yl_));
-    const __m128i h = _mm_set_epi64x(static_cast<long long>(hh_),
-                                     static_cast<long long>(hl_));
+  CTL_TARGET_PCLMUL static __m128i to_vector(uint64_t high, uint64_t low) {
+    return _mm_set_epi64x(static_cast<long long>(high),
+                          static_cast<long long>(low));
+  }
 
-    // Schoolbook 128 by 128 multiply into a 256 bit product held as [high:low].
-    __m128i low = _mm_clmulepi64_si128(x, h, 0x00);
-    __m128i mid = _mm_clmulepi64_si128(x, h, 0x10);
-    __m128i mid2 = _mm_clmulepi64_si128(x, h, 0x01);
-    __m128i high = _mm_clmulepi64_si128(x, h, 0x11);
+  /**
+   * @brief Carry-less multiply of two 128 bit values into a 256 bit product
+   *
+   * Schoolbook, with the two cross terms folded together. No reduction is done
+   * here, which is what lets several products be summed before reducing once.
+   */
+  CTL_TARGET_PCLMUL static void clmul_256(__m128i a, __m128i b, __m128i &low,
+                                          __m128i &high) {
+    const __m128i l = _mm_clmulepi64_si128(a, b, 0x00);
+    const __m128i h = _mm_clmulepi64_si128(a, b, 0x11);
+    const __m128i m = _mm_xor_si128(_mm_clmulepi64_si128(a, b, 0x10),
+                                    _mm_clmulepi64_si128(a, b, 0x01));
+    low = _mm_xor_si128(l, _mm_slli_si128(m, 8));
+    high = _mm_xor_si128(h, _mm_srli_si128(m, 8));
+  }
 
-    mid = _mm_xor_si128(mid, mid2);
-    low = _mm_xor_si128(low, _mm_slli_si128(mid, 8));
-    high = _mm_xor_si128(high, _mm_srli_si128(mid, 8));
-
-    // Shift the whole 256 bit product left by one bit.
-    __m128i carry_low = _mm_srli_epi32(low, 31);
-    __m128i carry_high = _mm_srli_epi32(high, 31);
+  /**
+   * @brief Reduces a 256 bit product back to a field element
+   *
+   * The product sits one bit higher than it should, because reversing a 128 bit
+   * value spreads a 255 bit product across 256 bits, so it is shifted left by
+   * one first. Leaving that shift out produces tags that are wrong every time
+   * rather than occasionally, so the published vectors catch it immediately.
+   * What follows folds the top half back in using the reversed form of the
+   * field polynomial.
+   */
+  CTL_TARGET_PCLMUL static __m128i reduce(__m128i low, __m128i high) {
+    const __m128i carry_low = _mm_srli_epi32(low, 31);
+    const __m128i carry_high = _mm_srli_epi32(high, 31);
     low = _mm_slli_epi32(low, 1);
     high = _mm_slli_epi32(high, 1);
 
@@ -229,8 +265,7 @@ private:
     high = _mm_or_si128(high, _mm_slli_si128(carry_high, 4));
     high = _mm_or_si128(high, spill);
 
-    // Reduce modulo the reversed field polynomial.
-    __m128i fold = _mm_xor_si128(
+    const __m128i fold = _mm_xor_si128(
         _mm_xor_si128(_mm_slli_epi32(low, 31), _mm_slli_epi32(low, 30)),
         _mm_slli_epi32(low, 25));
     const __m128i carried = _mm_srli_si128(fold, 4);
@@ -241,20 +276,94 @@ private:
         _mm_srli_epi32(low, 7));
     tail = _mm_xor_si128(tail, carried);
     low = _mm_xor_si128(low, tail);
-    const __m128i result = _mm_xor_si128(high, low);
+    return _mm_xor_si128(high, low);
+  }
 
-    yl_ = static_cast<uint64_t>(_mm_cvtsi128_si64(result));
-    yh_ = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_srli_si128(result, 8)));
+  /**
+   * @brief Stores a field element back into the accumulator
+   */
+  CTL_TARGET_PCLMUL void store_accumulator(__m128i value) {
+    yl_ = static_cast<uint64_t>(_mm_cvtsi128_si64(value));
+    yh_ = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_srli_si128(value, 8)));
+  }
+
+  /**
+   * @brief Multiplies two field elements with the carry-less instruction
+   *
+   * Used when preparing the powers of the subkey.
+   */
+  CTL_TARGET_PCLMUL static void multiply_pair(uint64_t ah, uint64_t al,
+                                              uint64_t bh, uint64_t bl,
+                                              uint64_t &zh, uint64_t &zl) {
+    __m128i low;
+    __m128i high;
+    clmul_256(to_vector(ah, al), to_vector(bh, bl), low, high);
+    const __m128i result = reduce(low, high);
+    zl = static_cast<uint64_t>(_mm_cvtsi128_si64(result));
+    zh = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_srli_si128(result, 8)));
+  }
+
+  /**
+   * @brief Multiplies using the carry-less multiply instruction
+   */
+  CTL_TARGET_PCLMUL void multiply_carryless() {
+    __m128i low;
+    __m128i high;
+    clmul_256(to_vector(yh_, yl_), to_vector(hh_, hl_), low, high);
+    store_accumulator(reduce(low, high));
+  }
+
+  /**
+   * @brief Absorbs several blocks with one reduction
+   *
+   * Expanding the chain for four blocks gives
+   *   ((((Y + B0) H + B1) H + B2) H + B3) H
+   *     = (Y + B0) H^4 + B1 H^3 + B2 H^2 + B3 H,
+   * so with the powers of H precomputed the four multiplications no longer wait
+   * on each other. Both the shift and the reduction are linear over GF(2), so
+   * they distribute across the sum and only have to be applied once, to the
+   * total. The reduction is the expensive part, which is where the time goes.
+   *
+   * @param blocks aggregate whole blocks
+   */
+  CTL_TARGET_PCLMUL void absorb_aggregated(const uint8_t *blocks) {
+    __m128i low = _mm_setzero_si128();
+    __m128i high = _mm_setzero_si128();
+
+    for (size_t i = 0; i < aggregate; ++i) {
+      const uint8_t *block = blocks + i * block_size;
+      __m128i x = to_vector(ctl::detail::load_be64(block),
+                            ctl::detail::load_be64(block + 8));
+      if (i == 0)
+        x = _mm_xor_si128(x, to_vector(yh_, yl_));
+
+      // The first block takes the highest power, the last takes H itself.
+      const size_t power = aggregate - 1 - i;
+      __m128i l;
+      __m128i h;
+      clmul_256(x, to_vector(power_h_[power], power_l_[power]), l, h);
+      low = _mm_xor_si128(low, l);
+      high = _mm_xor_si128(high, h);
+    }
+
+    store_accumulator(reduce(low, high));
   }
 #endif
 
   /**
-   * @brief Multiplies one bit at a time
+   * @brief Multiplies the accumulator by the subkey, one bit at a time
+   */
+  void multiply_bitwise() {
+    multiply_bits(yh_, yl_, hh_, hl_, yh_, yl_);
+  }
+
+  /**
+   * @brief Multiplies two field elements one bit at a time
    *
-   * This is algorithm 1 of SP 800-38D, taking the bits of the accumulator from
-   * the most significant end and shifting the subkey right one bit at a time.
-   * Both conditionals of the specification are expressed as masks so that the
-   * running time carries no information about either operand.
+   * This is algorithm 1 of SP 800-38D, taking the bits of the first operand
+   * from the most significant end and shifting the second right one bit at a
+   * time. Both conditionals of the specification are expressed as masks so that
+   * the running time carries no information about either operand.
    *
    * A table driven version would be several times faster, but the table would
    * be built from the subkey and indexed by data derived from it, which is a
@@ -262,13 +371,12 @@ private:
    * carry-less path above is both faster than a table and free of that problem,
    * so the choice here is between this and that, never a table.
    */
-  void multiply_bitwise() {
+  static void multiply_bits(uint64_t xh, uint64_t xl, uint64_t yh, uint64_t yl,
+                            uint64_t &zh_out, uint64_t &zl_out) {
     uint64_t zh = 0;
     uint64_t zl = 0;
-    uint64_t vh = hh_;
-    uint64_t vl = hl_;
-    const uint64_t xh = yh_;
-    const uint64_t xl = yl_;
+    uint64_t vh = yh;
+    uint64_t vl = yl;
 
     for (unsigned int i = 0; i < 64; ++i) {
       const uint64_t selected = 0ull - ((xh >> (63 - i)) & 1);
@@ -288,8 +396,8 @@ private:
       vh = (vh >> 1) ^ (reduction & carried);
     }
 
-    yh_ = zh;
-    yl_ = zl;
+    zh_out = zh;
+    zl_out = zl;
   }
 
   /**
@@ -311,6 +419,12 @@ private:
   size_t pending_;
 
 #if defined(CTL_HAS_X86_HW_ACCEL)
+  /**
+   * @brief H, H^2 and so on up to H^aggregate
+   */
+  uint64_t power_h_[aggregate];
+  uint64_t power_l_[aggregate];
+
   /**
    * @brief Whether the carry-less multiply instruction is used, determined once
    * when the subkey is set
