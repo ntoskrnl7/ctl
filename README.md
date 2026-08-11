@@ -61,7 +61,8 @@ Headers carry no extension, in the same style as `ext`.
 ```
 
 Operations that can fail return `ext::void_result`; those that cannot say so by
-returning nothing.
+returning nothing. Every one of those results is `[[nodiscard]]`, so dropping
+the outcome of a decryption does not compile quietly.
 
 ### Buffers carry their own length
 
@@ -137,6 +138,11 @@ mode::xts<cipher::aes<256>> xts(key);   // the key is 64 bytes here
 xts.encrypt(sector_number, sector, out);
 ```
 
+Because the key is twice as long as the block cipher key, filling the slot by
+writing the same key twice produces a buffer of exactly the right length that is
+not a key. K1 encrypts the data and K2 encrypts the tweak, and the mode offers
+nothing once the two coincide, so a key whose halves are equal is refused.
+
 ### GCM, authenticated with associated data
 
 Additional authenticated data stays in the clear but is covered by the tag,
@@ -191,6 +197,12 @@ gcm.encryptor(iv).aad(message).finish(tag);
 The incremental form cannot make the guarantee the single call makes. When a tag
 fails there, the plaintext has already gone out across the caller's own buffers
 and nothing here can reach them, so discarding it becomes the caller's job.
+
+A writer holds on to the `gcm` it came from, so making one from a temporary would
+leave it pointing at a destroyed object. That does not compile; give the `gcm` a
+name. Both forms also refuse to carry one invocation past the roughly 64 GiB the
+specification allows, because the counter is only the last four bytes of the
+block and past that limit the key stream repeats.
 
 ## Hardware acceleration
 

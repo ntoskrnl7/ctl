@@ -127,6 +127,20 @@ void check_ctr(const char *key_hex, const char *cipher_hex) {
 }
 
 /**
+ * @brief Splits the concatenated key representation used by published vectors
+ *
+ * The public XTS interface deliberately takes K1 and K2 separately. Keeping
+ * this adaptation here makes the vector file format a concern of the tests
+ * rather than one every caller has to reproduce.
+ */
+template <class Mode>
+Mode make_xts_from_vector_key(const std::vector<uint8_t> &key) {
+  const size_t component = Mode::component_key_size;
+  return Mode{typename Mode::component_key_view(key.data()),
+              typename Mode::component_key_view(key.data() + component)};
+}
+
+/**
  * @brief Verifies one XTS vector given in the form that supplies the tweak
  * directly
  */
@@ -137,10 +151,10 @@ void check_xts(const char *key_hex, const char *tweak_hex,
   const std::vector<uint8_t> tweak = test::hex(tweak_hex);
   const std::vector<uint8_t> plain = test::hex(plain_hex);
 
-  ASSERT_EQ(key.size(), Mode::key_size);
+  ASSERT_EQ(key.size(), Mode::component_key_size * 2);
   ASSERT_EQ(tweak.size(), Mode::tweak_size);
 
-  Mode mode(key);
+  Mode mode = make_xts_from_vector_key<Mode>(key);
 
   std::vector<uint8_t> encrypted(plain.size());
   ASSERT_TRUE(mode.encrypt(tweak, plain, encrypted));
@@ -382,7 +396,8 @@ TEST(xts, cavp_aes128_sequence_number_form) {
   const std::vector<uint8_t> plain =
       test::hex("46409f7426eb4e3d33480534b80fe6e09fed6583907eb83c84");
 
-  mode::xts<aes128> xts(key);
+  mode::xts<aes128> xts =
+      make_xts_from_vector_key<mode::xts<aes128>>(key);
 
   std::vector<uint8_t> encrypted(plain.size());
   ASSERT_TRUE(xts.encrypt(static_cast<uint64_t>(117), plain, encrypted));
@@ -405,24 +420,50 @@ TEST(xts, rejects_data_unit_shorter_than_one_block) {
   const std::vector<uint8_t> key = test::hex("fb46fb3cab7f67ad5207bc232c50dcbb"
                                             "24dbd1564590855d4cb777b3ba6431c3");
   std::vector<uint8_t> buffer(15);
-  mode::xts<aes128> xts(key);
+  mode::xts<aes128> xts =
+      make_xts_from_vector_key<mode::xts<aes128>>(key);
 
   const auto result = xts.encrypt(static_cast<uint64_t>(0), buffer, buffer);
   ASSERT_FALSE(result);
   EXPECT_EQ(mode::xts<aes128>::data_unit_too_short, result.error().value);
 }
 
-TEST(xts, rejects_key_of_the_wrong_length) {
-  const std::vector<uint8_t> short_key =
-      test::hex("00112233445566778899aabbccddeeff");
-  ASSERT_LT(short_key.size(), mode::xts<aes128>::key_size);
-  EXPECT_THROW(mode::xts<aes128>{ctl::bytes(short_key)},
+TEST(xts, rejects_a_component_key_of_the_wrong_length) {
+  const size_t size = mode::xts<aes128>::component_key_size;
+  const std::vector<uint8_t> data_key(size, 0x11);
+  const std::vector<uint8_t> tweak_key(size, 0x22);
+  const std::vector<uint8_t> short_key(size - 1);
+  const std::vector<uint8_t> long_key(size + 1);
+
+  EXPECT_NO_THROW((void(mode::xts<aes128>{data_key, tweak_key})));
+  EXPECT_THROW((void(mode::xts<aes128>{short_key, tweak_key})),
+               std::invalid_argument);
+  EXPECT_THROW((void(mode::xts<aes128>{long_key, tweak_key})),
+               std::invalid_argument);
+  EXPECT_THROW((void(mode::xts<aes128>{data_key, short_key})),
+               std::invalid_argument);
+  EXPECT_THROW((void(mode::xts<aes128>{data_key, long_key})),
+               std::invalid_argument);
+}
+
+// FIPS 140-3 Implementation Guidance C.I requires an explicit K1 != K2 check
+// regardless of how the two component keys were obtained.
+TEST(xts, rejects_component_keys_with_the_same_value) {
+  const size_t size = mode::xts<aes128>::component_key_size;
+  std::vector<uint8_t> key(size);
+  for (size_t i = 0; i < size; ++i)
+    key[i] = static_cast<uint8_t>(0x40 + i);
+  EXPECT_THROW((void(mode::xts<aes128>{key, key})), std::invalid_argument);
+
+  // All zeroes is the same mistake reached by a different route.
+  const std::vector<uint8_t> zeroes(size);
+  EXPECT_THROW((void(mode::xts<aes128>{zeroes, zeroes})),
                std::invalid_argument);
 
-  // A key that is too long used to be accepted and silently truncated, which
-  // is how a key meant for a different cipher ends up in use unnoticed.
-  const std::vector<uint8_t> long_key(mode::xts<aes128>::key_size + 1);
-  EXPECT_THROW(mode::xts<aes128>{ctl::bytes(long_key)}, std::invalid_argument);
+  // One byte apart is enough to be two keys.
+  std::vector<uint8_t> other = key;
+  other.back() ^= 0x01;
+  EXPECT_NO_THROW((void(mode::xts<aes128>{key, other})));
 }
 
 // Data units of many lengths, including several that are not a multiple of the
@@ -431,7 +472,8 @@ TEST(xts, rejects_key_of_the_wrong_length) {
 TEST(xts, round_trips_at_every_length) {
   const std::vector<uint8_t> key = test::hex("fb46fb3cab7f67ad5207bc232c50dcbb"
                                             "24dbd1564590855d4cb777b3ba6431c3");
-  mode::xts<aes128> xts(key);
+  mode::xts<aes128> xts =
+      make_xts_from_vector_key<mode::xts<aes128>>(key);
 
   std::vector<uint8_t> plain(200);
   for (size_t i = 0; i < plain.size(); ++i)
@@ -478,7 +520,8 @@ TEST(lengths, a_nonce_of_the_wrong_length_is_refused) {
 
   mode::cbc<aes128> cbc(key);
   const std::vector<uint8_t> short_iv(mode::cbc<aes128>::iv_size - 1);
-  EXPECT_THROW(cbc.encrypt(short_iv, plain, output), std::invalid_argument);
+  EXPECT_THROW((void)cbc.encrypt(short_iv, plain, output),
+               std::invalid_argument);
 
   mode::ctr<aes128> ctr(key);
   const std::vector<uint8_t> long_nonce(mode::ctr<aes128>::nonce_size + 1);
@@ -493,19 +536,20 @@ TEST(lengths, an_output_buffer_that_is_too_small_is_refused) {
   std::vector<uint8_t> too_small(48);
 
   mode::ecb<aes128> ecb(key);
-  EXPECT_THROW(ecb.encrypt(plain, too_small), std::invalid_argument);
+  EXPECT_THROW((void)ecb.encrypt(plain, too_small), std::invalid_argument);
 
   mode::cbc<aes128>::iv_t iv = {0};
   mode::cbc<aes128> cbc(key);
-  EXPECT_THROW(cbc.encrypt(iv, plain, too_small), std::invalid_argument);
+  EXPECT_THROW((void)cbc.encrypt(iv, plain, too_small), std::invalid_argument);
 
   mode::ctr<aes128>::nonce_t nonce = {0};
   mode::ctr<aes128> ctr(key);
   EXPECT_THROW(ctr.crypt(nonce, 0, plain, too_small), std::invalid_argument);
 
-  const std::vector<uint8_t> xts_key(mode::xts<aes128>::key_size);
-  mode::xts<aes128> xts(xts_key);
-  EXPECT_THROW(xts.encrypt(static_cast<uint64_t>(0), plain, too_small),
+  mode::xts<aes128>::component_key_t data_key = {0x11};
+  mode::xts<aes128>::component_key_t tweak_key = {0x22};
+  mode::xts<aes128> xts(data_key, tweak_key);
+  EXPECT_THROW((void)xts.encrypt(static_cast<uint64_t>(0), plain, too_small),
                std::invalid_argument);
 }
 
@@ -570,7 +614,8 @@ TEST(xts, composes_with_aria_roundtrip_only) {
   const std::vector<uint8_t> plain =
       test::hex("46409f7426eb4e3d33480534b80fe6e09fed6583907eb83c84");
 
-  mode::xts<aria128> xts(key);
+  mode::xts<aria128> xts =
+      make_xts_from_vector_key<mode::xts<aria128>>(key);
 
   std::vector<uint8_t> encrypted(plain.size());
   ASSERT_TRUE(xts.encrypt(static_cast<uint64_t>(7), plain, encrypted));

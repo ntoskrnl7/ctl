@@ -8,8 +8,8 @@
  * ciphertext at a different position, and ciphertext stealing preserves the
  * length even when it is not a multiple of the block size.
  *
- * The key is two block cipher keys concatenated. The first half, K1, encrypts
- * the data and the second half, K2, encrypts the tweak.
+ * Two block cipher keys are supplied separately. K1 encrypts the data and K2
+ * encrypts the tweak. They must be generated or established independently.
  *
  * Two places are easy to get wrong and are called out explicitly.
  *
@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 
 #include <ext/result>
 
@@ -67,14 +68,9 @@ public:
                 "(IEEE Std 1619)");
 
   /**
-   * @brief Key size of one block cipher in bytes
+   * @brief Size of each XTS component key in bytes
    */
-  static constexpr size_t cipher_key_size = cipher_type::key_size;
-
-  /**
-   * @brief XTS key size in bytes, that is K1 and K2 concatenated
-   */
-  static constexpr size_t key_size = cipher_key_size * 2;
+  static constexpr size_t component_key_size = cipher_type::key_size;
 
   /**
    * @brief Tweak size in bytes
@@ -99,9 +95,14 @@ public:
   typedef uint8_t tweak_t[tweak_size];
 
   /**
-   * @brief A key handed over for reading, K1 followed by K2
+   * @brief Storage for one XTS component key
    */
-  typedef ctl::fixed_bytes<key_size> key_view;
+  typedef uint8_t component_key_t[component_key_size];
+
+  /**
+   * @brief One XTS component key handed over for reading
+   */
+  typedef ctl::fixed_bytes<component_key_size> component_key_view;
 
   /**
    * @brief A tweak handed over for reading
@@ -129,19 +130,33 @@ public:
   };
 
   /**
-   * @brief Initializes with a key
+   * @brief Initializes with independently generated component keys
    *
-   * The XTS key is two block cipher keys concatenated, and its length is part
-   * of key_view, so a key of the wrong length no longer reaches the split
-   * below.
+   * The length of each key is part of component_key_view, so neither can be
+   * silently truncated or read past its end. FIPS 140-3 Implementation
+   * Guidance C.I requires K1 and K2 to be generated or established
+   * independently and requires an explicit check that their values differ.
+   * The check here enforces the latter; how the keys were produced remains the
+   * caller's responsibility.
    *
-   * @param key K1 followed by K2, key_size bytes
-   * @exception std::invalid_argument if the key is not key_size bytes
+   * @param data_key K1, which encrypts the data
+   * @param tweak_key K2, which encrypts the tweak
+   * @exception std::invalid_argument if either key is not component_key_size
+   * bytes, or if the two keys have the same value
    */
-  explicit xts(key_view key)
-      : data_cipher_(typename cipher_type::key_view(key.data())),
-        tweak_cipher_(
-            typename cipher_type::key_view(key.data() + cipher_key_size)) {}
+  explicit xts(component_key_view data_key, component_key_view tweak_key)
+      : data_cipher_(typename cipher_type::key_view(data_key.data())),
+        tweak_cipher_(typename cipher_type::key_view(tweak_key.data())) {
+    // Checked after the two ciphers are built rather than before, so that
+    // throwing here still runs their destructors and the round keys already
+    // derived from the rejected component keys are erased.
+    if (ctl::detail::equal_constant_time(data_key.data(), tweak_key.data(),
+                                        component_key_size))
+      throw std::invalid_argument(
+          "ctl::symmetric::mode::xts : K1 and K2 have the same value. The "
+          "component keys have to be generated or established independently "
+          "and XTS explicitly forbids equal values.");
+  }
 
   /**
    * @brief Encrypts a data unit
@@ -152,8 +167,9 @@ public:
    * be the same buffer
    * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> encrypt(tweak_view tweak, ctl::bytes input,
-                                        ctl::writable_bytes output) const {
+  [[nodiscard]] ext::void_result<error_status>
+  encrypt(tweak_view tweak, ctl::bytes input,
+          ctl::writable_bytes output) const {
     error_status status;
     const size_t size = input.size();
     if (size_error(size, status))
@@ -210,8 +226,9 @@ public:
    * be the same buffer
    * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> decrypt(tweak_view tweak, ctl::bytes input,
-                                        ctl::writable_bytes output) const {
+  [[nodiscard]] ext::void_result<error_status>
+  decrypt(tweak_view tweak, ctl::bytes input,
+          ctl::writable_bytes output) const {
     error_status status;
     const size_t size = input.size();
     if (size_error(size, status))
@@ -265,9 +282,9 @@ public:
    * @param output where the ciphertext goes, at least as long as input and may
    * be the same buffer
    */
-  ext::void_result<error_status> encrypt(sequence_number_t sequence_number,
-                                        ctl::bytes input,
-                                        ctl::writable_bytes output) const {
+  [[nodiscard]] ext::void_result<error_status>
+  encrypt(sequence_number_t sequence_number, ctl::bytes input,
+          ctl::writable_bytes output) const {
     tweak_t tweak;
     make_tweak(sequence_number, tweak);
     return encrypt(tweak, input, output);
@@ -281,9 +298,9 @@ public:
    * @param output where the plaintext goes, at least as long as input and may
    * be the same buffer
    */
-  ext::void_result<error_status> decrypt(sequence_number_t sequence_number,
-                                        ctl::bytes input,
-                                        ctl::writable_bytes output) const {
+  [[nodiscard]] ext::void_result<error_status>
+  decrypt(sequence_number_t sequence_number, ctl::bytes input,
+          ctl::writable_bytes output) const {
     tweak_t tweak;
     make_tweak(sequence_number, tweak);
     return decrypt(tweak, input, output);

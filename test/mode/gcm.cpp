@@ -475,14 +475,14 @@ TEST(gcm, rejects_a_tag_buffer_of_the_wrong_length) {
   mode::gcm<aes128> gcm(key);
 
   std::vector<uint8_t> short_tag(mode::gcm<aes128>::tag_size - 1);
-  EXPECT_THROW(gcm.encrypt(iv, {}, {plain}, out, short_tag),
+  EXPECT_THROW((void)gcm.encrypt(iv, {}, {plain}, out, short_tag),
                std::invalid_argument);
 
   // A tag sized for the full 128 bits handed to a mode configured for 96 is
   // the mistake a separate length argument could never catch.
   mode::gcm<aes128, 96> truncated(key);
   std::vector<uint8_t> wide_tag(16);
-  EXPECT_THROW(truncated.encrypt(iv, {}, {plain}, out, wide_tag),
+  EXPECT_THROW((void)truncated.encrypt(iv, {}, {plain}, out, wide_tag),
                std::invalid_argument);
 }
 
@@ -497,7 +497,7 @@ TEST(gcm, rejects_an_output_buffer_that_is_too_small) {
 
   std::vector<uint8_t> too_small(plain.size() - 1);
   std::vector<uint8_t> tag(16);
-  EXPECT_THROW(gcm.encrypt(iv, {}, {plain}, too_small, tag),
+  EXPECT_THROW((void)gcm.encrypt(iv, {}, {plain}, too_small, tag),
                std::invalid_argument);
 
   // The same holds for the incremental interface, where the output of each run
@@ -507,3 +507,58 @@ TEST(gcm, rejects_an_output_buffer_that_is_too_small) {
   EXPECT_THROW(writer.write(ctl::bytes(plain).first(8), run),
                std::invalid_argument);
 }
+
+// The counter of GCM is only the last four bytes of the block, so an invocation
+// that runs past the limit in the specification repeats its key stream. The
+// single call interface sees the whole length up front and reports this through
+// its result; the incremental interface only learns the length as the data
+// arrives, and used to accumulate without a limit at all.
+//
+// The limit is about 64 GiB, so this describes a run of that length rather than
+// allocating one. The guard runs before anything is read, which is what makes
+// that possible.
+TEST(gcm, refuses_to_run_past_what_one_key_stream_covers) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+
+  mode::gcm<aes128> gcm(key);
+
+  if constexpr (sizeof(size_t) >= 8) {
+    const size_t past =
+        static_cast<size_t>(mode::gcm<aes128>::max_data_size) + 1;
+    const ctl::bytes nothing(nullptr, past);
+    const ctl::writable_bytes nowhere(nullptr, past);
+
+    auto writer = gcm.encryptor(iv).data();
+    EXPECT_THROW(writer.write(nothing, nowhere), std::length_error);
+
+    auto reader = gcm.decryptor(iv).data();
+    EXPECT_THROW(reader.write(nothing, nowhere), std::length_error);
+
+    // The single call interface reports the same thing through its result.
+    std::vector<uint8_t> tag(16);
+    const auto result = gcm.encrypt(iv, {}, {nothing}, nowhere, tag);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(mode::gcm<aes128>::invalid_input_length, result.error().value);
+  }
+}
+
+// A writer holds the cipher and the prepared hash of the gcm it came from, so
+// making one from a temporary would leave it pointing at a destroyed object.
+// That is refused at compile time rather than documented.
+namespace {
+
+template <class T, class = void>
+struct encryptor_on_temporary : std::false_type {};
+
+template <class T>
+struct encryptor_on_temporary<
+    T, decltype(void(std::declval<T>().encryptor(std::declval<ctl::bytes>())))>
+    : std::true_type {};
+
+} // namespace
+
+static_assert(encryptor_on_temporary<mode::gcm<aes128> &>::value,
+              "a named gcm has to hand out a writer");
+static_assert(!encryptor_on_temporary<mode::gcm<aes128>>::value,
+              "a temporary gcm must not, since the writer outlives it");

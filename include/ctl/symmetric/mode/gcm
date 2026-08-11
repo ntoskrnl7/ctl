@@ -182,10 +182,9 @@ public:
    * a wire format usually wants
    * @exception std::invalid_argument if output cannot hold the ciphertext
    */
-  ext::void_result<error_status> encrypt(ctl::bytes iv, pieces aad,
-                                        pieces plain,
-                                        ctl::writable_bytes output,
-                                        writable_tag_view tag) const {
+  [[nodiscard]] ext::void_result<error_status>
+  encrypt(ctl::bytes iv, pieces aad, pieces plain, ctl::writable_bytes output,
+          writable_tag_view tag) const {
     if (iv.empty())
       return ext::err(invalid_iv_length);
     const uint64_t data_size = total(plain);
@@ -226,10 +225,9 @@ public:
    * @param tag the tag to verify against, tag_size bytes
    * @exception std::invalid_argument if output cannot hold the plaintext
    */
-  ext::void_result<error_status> decrypt(ctl::bytes iv, pieces aad,
-                                        pieces cipher,
-                                        ctl::writable_bytes output,
-                                        tag_view tag) const {
+  [[nodiscard]] ext::void_result<error_status>
+  decrypt(ctl::bytes iv, pieces aad, pieces cipher, ctl::writable_bytes output,
+          tag_view tag) const {
     if (iv.empty())
       return ext::err(invalid_iv_length);
     const uint64_t total_size = total(cipher);
@@ -301,6 +299,7 @@ private:
      */
     void encrypt(const uint8_t *input, size_t size, uint8_t *output) {
       close_aad();
+      require_within_limit(size);
       apply_keystream(input, size, output);
       hash_.update(output, size);
       data_bits_ += static_cast<uint64_t>(size) * 8;
@@ -314,6 +313,7 @@ private:
      */
     void decrypt(const uint8_t *input, size_t size, uint8_t *output) {
       close_aad();
+      require_within_limit(size);
       hash_.update(input, size);
       data_bits_ += static_cast<uint64_t>(size) * 8;
       apply_keystream(input, size, output);
@@ -339,6 +339,36 @@ private:
     }
 
   private:
+    /**
+     * @brief Refuses to carry an invocation past what one key stream covers
+     *
+     * The counter of GCM is only the last four bytes of the block, so after
+     * 2^32 blocks it wraps and the key stream repeats from the beginning. The
+     * limit in SP 800-38D stops short of that. Reusing key stream within one
+     * invocation exposes the exclusive or of two plaintexts, so this cannot be
+     * left to the caller to remember.
+     *
+     * The single call interface knows the whole length in advance and reports
+     * this through its result. Nothing accumulates across calls there, so this
+     * is what covers the incremental interface, where the length only becomes
+     * known as the data arrives and a method that returns the builder for
+     * chaining has no result to report through.
+     *
+     * @param size length about to be added
+     * @exception std::length_error if the invocation would pass the limit
+     */
+    void require_within_limit(size_t size) const {
+      // data_bits_ never passes the limit, since this runs before every
+      // addition, so the subtraction cannot wrap.
+      const uint64_t remaining = max_data_size - data_bits_ / 8;
+      if (static_cast<uint64_t>(size) > remaining)
+        throw std::length_error(
+            "ctl::symmetric::mode::gcm : one invocation may cover at most " +
+            std::to_string(max_data_size) +
+            " bytes, and this would pass that. Start a new invocation with a "
+            "fresh initialization vector.");
+    }
+
     /**
      * @brief Closes the AAD, padding it to a block boundary
      *
@@ -569,7 +599,7 @@ public:
      * @return success only if the data is authentic; on failure the caller must
      * discard every byte of plaintext it received
      */
-    ext::void_result<error_status> finish(tag_view tag) {
+    [[nodiscard]] ext::void_result<error_status> finish(tag_view tag) {
       return verify(state_, tag);
     }
 
@@ -604,7 +634,7 @@ public:
     /**
      * @brief Verifies the tag with no data at all, which is GMAC
      */
-    ext::void_result<error_status> finish(tag_view tag) {
+    [[nodiscard]] ext::void_result<error_status> finish(tag_view tag) {
       return verify(state_, tag);
     }
 
@@ -621,12 +651,23 @@ public:
    * @param iv initialization vector, any non zero length; 12 bytes recommended
    * @exception std::invalid_argument if iv is empty
    */
-  encrypt_aad encryptor(ctl::bytes iv) const {
+  encrypt_aad encryptor(ctl::bytes iv) const & {
     if (iv.empty())
       throw std::invalid_argument("ctl::symmetric::mode::gcm : "
                                   "the initialization vector is empty.");
     return encrypt_aad(cipher_, hash_, iv);
   }
+
+  /**
+   * @brief Not available on a temporary
+   *
+   * What comes back holds the cipher and the prepared hash of the gcm it came
+   * from, and it is meant to be fed over a stretch of the program rather than
+   * used up in one expression. Made from a temporary it would be left pointing
+   * at a destroyed object, so the case is refused instead of documented. Give
+   * the gcm a name.
+   */
+  encrypt_aad encryptor(ctl::bytes iv) const && = delete;
 
   /**
    * @brief Begins a decryption that is fed over several calls
@@ -636,12 +677,17 @@ public:
    * @param iv initialization vector, the same one used to encrypt
    * @exception std::invalid_argument if iv is empty
    */
-  decrypt_aad decryptor(ctl::bytes iv) const {
+  decrypt_aad decryptor(ctl::bytes iv) const & {
     if (iv.empty())
       throw std::invalid_argument("ctl::symmetric::mode::gcm : "
                                   "the initialization vector is empty.");
     return decrypt_aad(cipher_, hash_, iv);
   }
+
+  /**
+   * @brief Not available on a temporary, for the reason encryptor gives
+   */
+  decrypt_aad decryptor(ctl::bytes iv) const && = delete;
 
 private:
   /**

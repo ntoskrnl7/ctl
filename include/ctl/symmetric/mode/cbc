@@ -99,8 +99,8 @@ public:
    * be the same buffer
    * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> encrypt(iv_view iv, ctl::bytes input,
-                                        ctl::writable_bytes output) const {
+  [[nodiscard]] ext::void_result<error_status>
+  encrypt(iv_view iv, ctl::bytes input, ctl::writable_bytes output) const {
     if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
     ctl::detail::require_capacity("ctl::symmetric::mode::cbc::encrypt",
@@ -129,8 +129,8 @@ public:
    * be the same buffer
    * @exception std::invalid_argument if output is shorter than input
    */
-  ext::void_result<error_status> decrypt(iv_view iv, ctl::bytes input,
-                                        ctl::writable_bytes output) const {
+  [[nodiscard]] ext::void_result<error_status>
+  decrypt(iv_view iv, ctl::bytes input, ctl::writable_bytes output) const {
     if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
     ctl::detail::require_capacity("ctl::symmetric::mode::cbc::decrypt",
