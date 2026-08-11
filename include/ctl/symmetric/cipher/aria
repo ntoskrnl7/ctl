@@ -522,7 +522,7 @@ private:
   /**
    * @brief Type 1 substitution layer SL1 (section 2.4.2 of RFC 5794)
    */
-  static void substitute1(const uint8_t *input, uint8_t *output) {
+  static CTL_FORCEINLINE void substitute1(const uint8_t *input, uint8_t *output) {
     for (size_t i = 0; i < 16; i += 4) {
       output[i + 0] = ctl::detail::aes_sbox.forward[input[i + 0]];
       output[i + 1] = aria_detail::sb2.forward[input[i + 1]];
@@ -536,7 +536,7 @@ private:
    *
    * The inverse of SL1.
    */
-  static void substitute2(const uint8_t *input, uint8_t *output) {
+  static CTL_FORCEINLINE void substitute2(const uint8_t *input, uint8_t *output) {
     for (size_t i = 0; i < 16; i += 4) {
       output[i + 0] = ctl::detail::aes_sbox.inverse[input[i + 0]];
       output[i + 1] = aria_detail::sb2.inverse[input[i + 1]];
@@ -553,7 +553,7 @@ private:
    * @param x input of 16 bytes
    * @param y output of 16 bytes, may be the same as x
    */
-  static void diffuse(const uint8_t *x, uint8_t *y) {
+  static CTL_FORCEINLINE void diffuse(const uint8_t *x, uint8_t *y) {
     // Each equation in the specification exclusive ors seven inputs, so
     // carrying them over directly costs 96 exclusive ors. Grouping the sixteen
     // outputs into fours, however, shows that each group shares four inputs.
@@ -593,7 +593,7 @@ private:
    * @brief Odd round function FO(D,RK) = A(SL1(D ^ RK)) (section 2.4.1 of
    * RFC 5794)
    */
-  static void odd_round(const uint8_t *data, const uint8_t *round_key,
+  static CTL_FORCEINLINE void odd_round(const uint8_t *data, const uint8_t *round_key,
                         uint8_t *output) {
     // The substitution reads and writes the same index, so it runs in place and
     // the round needs one scratch block rather than two. This was measured and
@@ -609,7 +609,7 @@ private:
    * @brief Even round function FE(D,RK) = A(SL2(D ^ RK)) (section 2.4.1 of
    * RFC 5794)
    */
-  static void even_round(const uint8_t *data, const uint8_t *round_key,
+  static CTL_FORCEINLINE void even_round(const uint8_t *data, const uint8_t *round_key,
                          uint8_t *output) {
     uint8_t t[16];
     ctl::detail::xor_block<16>(data, round_key, t);
