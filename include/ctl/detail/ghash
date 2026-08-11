@@ -27,8 +27,18 @@
 #include <cstdint>
 #include <cstring>
 
+#include <ctl/detail/config>
+#include <ctl/detail/cpu>
 #include <ctl/detail/endian>
 #include <ctl/detail/memory>
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <immintrin.h>
+#endif
+#endif
 
 namespace ctl {
 namespace detail {
@@ -55,6 +65,9 @@ public:
 
   ghash() : hh_(0), hl_(0), yh_(0), yl_(0), pending_(0) {
     memset(buffer_, 0, sizeof(buffer_));
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    hardware_ = false;
+#endif
   }
 
   ~ghash() {
@@ -74,6 +87,9 @@ public:
   void set_key(const uint8_t *h) {
     hh_ = ctl::detail::load_be64(h);
     hl_ = ctl::detail::load_be64(h + 8);
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    hardware_ = ctl::detail::cpu::has_carryless_multiply();
+#endif
     reset();
   }
 
@@ -155,13 +171,98 @@ private:
 
   /**
    * @brief Multiplies the accumulator by the subkey in GF(2^128)
+   */
+  void multiply() {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (hardware_) {
+      multiply_carryless();
+      return;
+    }
+#endif
+    multiply_bitwise();
+  }
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  /**
+   * @brief Multiplies using the carry-less multiply instruction
+   *
+   * Two things make this work. First, the value that a big endian load produces
+   * is already the representation this needs: GCM numbers bits from the most
+   * significant end, so placing the first eight bytes in the high lane and the
+   * last eight in the low lane puts the coefficient of x^0 at bit 127, which is
+   * the reversed form the instruction wants.
+   *
+   * Second, multiplying two values held that way yields a product that sits one
+   * bit higher than it should, because reversing a 128 bit value spreads a
+   * 255 bit product across 256 bits. That is what the shift by one below
+   * corrects, and it is the step that is easy to leave out; leaving it out
+   * produces tags that are wrong every time rather than occasionally, so the
+   * published vectors catch it immediately.
+   *
+   * The reduction that follows folds the top half back in using the reversed
+   * form of the field polynomial.
+   */
+  CTL_TARGET_PCLMUL void multiply_carryless() {
+    const __m128i x = _mm_set_epi64x(static_cast<long long>(yh_),
+                                     static_cast<long long>(yl_));
+    const __m128i h = _mm_set_epi64x(static_cast<long long>(hh_),
+                                     static_cast<long long>(hl_));
+
+    // Schoolbook 128 by 128 multiply into a 256 bit product held as [high:low].
+    __m128i low = _mm_clmulepi64_si128(x, h, 0x00);
+    __m128i mid = _mm_clmulepi64_si128(x, h, 0x10);
+    __m128i mid2 = _mm_clmulepi64_si128(x, h, 0x01);
+    __m128i high = _mm_clmulepi64_si128(x, h, 0x11);
+
+    mid = _mm_xor_si128(mid, mid2);
+    low = _mm_xor_si128(low, _mm_slli_si128(mid, 8));
+    high = _mm_xor_si128(high, _mm_srli_si128(mid, 8));
+
+    // Shift the whole 256 bit product left by one bit.
+    __m128i carry_low = _mm_srli_epi32(low, 31);
+    __m128i carry_high = _mm_srli_epi32(high, 31);
+    low = _mm_slli_epi32(low, 1);
+    high = _mm_slli_epi32(high, 1);
+
+    const __m128i spill = _mm_srli_si128(carry_low, 12);
+    low = _mm_or_si128(low, _mm_slli_si128(carry_low, 4));
+    high = _mm_or_si128(high, _mm_slli_si128(carry_high, 4));
+    high = _mm_or_si128(high, spill);
+
+    // Reduce modulo the reversed field polynomial.
+    __m128i fold = _mm_xor_si128(
+        _mm_xor_si128(_mm_slli_epi32(low, 31), _mm_slli_epi32(low, 30)),
+        _mm_slli_epi32(low, 25));
+    const __m128i carried = _mm_srli_si128(fold, 4);
+    low = _mm_xor_si128(low, _mm_slli_si128(fold, 12));
+
+    __m128i tail = _mm_xor_si128(
+        _mm_xor_si128(_mm_srli_epi32(low, 1), _mm_srli_epi32(low, 2)),
+        _mm_srli_epi32(low, 7));
+    tail = _mm_xor_si128(tail, carried);
+    low = _mm_xor_si128(low, tail);
+    const __m128i result = _mm_xor_si128(high, low);
+
+    yl_ = static_cast<uint64_t>(_mm_cvtsi128_si64(result));
+    yh_ = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_srli_si128(result, 8)));
+  }
+#endif
+
+  /**
+   * @brief Multiplies one bit at a time
    *
    * This is algorithm 1 of SP 800-38D, taking the bits of the accumulator from
    * the most significant end and shifting the subkey right one bit at a time.
    * Both conditionals of the specification are expressed as masks so that the
    * running time carries no information about either operand.
+   *
+   * A table driven version would be several times faster, but the table would
+   * be built from the subkey and indexed by data derived from it, which is a
+   * cache timing side channel on the very value that must stay secret. The
+   * carry-less path above is both faster than a table and free of that problem,
+   * so the choice here is between this and that, never a table.
    */
-  void multiply() {
+  void multiply_bitwise() {
     uint64_t zh = 0;
     uint64_t zl = 0;
     uint64_t vh = hh_;
@@ -208,6 +309,14 @@ private:
    */
   uint8_t buffer_[block_size];
   size_t pending_;
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  /**
+   * @brief Whether the carry-less multiply instruction is used, determined once
+   * when the subkey is set
+   */
+  bool hardware_;
+#endif
 };
 
 } // namespace detail
