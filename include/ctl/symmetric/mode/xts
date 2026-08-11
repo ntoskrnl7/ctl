@@ -175,7 +175,7 @@ public:
     if (size_error(size, status))
       return ext::err(status);
     ctl::detail::require_capacity("ctl::symmetric::mode::xts::encrypt",
-                                  output.size(), size);
+                                  "output", output.size(), size);
 
     uint8_t encrypted_tweak[block_size];
     tweak_cipher_.encrypt_block(tweak, encrypted_tweak);
@@ -188,7 +188,7 @@ public:
     const size_t whole = remainder == 0 ? size / block_size
                                         : size / block_size - 1;
 
-    transform_blocks<true>(input.data(), whole, t, output.data());
+    transform_blocks<true>(input, whole, t, output);
 
     if (remainder != 0) {
       const size_t last = whole * block_size;
@@ -234,7 +234,7 @@ public:
     if (size_error(size, status))
       return ext::err(status);
     ctl::detail::require_capacity("ctl::symmetric::mode::xts::decrypt",
-                                  output.size(), size);
+                                  "output", output.size(), size);
 
     uint8_t encrypted_tweak[block_size];
     tweak_cipher_.encrypt_block(tweak, encrypted_tweak);
@@ -245,7 +245,7 @@ public:
     const size_t whole = remainder == 0 ? size / block_size
                                         : size / block_size - 1;
 
-    transform_blocks<false>(input.data(), whole, t, output.data());
+    transform_blocks<false>(input, whole, t, output);
 
     if (remainder != 0) {
       const size_t last = whole * block_size;
@@ -417,14 +417,15 @@ private:
    * become the bottleneck.
    *
    * @tparam _Encrypt true to encrypt, false to decrypt
-   * @param input input
-   * @param count number of blocks to process
+   * @param input the data unit, of which the leading count blocks are processed
+   * @param count number of blocks to process, which is fewer than the data unit
+   * holds when ciphertext stealing handles the end
    * @param t the current tweak, advanced by count steps on return
-   * @param output output, may be the same as input
+   * @param output output, may be the same buffer as input
    */
   template <bool _Encrypt>
-  void transform_blocks(const uint8_t *input, size_t count, tweak_state &t,
-                        uint8_t *output) const {
+  void transform_blocks(ctl::bytes input, size_t count, tweak_state &t,
+                        ctl::writable_bytes output) const {
     uint8_t tweaks[batch_blocks * block_size];
 
     size_t j = 0;
@@ -441,20 +442,22 @@ private:
       // the masked values in registers. Doing it separately would mean writing
       // the masked input to a buffer, letting the cipher read and write that
       // buffer, and reading it back to unmask.
+      const size_t at = j * block_size;
       if constexpr (_Encrypt)
-        data_cipher_.encrypt_blocks_masked(input + j * block_size, tweaks,
-                                          output + j * block_size,
-                                          batch_blocks);
+        data_cipher_.encrypt_blocks_masked(input.subview(at, sizeof(tweaks)),
+                                          tweaks,
+                                          output.subview(at, sizeof(tweaks)));
       else
-        data_cipher_.decrypt_blocks_masked(input + j * block_size, tweaks,
-                                          output + j * block_size,
-                                          batch_blocks);
+        data_cipher_.decrypt_blocks_masked(input.subview(at, sizeof(tweaks)),
+                                          tweaks,
+                                          output.subview(at, sizeof(tweaks)));
       j += batch_blocks;
     }
 
     // Blocks left over that do not fill a batch
     for (; j < count; ++j) {
-      transform<_Encrypt>(input + j * block_size, t, output + j * block_size);
+      transform<_Encrypt>(input.data() + j * block_size, t,
+                          output.data() + j * block_size);
       advance(t);
     }
 

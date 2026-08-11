@@ -231,19 +231,23 @@ AES-128 over a 4096 byte buffer, Intel Core Ultra 7 265K, MSVC `/O2`.
 | Mode | Software | Accelerated |
 | --- | --- | --- |
 | ECB | 543 MB/s | 11,400 MB/s |
-| XTS | 472 | 6,270 |
-| CTR | 470 | 4,510 |
-| CBC, which chains and cannot be parallelized | 426 | 1,590 |
-| GCM | 103 | 936 |
+| XTS | 472 | 6,200 |
+| CTR | 470 | 4,400 |
+| CBC, which chains and cannot be parallelized | 426 | 1,600 |
+| GCM | 103 | 948 |
 
 XTS over 512 byte sectors reaches 4,500 MB/s. ARIA runs at 132 MB/s in software
-and 291 MB/s with the vector path, and ARIA-XTS at 220 MB/s. No operation
+and 291 MB/s with the vector path, and ARIA-XTS at 230 MB/s. No operation
 performs a heap allocation.
 
 Describing a buffer by a view rather than by a pointer and a length costs
-nothing measurable. Running the same benchmark against the interface it
-replaced, interleaved so that neither sees a different thermal state, puts every
-mode within the ±2% the runs vary by on their own.
+nothing measurable in most places. Running the same benchmark against the
+interface it replaced, interleaved so that neither sees a different thermal
+state, puts every mode within the couple of percent the runs vary by on their
+own, except CTR. CTR crosses into the cipher once per batch rather than once per
+call, and there the three buffers describing themselves rather than sharing one
+block count measures two to three percent slower. That number is real and not
+noise, and it buys the only thing that made those three buffers checkable.
 
 ## Status and limits
 

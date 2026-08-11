@@ -34,6 +34,8 @@
 #include <type_traits>
 #include <utility>
 
+#include <ctl/detail/config>
+
 namespace ctl {
 
 namespace detail {
@@ -120,28 +122,41 @@ struct static_size<_Container, std::void_t<decltype(std::tuple_size<
 /**
  * @brief Reports a buffer whose length is not the one the argument requires
  */
-[[noreturn]] inline void throw_length_mismatch(size_t expected, size_t actual) {
+[[noreturn]] CTL_NOINLINE inline void throw_length_mismatch(size_t expected,
+                                                             size_t actual) {
   throw std::invalid_argument(
       "ctl : this argument requires exactly " + std::to_string(expected) +
       " bytes, but a buffer of " + std::to_string(actual) + " was given.");
 }
 
 /**
- * @brief Reports an output buffer that is too small to hold the result
+ * @brief Reports a buffer that is too small for what a call will do with it
  *
- * The length of an output buffer is decided entirely by the calling code and
- * never by the data, so a buffer that is too small is always a mistake in that
- * code rather than a condition to recover from. It is therefore reported the
- * same way a wrong key length is, rather than through the result type the modes
- * use for what the data can legitimately be.
+ * The length of a buffer a call writes into, or of one it has to read in step
+ * with another, is decided entirely by the calling code and never by the data,
+ * so one that is too small is always a mistake in that code rather than a
+ * condition to recover from. It is therefore reported the same way a wrong key
+ * length is, rather than through the result type the modes use for what the
+ * data can legitimately be.
+ *
+ * @param where the operation, for the message
+ * @param what which buffer, for the message
+ * @param available how long it is
+ * @param needed how long it has to be
  */
-inline void require_capacity(const char *where, size_t available,
-                             size_t needed) {
+[[noreturn]] CTL_NOINLINE inline void
+throw_short_buffer(const char *where, const char *what, size_t available,
+                   size_t needed) {
+  throw std::invalid_argument(
+      std::string(where) + " : the " + what + " buffer holds " +
+      std::to_string(available) + " bytes, but " + std::to_string(needed) +
+      " are needed.");
+}
+
+inline void require_capacity(const char *where, const char *what,
+                             size_t available, size_t needed) {
   if (available < needed)
-    throw std::invalid_argument(
-        std::string(where) + " : the output buffer holds " +
-        std::to_string(available) + " bytes, but " + std::to_string(needed) +
-        " are needed.");
+    throw_short_buffer(where, what, available, needed);
 }
 
 } // namespace detail
@@ -462,5 +477,56 @@ template <size_t _Size>
 inline fixed_bytes<_Size>::fixed_bytes(
     writable_fixed_bytes<_Size> view) noexcept
     : data_(view.data()) {}
+
+namespace detail {
+
+/**
+ * @brief Works out how many blocks a batch call covers, and checks that every
+ * buffer it was handed covers them
+ *
+ * A call that transforms whole blocks used to be told how many to do, and one
+ * number described every buffer involved. The number is not needed: it follows
+ * from the length of the input. Deriving it here is what makes the other
+ * buffers checkable at all, since there is now something to check them against.
+ *
+ * @param where the operation, for the message
+ * @param input the buffer whose length decides how much work there is
+ * @param output where the result goes
+ * @param block_size the block size of the cipher
+ * @return the number of blocks
+ * @exception std::invalid_argument if the input is not a whole number of blocks,
+ * or if the output cannot cover it
+ */
+[[noreturn]] CTL_NOINLINE inline void
+throw_partial_block(const char *where, size_t size, size_t block_size) {
+  throw std::invalid_argument(
+      std::string(where) + " : the input is " + std::to_string(size) +
+      " bytes, which is not a whole number of " + std::to_string(block_size) +
+      " byte blocks.");
+}
+
+inline size_t require_whole_blocks(const char *where, bytes input,
+                                   writable_bytes output, size_t block_size) {
+  if (input.size() % block_size != 0)
+    throw_partial_block(where, input.size(), block_size);
+  require_capacity(where, "output", output.size(), input.size());
+  return input.size() / block_size;
+}
+
+/**
+ * @brief The same, for a call that reads a second buffer in step with the input
+ *
+ * The per block masks of a tweakable mode and the data a counter based mode
+ * combines its key stream with are both this. Neither carried a length before,
+ * only a comment saying it had to be as long as the input.
+ */
+inline size_t require_whole_blocks(const char *where, bytes input,
+                                   const char *second_name, bytes second,
+                                   writable_bytes output, size_t block_size) {
+  require_capacity(where, second_name, second.size(), input.size());
+  return require_whole_blocks(where, input, output, block_size);
+}
+
+} // namespace detail
 
 } // namespace ctl

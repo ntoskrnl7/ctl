@@ -96,15 +96,19 @@ public:
    * @param input the data to encrypt, whose length must be a multiple of
    * block_size
    * @param output where the ciphertext goes, at least as long as input and may
-   * be the same buffer
-   * @exception std::invalid_argument if output is shorter than input
+   * be exactly the same buffer; any other overlap is refused
+   * @exception std::invalid_argument if output is shorter than input, or if
+   * input and output partially overlap
    */
   [[nodiscard]] ext::void_result<error_status>
   encrypt(iv_view iv, ctl::bytes input, ctl::writable_bytes output) const {
     if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
     ctl::detail::require_capacity("ctl::symmetric::mode::cbc::encrypt",
-                                  output.size(), input.size());
+                                  "output", output.size(), input.size());
+    ctl::detail::require_exact_or_disjoint(
+        "ctl::symmetric::mode::cbc::encrypt", input.data(), input.size(),
+        output.data(), output.data(), input.size());
 
     uint8_t chain[block_size];
     memcpy(chain, iv.data(), block_size);
@@ -126,15 +130,19 @@ public:
    * @param input the data to decrypt, whose length must be a multiple of
    * block_size
    * @param output where the plaintext goes, at least as long as input and may
-   * be the same buffer
-   * @exception std::invalid_argument if output is shorter than input
+   * be exactly the same buffer; any other overlap is refused
+   * @exception std::invalid_argument if output is shorter than input, or if
+   * input and output partially overlap
    */
   [[nodiscard]] ext::void_result<error_status>
   decrypt(iv_view iv, ctl::bytes input, ctl::writable_bytes output) const {
     if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
     ctl::detail::require_capacity("ctl::symmetric::mode::cbc::decrypt",
-                                  output.size(), input.size());
+                                  "output", output.size(), input.size());
+    ctl::detail::require_exact_or_disjoint(
+        "ctl::symmetric::mode::cbc::decrypt", input.data(), input.size(),
+        output.data(), output.data(), input.size());
 
     uint8_t chain[block_size];
     memcpy(chain, iv.data(), block_size);

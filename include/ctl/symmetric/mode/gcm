@@ -191,7 +191,7 @@ public:
     if (data_size > max_data_size)
       return ext::err(invalid_input_length);
     ctl::detail::require_capacity("ctl::symmetric::mode::gcm::encrypt",
-                                  output.size(),
+                                  "output", output.size(),
                                   static_cast<size_t>(data_size));
 
     session state(cipher_, hash_, iv);
@@ -235,7 +235,7 @@ public:
       return ext::err(invalid_input_length);
     const size_t data_size = static_cast<size_t>(total_size);
     ctl::detail::require_capacity("ctl::symmetric::mode::gcm::decrypt",
-                                  output.size(), data_size);
+                                  "output", output.size(), data_size);
 
     session state(cipher_, hash_, iv);
     for (const piece &p : aad)
@@ -498,8 +498,8 @@ public:
      */
     encrypt_data &write(ctl::bytes input, ctl::writable_bytes output) {
       ctl::detail::require_capacity(
-          "ctl::symmetric::mode::gcm::encrypt_data::write", output.size(),
-          input.size());
+          "ctl::symmetric::mode::gcm::encrypt_data::write", "output",
+          output.size(), input.size());
       state_.encrypt(input.data(), input.size(), output.data());
       return *this;
     }
@@ -586,8 +586,8 @@ public:
      */
     decrypt_data &write(ctl::bytes input, ctl::writable_bytes output) {
       ctl::detail::require_capacity(
-          "ctl::symmetric::mode::gcm::decrypt_data::write", output.size(),
-          input.size());
+          "ctl::symmetric::mode::gcm::decrypt_data::write", "output",
+          output.size(), input.size());
       state_.decrypt(input.data(), input.size(), output.data());
       return *this;
     }

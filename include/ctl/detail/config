@@ -79,3 +79,21 @@
 #else
 #define CTL_FORCEINLINE inline
 #endif
+
+/**
+ * Kept out of the caller
+ *
+ * For the code that builds and throws an exception. A check on a hot path is a
+ * comparison, but the message that goes with the failure is string
+ * construction, and inlining that into the caller pushes the code that does the
+ * work further apart for no gain, since it never runs. Marking the reporting
+ * function this way leaves the comparison at the call site and puts the rest
+ * somewhere cold.
+ */
+#if defined(_MSC_VER)
+#define CTL_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define CTL_NOINLINE __attribute__((noinline))
+#else
+#define CTL_NOINLINE
+#endif

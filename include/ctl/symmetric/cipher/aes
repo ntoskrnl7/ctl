@@ -387,56 +387,68 @@ public:
    * waits out that latency on every round. Interleaving several blocks fills
    * the wait with work from the other blocks.
    *
-   * The batch entry points take pointers rather than views. They are the
-   * interface between a mode of operation and its cipher, not something a
-   * caller reaches for, and the mode computes every length here from its own
-   * block count, so there is no pair for a caller to get wrong.
+   * How many blocks there are is not taken as an argument. It follows from the
+   * length of the input, and one number describing three buffers is what let a
+   * mask with no length of its own, or an output shorter than the input, go
+   * unnoticed.
    *
-   * @param input input of count * block_size bytes
-   * @param output output of count * block_size bytes, may be the same as input
-   * @param count number of blocks
+   * @param input the blocks to encrypt, a whole number of them
+   * @param output where the results go, at least as long as input and may be
+   * the same buffer
+   * @exception std::invalid_argument if input is not a whole number of blocks,
+   * or if output is shorter than input
    */
-  void encrypt_blocks(const uint8_t *input, uint8_t *output,
-                      size_t count) const {
+  void encrypt_blocks(ctl::bytes input, ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::aes::encrypt_blocks", input, output,
+        block_size);
+    const uint8_t *in = input.data();
+    uint8_t *out = output.data();
 #if defined(CTL_HAS_X86_HW_ACCEL)
     if (hardware_) {
       size_t i = 0;
       for (; i + preferred_batch <= count; i += preferred_batch)
-        encrypt_wide_aes_ni<preferred_batch>(input + i * block_size,
-                                            output + i * block_size);
+        encrypt_wide_aes_ni<preferred_batch>(in + i * block_size,
+                                            out + i * block_size);
       for (; i < count; ++i)
-        encrypt_block_aes_ni(input + i * block_size, output + i * block_size);
+        encrypt_block_aes_ni(in + i * block_size, out + i * block_size);
       return;
     }
 #endif
     for (size_t i = 0; i < count; ++i)
-      encrypt_block_software(block_view(input + i * block_size),
-                             writable_block_view(output + i * block_size));
+      encrypt_block_software(block_view(in + i * block_size),
+                             writable_block_view(out + i * block_size));
   }
 
   /**
    * @brief Decrypts several mutually independent blocks
    *
-   * @param input input of count * block_size bytes
-   * @param output output of count * block_size bytes, may be the same as input
-   * @param count number of blocks
+   * @param input the blocks to decrypt, a whole number of them
+   * @param output where the results go, at least as long as input and may be
+   * the same buffer
+   * @exception std::invalid_argument if input is not a whole number of blocks,
+   * or if output is shorter than input
    */
-  void decrypt_blocks(const uint8_t *input, uint8_t *output,
-                      size_t count) const {
+  void decrypt_blocks(ctl::bytes input, ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::aes::decrypt_blocks", input, output,
+        block_size);
+    const uint8_t *in = input.data();
+    uint8_t *out = output.data();
 #if defined(CTL_HAS_X86_HW_ACCEL)
     if (hardware_) {
       size_t i = 0;
       for (; i + preferred_batch <= count; i += preferred_batch)
-        decrypt_wide_aes_ni<preferred_batch>(input + i * block_size,
-                                            output + i * block_size);
+        decrypt_wide_aes_ni<preferred_batch>(in + i * block_size,
+                                            out + i * block_size);
       for (; i < count; ++i)
-        decrypt_block_aes_ni(input + i * block_size, output + i * block_size);
+        decrypt_block_aes_ni(in + i * block_size, out + i * block_size);
       return;
     }
 #endif
     for (size_t i = 0; i < count; ++i)
-      decrypt_block_software(block_view(input + i * block_size),
-                             writable_block_view(output + i * block_size));
+      decrypt_block_software(block_view(in + i * block_size),
+                             writable_block_view(out + i * block_size));
   }
 
   /**
@@ -449,29 +461,36 @@ public:
    * let the cipher read and write that buffer, then read it back to unmask,
    * which is more than twice the memory traffic.
    *
-   * @param input input of count * block_size bytes
-   * @param mask masks of count * block_size bytes
-   * @param output output of count * block_size bytes, may be the same as input
-   * @param count number of blocks
+   * @param input the blocks to encrypt, a whole number of them
+   * @param mask one mask per block, at least as long as input
+   * @param output where the results go, at least as long as input and may be
+   * the same buffer
+   * @exception std::invalid_argument if input is not a whole number of blocks,
+   * or if mask or output is shorter than input
    */
-  void encrypt_blocks_masked(const uint8_t *input, const uint8_t *mask,
-                             uint8_t *output, size_t count) const {
+  void encrypt_blocks_masked(ctl::bytes input, ctl::bytes mask,
+                             ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::aes::encrypt_blocks_masked", input, "mask",
+        mask, output, block_size);
+    const uint8_t *in = input.data();
+    const uint8_t *m = mask.data();
+    uint8_t *out = output.data();
 #if defined(CTL_HAS_X86_HW_ACCEL)
     if (hardware_) {
       size_t i = 0;
       for (; i + preferred_batch <= count; i += preferred_batch)
         wide_masked_aes_ni<preferred_batch, true, true>(
-            input + i * block_size, mask + i * block_size,
-            output + i * block_size);
+            in + i * block_size, m + i * block_size, out + i * block_size);
       for (; i < count; ++i)
-        block_masked<true>(input + i * block_size, mask + i * block_size,
-                           output + i * block_size);
+        block_masked<true>(in + i * block_size, m + i * block_size,
+                           out + i * block_size);
       return;
     }
 #endif
     for (size_t i = 0; i < count; ++i)
-      block_masked<true>(input + i * block_size, mask + i * block_size,
-                         output + i * block_size);
+      block_masked<true>(in + i * block_size, m + i * block_size,
+                         out + i * block_size);
   }
 
   /**
@@ -479,29 +498,36 @@ public:
    *
    * Computes output[i] = D(input[i] ^ mask[i]) ^ mask[i].
    *
-   * @param input input of count * block_size bytes
-   * @param mask masks of count * block_size bytes
-   * @param output output of count * block_size bytes, may be the same as input
-   * @param count number of blocks
+   * @param input the blocks to decrypt, a whole number of them
+   * @param mask one mask per block, at least as long as input
+   * @param output where the results go, at least as long as input and may be
+   * the same buffer
+   * @exception std::invalid_argument if input is not a whole number of blocks,
+   * or if mask or output is shorter than input
    */
-  void decrypt_blocks_masked(const uint8_t *input, const uint8_t *mask,
-                             uint8_t *output, size_t count) const {
+  void decrypt_blocks_masked(ctl::bytes input, ctl::bytes mask,
+                             ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::aes::decrypt_blocks_masked", input, "mask",
+        mask, output, block_size);
+    const uint8_t *in = input.data();
+    const uint8_t *m = mask.data();
+    uint8_t *out = output.data();
 #if defined(CTL_HAS_X86_HW_ACCEL)
     if (hardware_) {
       size_t i = 0;
       for (; i + preferred_batch <= count; i += preferred_batch)
         wide_masked_aes_ni<preferred_batch, false, true>(
-            input + i * block_size, mask + i * block_size,
-            output + i * block_size);
+            in + i * block_size, m + i * block_size, out + i * block_size);
       for (; i < count; ++i)
-        block_masked<false>(input + i * block_size, mask + i * block_size,
-                            output + i * block_size);
+        block_masked<false>(in + i * block_size, m + i * block_size,
+                            out + i * block_size);
       return;
     }
 #endif
     for (size_t i = 0; i < count; ++i)
-      block_masked<false>(input + i * block_size, mask + i * block_size,
-                          output + i * block_size);
+      block_masked<false>(in + i * block_size, m + i * block_size,
+                          out + i * block_size);
   }
 
   /**
@@ -512,30 +538,36 @@ public:
    * having it here keeps the key stream in registers instead of writing it to a
    * buffer that then has to be read back.
    *
-   * @param input input of count * block_size bytes, the counter blocks
-   * @param operand buffer of count * block_size bytes to combine with
-   * @param output output of count * block_size bytes, may be the same as
-   * operand
-   * @param count number of blocks
+   * @param input the counter blocks to encrypt, a whole number of them
+   * @param operand what to combine the results with, at least as long as input
+   * @param output where the results go, at least as long as input and may be
+   * the same buffer as operand
+   * @exception std::invalid_argument if input is not a whole number of blocks,
+   * or if operand or output is shorter than input
    */
-  void encrypt_blocks_then_xor(const uint8_t *input, const uint8_t *operand,
-                               uint8_t *output, size_t count) const {
+  void encrypt_blocks_then_xor(ctl::bytes input, ctl::bytes operand,
+                               ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::aes::encrypt_blocks_then_xor", input,
+        "operand", operand, output, block_size);
+    const uint8_t *in = input.data();
+    const uint8_t *op = operand.data();
+    uint8_t *out = output.data();
 #if defined(CTL_HAS_X86_HW_ACCEL)
     if (hardware_) {
       size_t i = 0;
       for (; i + preferred_batch <= count; i += preferred_batch)
         wide_masked_aes_ni<preferred_batch, true, false>(
-            input + i * block_size, operand + i * block_size,
-            output + i * block_size);
+            in + i * block_size, op + i * block_size, out + i * block_size);
       for (; i < count; ++i)
-        block_then_xor(input + i * block_size, operand + i * block_size,
-                       output + i * block_size);
+        block_then_xor(in + i * block_size, op + i * block_size,
+                       out + i * block_size);
       return;
     }
 #endif
     for (size_t i = 0; i < count; ++i)
-      block_then_xor(input + i * block_size, operand + i * block_size,
-                     output + i * block_size);
+      block_then_xor(in + i * block_size, op + i * block_size,
+                     out + i * block_size);
   }
 
   /**

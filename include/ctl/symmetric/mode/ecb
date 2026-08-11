@@ -75,20 +75,19 @@ public:
    * @param input the data to encrypt, whose length must be a multiple of
    * block_size
    * @param output where the ciphertext goes, at least as long as input and may
-   * be the same buffer
-   * @exception std::invalid_argument if output is shorter than input
+   * be exactly the same buffer; any other overlap is refused
+   * @exception std::invalid_argument if output is shorter than input, or if
+   * input and output partially overlap
    */
   [[nodiscard]] ext::void_result<error_status>
   encrypt(ctl::bytes input, ctl::writable_bytes output) const {
     if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
-    ctl::detail::require_capacity("ctl::symmetric::mode::ecb::encrypt",
-                                  output.size(), input.size());
     // The blocks are mutually independent, so all of them are handed over at
     // once. Where a hardware path exists, this is where several blocks end up
-    // being interleaved.
-    cipher_.encrypt_blocks(input.data(), output.data(),
-                           input.size() / block_size);
+    // being interleaved. The cipher works out how many there are from the
+    // length of what it was handed, and checks the output against it.
+    cipher_.encrypt_blocks(input, output);
     return ext::ok<void>();
   }
 
@@ -98,17 +97,15 @@ public:
    * @param input the data to decrypt, whose length must be a multiple of
    * block_size
    * @param output where the plaintext goes, at least as long as input and may
-   * be the same buffer
-   * @exception std::invalid_argument if output is shorter than input
+   * be exactly the same buffer; any other overlap is refused
+   * @exception std::invalid_argument if output is shorter than input, or if
+   * input and output partially overlap
    */
   [[nodiscard]] ext::void_result<error_status>
   decrypt(ctl::bytes input, ctl::writable_bytes output) const {
     if (input.size() % block_size != 0)
       return ext::err(invalid_input_length);
-    ctl::detail::require_capacity("ctl::symmetric::mode::ecb::decrypt",
-                                  output.size(), input.size());
-    cipher_.decrypt_blocks(input.data(), output.data(),
-                           input.size() / block_size);
+    cipher_.decrypt_blocks(input, output);
     return ext::ok<void>();
   }
 

@@ -113,7 +113,7 @@ public:
   void crypt(nonce_view nonce, offset_t byte_offset, ctl::bytes input,
              ctl::writable_bytes output) const {
     ctl::detail::require_capacity("ctl::symmetric::mode::ctr::crypt",
-                                  output.size(), input.size());
+                                  "output", output.size(), input.size());
 
     const size_t size = input.size();
     counter_state counter = load_counter(nonce.data());
@@ -152,8 +152,21 @@ public:
       // Combining with the data inside the cipher keeps the key stream in
       // registers. Generating it into a buffer first would mean writing it out
       // and reading it back just to exclusive or it.
-      cipher_.encrypt_blocks_then_xor(counters, input.data() + i,
-                                      output.data() + i, batch_blocks);
+      //
+      // This is the one place in the library that crosses into the cipher once
+      // per batch rather than once per call, and describing the three buffers
+      // by view rather than by one shared block count measures about two to
+      // three percent slower here. Every other mode is within the couple of
+      // percent the runs vary by on their own. The three buffers being
+      // checkable at all is worth that, but the number is real and not noise.
+      //
+      // Staging four times as many counter blocks, so this is reached a quarter
+      // as often, was tried and made it worse rather than better, by about
+      // seven percent. So what costs is not the number of times this is
+      // reached. Do not try that again.
+      cipher_.encrypt_blocks_then_xor(counters,
+                                      input.subview(i, sizeof(counters)),
+                                      output.subview(i, sizeof(counters)));
     }
 
     // Whole blocks left over that do not fill a batch
