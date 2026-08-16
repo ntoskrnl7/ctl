@@ -32,25 +32,23 @@
 #include <ctl/detail/endian>
 #include <ctl/detail/memory>
 
-#if defined(CTL_GHASH_HAS_MULTIPLY)
+/**
+ * Whether a polynomial multiply instruction is available on this target
+ *
+ * This has to be decided before the intrinsic header below is selected. A
+ * previous order happened to work when another header had already included the
+ * x86 intrinsics, but made this header fail when it was included on its own.
+ */
+#if defined(CTL_HAS_X86_HW_ACCEL)
+#define CTL_GHASH_HAS_MULTIPLY 1
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <immintrin.h>
 #endif
 #elif defined(CTL_HAS_ARM_HW_ACCEL)
-#include <arm_neon.h>
-#endif
-
-/**
- * Whether a polynomial multiply instruction is available on this target
- *
- * PCLMULQDQ on x86 and PMULL on ARM. They compute the same thing, so what
- * differs below is only the spelling and the way a 128 bit value is taken
- * apart.
- */
-#if defined(CTL_HAS_X86_HW_ACCEL) || defined(CTL_HAS_ARM_HW_ACCEL)
 #define CTL_GHASH_HAS_MULTIPLY 1
+#include <arm_neon.h>
 #endif
 
 namespace ctl {
@@ -81,7 +79,9 @@ public:
    */
   static constexpr size_t aggregate = 4;
 
-  ghash() : hh_(0), hl_(0), yh_(0), yl_(0), pending_(0) {
+  ghash()
+      : hh_(0), hl_(0), hh_reversed_(0), hl_reversed_(0), yh_(0), yl_(0),
+        pending_(0) {
     memset(buffer_, 0, sizeof(buffer_));
 #if defined(CTL_GHASH_HAS_MULTIPLY)
     hardware_ = false;
@@ -90,16 +90,30 @@ public:
 #endif
   }
 
-  ~ghash() {
+  ~ghash() { erase(); }
+
+  /**
+   * @brief Erases the subkey, accumulator and buffered input
+   *
+   * Kept separate from the destructor so that a GCM session can erase the
+   * source immediately after transferring its state. Volatile writes are used
+   * for the scalar words as well as the arrays; ordinary assignments in a
+   * destructor can be removed as dead stores.
+   */
+  void erase() {
+    ctl::detail::secure_zero(&hh_, sizeof(hh_));
+    ctl::detail::secure_zero(&hl_, sizeof(hl_));
+    ctl::detail::secure_zero(&hh_reversed_, sizeof(hh_reversed_));
+    ctl::detail::secure_zero(&hl_reversed_, sizeof(hl_reversed_));
+    ctl::detail::secure_zero(&yh_, sizeof(yh_));
+    ctl::detail::secure_zero(&yl_, sizeof(yl_));
     ctl::detail::secure_zero(buffer_, sizeof(buffer_));
 #if defined(CTL_GHASH_HAS_MULTIPLY)
     ctl::detail::secure_zero(power_h_, sizeof(power_h_));
     ctl::detail::secure_zero(power_l_, sizeof(power_l_));
+    hardware_ = false;
 #endif
-    hh_ = 0;
-    hl_ = 0;
-    yh_ = 0;
-    yl_ = 0;
+    pending_ = 0;
   }
 
   /**
@@ -111,6 +125,11 @@ public:
   void set_key(const uint8_t *h) {
     hh_ = ctl::detail::load_be64(h);
     hl_ = ctl::detail::load_be64(h + 8);
+
+    // The software multiply needs the subkey read backwards as well, and the
+    // subkey does not change, so it is reversed here rather than per block.
+    hh_reversed_ = reverse_bits(hh_);
+    hl_reversed_ = reverse_bits(hl_);
 
 #if defined(CTL_GHASH_HAS_MULTIPLY)
 #if defined(CTL_HAS_X86_HW_ACCEL)
@@ -130,6 +149,29 @@ public:
 #endif
 
     reset();
+  }
+
+  /**
+   * @brief Whether the two software multiplies agree on one pair of blocks
+   *
+   * Only for a test. The bit at a time multiply is kept as the reference the
+   * faster one is checked against, the same way the cipher keeps its table
+   * driven path, and this is what lets a test hold the two together without
+   * opening up the accumulator to everyone else.
+   *
+   * @param x a block to use as the accumulator
+   * @param y a block to use as the subkey
+   */
+  static bool software_multiplies_agree(const uint8_t *x, const uint8_t *y) {
+    ghash fast;
+    fast.set_key(y);
+    fast.yh_ = ctl::detail::load_be64(x);
+    fast.yl_ = ctl::detail::load_be64(x + 8);
+
+    ghash reference = fast;
+    fast.multiply_ctmul();
+    reference.multiply_bitwise();
+    return fast.yh_ == reference.yh_ && fast.yl_ == reference.yl_;
   }
 
   /**
@@ -163,6 +205,9 @@ public:
    * @param size number of bytes
    */
   void update(const uint8_t *data, size_t size) {
+    if (size == 0)
+      return;
+
     if (pending_ != 0) {
       const size_t needed = block_size - pending_;
       const size_t taken = size < needed ? size : needed;
@@ -244,7 +289,13 @@ private:
       return;
     }
 #endif
+#if defined(CTL_HAS_WIDE_MULTIPLY)
+    multiply_ctmul();
+#else
+    // On a processor whose registers are half the width these words want, the
+    // wide multiplications cost more than the shifts they replace.
     multiply_bitwise();
+#endif
   }
 
 #if defined(CTL_GHASH_HAS_MULTIPLY)
@@ -554,7 +605,140 @@ private:
 #endif
 
   /**
+   * @brief A 128 bit value as a pair of words, most significant first
+   */
+  struct pair {
+    uint64_t hi;
+    uint64_t lo;
+  };
+
+  /**
+   * @brief Reverses the order of the bits in a word
+   */
+  CTL_FORCEINLINE static uint64_t reverse_bits(uint64_t v) {
+    v = ((v >> 1) & 0x5555555555555555ull) | ((v & 0x5555555555555555ull) << 1);
+    v = ((v >> 2) & 0x3333333333333333ull) | ((v & 0x3333333333333333ull) << 2);
+    v = ((v >> 4) & 0x0f0f0f0f0f0f0f0full) | ((v & 0x0f0f0f0f0f0f0f0full) << 4);
+    v = ((v >> 8) & 0x00ff00ff00ff00ffull) | ((v & 0x00ff00ff00ff00ffull) << 8);
+    v = ((v >> 16) & 0x0000ffff0000ffffull) |
+        ((v & 0x0000ffff0000ffffull) << 16);
+    return (v >> 32) | (v << 32);
+  }
+
+  /**
+   * @brief The low half of a carry-less product, by ordinary multiplication
+   *
+   * An ordinary multiply is a carry-less multiply that also carries, so the
+   * problem is only to keep the carries from reaching anything that is kept.
+   * Splitting each operand into the bits at positions congruent to 0, 1, 2 and
+   * 3 modulo four does that: every partial product of x_i and y_j lands at a
+   * position congruent to i + j, so the three positions above each one receive
+   * nothing but carries and are masked away. At most sixteen terms meet in one
+   * column, and sixteen is the one count that carries a bit four positions up,
+   * onto a position that is kept; that needs a column of sixty or higher, so it
+   * lands at sixty four or higher and is truncated. The low half is exact.
+   *
+   * Sixteen multiplications, against the sixty four shift and mask steps a bit
+   * at a time costs, and no table and no branch, which is the whole point: a
+   * GHASH table is built from the subkey and indexed by data derived from it.
+   */
+  CTL_FORCEINLINE static uint64_t multiply_low(uint64_t x, uint64_t y) {
+    const uint64_t x0 = x & 0x1111111111111111ull;
+    const uint64_t x1 = x & 0x2222222222222222ull;
+    const uint64_t x2 = x & 0x4444444444444444ull;
+    const uint64_t x3 = x & 0x8888888888888888ull;
+    const uint64_t y0 = y & 0x1111111111111111ull;
+    const uint64_t y1 = y & 0x2222222222222222ull;
+    const uint64_t y2 = y & 0x4444444444444444ull;
+    const uint64_t y3 = y & 0x8888888888888888ull;
+
+    const uint64_t z0 = (x0 * y0) ^ (x1 * y3) ^ (x2 * y2) ^ (x3 * y1);
+    const uint64_t z1 = (x0 * y1) ^ (x1 * y0) ^ (x2 * y3) ^ (x3 * y2);
+    const uint64_t z2 = (x0 * y2) ^ (x1 * y1) ^ (x2 * y0) ^ (x3 * y3);
+    const uint64_t z3 = (x0 * y3) ^ (x1 * y2) ^ (x2 * y1) ^ (x3 * y0);
+
+    return (z0 & 0x1111111111111111ull) | (z1 & 0x2222222222222222ull) |
+           (z2 & 0x4444444444444444ull) | (z3 & 0x8888888888888888ull);
+  }
+
+  /**
+   * @brief A whole carry-less product of two words
+   *
+   * Reversing both operands reverses their product, so the half that the
+   * function above throws away is the half it keeps when handed the operands
+   * backwards. The single shift is because a product of two 64 bit values
+   * spans 127 bits, which reversed in 128 sits one place low.
+   */
+  CTL_FORCEINLINE static pair multiply_words(uint64_t x, uint64_t y, uint64_t x_reversed,
+                             uint64_t y_reversed) {
+    const uint64_t low = multiply_low(x, y);
+    const uint64_t high =
+        reverse_bits(multiply_low(x_reversed, y_reversed)) >> 1;
+    return pair{high, low};
+  }
+
+  /**
+   * @brief Multiplies the accumulator by the subkey without a table
+   *
+   * Karatsuba over the two halves, so three products of words rather than
+   * four, and then the reduction. Nothing here indexes memory with anything
+   * derived from the subkey.
+   */
+  CTL_FORCEINLINE void multiply_ctmul() {
+    const uint64_t xh_reversed = reverse_bits(yh_);
+    const uint64_t xl_reversed = reverse_bits(yl_);
+
+    const pair low = multiply_words(yl_, hl_, xl_reversed, hl_reversed_);
+    const pair high = multiply_words(yh_, hh_, xh_reversed, hh_reversed_);
+    const pair cross =
+        multiply_words(yh_ ^ yl_, hh_ ^ hl_, xh_reversed ^ xl_reversed,
+                       hh_reversed_ ^ hl_reversed_);
+    const uint64_t middle_hi = cross.hi ^ low.hi ^ high.hi;
+    const uint64_t middle_lo = cross.lo ^ low.lo ^ high.lo;
+
+    // The 256 bit product, least significant word first, shifted up by one
+    // because reversing a 255 bit product in 256 places puts it one bit low.
+    const uint64_t z0 = low.lo;
+    const uint64_t z1 = low.hi ^ middle_lo;
+    const uint64_t z2 = high.lo ^ middle_hi;
+    const uint64_t z3 = high.hi;
+
+    const pair upper{(z3 << 1) | (z2 >> 63), (z2 << 1) | (z1 >> 63)};
+    const pair lower{(z1 << 1) | (z0 >> 63), z0 << 1};
+
+    const pair folded = fold_upper_half(lower);
+    yh_ = upper.hi ^ folded.hi;
+    yl_ = upper.lo ^ folded.lo;
+  }
+
+  /**
+   * @brief Reduces the half of the product that sits above the field
+   *
+   * A block's leftmost bit is the coefficient of x^0, so the value holding it
+   * is the coefficient vector read backwards and multiplying by x is a shift
+   * right rather than left. Since x^128 = x^7 + x^2 + x + 1 for this field,
+   * multiplying by x^128 is three shifts and the value itself. Bits pushed off
+   * the bottom are degrees of 128 and above and go round once more; that second
+   * pass cannot overflow in turn, because what it starts from has degree six at
+   * most.
+   */
+  CTL_FORCEINLINE static pair fold_upper_half(pair u) {
+    pair acc{u.hi ^ (u.hi >> 1) ^ (u.hi >> 2) ^ (u.hi >> 7),
+             u.lo ^ ((u.lo >> 1) | (u.hi << 63)) ^
+                 ((u.lo >> 2) | (u.hi << 62)) ^ ((u.lo >> 7) | (u.hi << 57))};
+
+    // What left the bottom, which is the only part that needs a second pass.
+    const uint64_t over = (u.lo << 63) ^ (u.lo << 62) ^ (u.lo << 57);
+    acc.hi ^= over ^ (over >> 1) ^ (over >> 2) ^ (over >> 7);
+    acc.lo ^= (over << 63) ^ (over << 62) ^ (over << 57);
+    return acc;
+  }
+
+  /**
    * @brief Multiplies the accumulator by the subkey, one bit at a time
+   *
+   * Kept as the reference the multiply above is checked against, the same way
+   * the table driven cipher path is kept.
    */
   void multiply_bitwise() {
     multiply_bits(yh_, yl_, hh_, hl_, yh_, yl_);
@@ -608,6 +792,12 @@ private:
    */
   uint64_t hh_;
   uint64_t hl_;
+
+  /**
+   * @brief The subkey with the bits of each word in the opposite order
+   */
+  uint64_t hh_reversed_;
+  uint64_t hl_reversed_;
 
   /**
    * @brief The accumulator

@@ -13,6 +13,27 @@
  */
 #pragma once
 
+#include <cstdint>
+
+/**
+ * Whether the target multiplies two 64 bit words in one instruction
+ *
+ * Some code has a choice between many wide multiplications and many narrow
+ * shifts, and which is cheaper turns on this. Where a 64 bit multiply has to
+ * be built out of 32 bit ones it stops being a bargain: the software GHASH
+ * measured one and three quarter times faster with wide multiplication on
+ * MIPS64 and a quarter slower on MIPS32r2, so the two targets want different
+ * code.
+ *
+ * The width of a size_t stands in for the width of a general register, which
+ * is not the same question but answers it on every target this has been run
+ * on. An ABI with narrow pointers on a wide processor would be told wrong and
+ * would take the narrow path, which is slower and not incorrect.
+ */
+#if SIZE_MAX > 0xffffffffu
+#define CTL_HAS_WIDE_MULTIPLY 1
+#endif
+
 /**
  * Whether the target is x86, either 32 or 64 bit
  */

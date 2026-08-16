@@ -158,6 +158,50 @@ TEST(gcm, the_polynomial_multiply_is_actually_reached) {
 #endif
 }
 
+// The software multiply builds a carry-less product out of ordinary
+// multiplications, which is worth several times the bit at a time loop and is
+// far easier to get subtly wrong. The loop stays as the reference, and this is
+// what holds the two together over inputs no published vector reaches.
+TEST(gcm, the_two_software_multiplies_agree) {
+  std::vector<uint8_t> x(16), y(16);
+
+  // The cases where a carry would have somewhere to go, first.
+  const uint8_t interesting[] = {0x00, 0x01, 0x80, 0xff, 0x55, 0xaa};
+  for (uint8_t a : interesting)
+    for (uint8_t b : interesting) {
+      std::fill(x.begin(), x.end(), a);
+      std::fill(y.begin(), y.end(), b);
+      EXPECT_TRUE(
+          ctl::detail::ghash::software_multiplies_agree(x.data(), y.data()))
+          << "with " << std::hex << int(a) << " and " << int(b);
+    }
+
+  // A single bit in every position of either operand, which is what tells one
+  // misplaced shift in the reduction from a correct one.
+  for (size_t bit = 0; bit < 128; ++bit) {
+    std::fill(x.begin(), x.end(), 0);
+    std::fill(y.begin(), y.end(), 0);
+    x[bit / 8] = static_cast<uint8_t>(1u << (bit % 8));
+    y[15 - bit / 8] = static_cast<uint8_t>(1u << (bit % 8));
+    EXPECT_TRUE(
+        ctl::detail::ghash::software_multiplies_agree(x.data(), y.data()))
+        << "with bit " << bit;
+  }
+
+  uint32_t state = 0x1badd00du;
+  for (size_t round = 0; round < 4096; ++round) {
+    for (size_t i = 0; i < 16; ++i) {
+      state = state * 1664525u + 1013904223u;
+      x[i] = static_cast<uint8_t>(state >> 24);
+      state = state * 1664525u + 1013904223u;
+      y[i] = static_cast<uint8_t>(state >> 24);
+    }
+    ASSERT_TRUE(
+        ctl::detail::ghash::software_multiplies_agree(x.data(), y.data()))
+        << "at round " << round;
+  }
+}
+
 TEST(gcm, constants) {
   using gcm_t = mode::gcm<aes128>;
   EXPECT_EQ(16u, gcm_t::tag_size);
@@ -380,6 +424,36 @@ TEST(gcm, tag_can_be_appended_to_the_output) {
   EXPECT_EQ(test::to_hex(plain), test::to_hex(decrypted));
 }
 
+// Appending a tag means placing it immediately after the ciphertext, not on
+// top of bytes that belong to the ciphertext or plaintext output. Encryption
+// would otherwise return a tag for ciphertext it then corrupts, while
+// decryption could overwrite the supplied tag before comparing it.
+TEST(gcm, tag_must_not_overlap_the_data_output) {
+  using checked_gcm = mode::gcm<aes128>;
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+  checked_gcm gcm(key);
+
+  std::vector<uint8_t> output(plain.size());
+  const std::vector<uint8_t> before = output;
+  EXPECT_THROW(
+      (void)gcm.encrypt(iv, {}, {plain}, output,
+                        ctl::writable_bytes(output).first(
+                            checked_gcm::tag_size)),
+      std::invalid_argument);
+  EXPECT_EQ(before, output);
+
+  std::vector<uint8_t> cipher(plain.size());
+  std::vector<uint8_t> tag(checked_gcm::tag_size);
+  ASSERT_TRUE(gcm.encrypt(iv, {}, {plain}, cipher, tag));
+  std::copy(tag.begin(), tag.end(), output.begin());
+  EXPECT_THROW(
+      (void)gcm.decrypt(iv, {}, {cipher}, output,
+                        ctl::bytes(output).first(checked_gcm::tag_size)),
+      std::invalid_argument);
+}
+
 namespace {
 
 using gcm128 = mode::gcm<aes128>;
@@ -405,6 +479,16 @@ static_assert(accepts_aad<gcm128::decrypt_aad>::value,
               "the AAD phase has to accept AAD");
 static_assert(!accepts_aad<gcm128::decrypt_data>::value,
               "the data phase must not accept AAD");
+static_assert(!std::is_copy_constructible<gcm128::encrypt_aad>::value,
+              "copying a phase would fork one IV into two key streams");
+static_assert(!std::is_copy_constructible<gcm128::encrypt_data>::value,
+              "copying a writer would fork one IV into two key streams");
+static_assert(!std::is_copy_constructible<gcm128::decrypt_aad>::value,
+              "copying a phase would duplicate an invocation state");
+static_assert(!std::is_copy_constructible<gcm128::decrypt_data>::value,
+              "copying a reader would duplicate an invocation state");
+static_assert(std::is_move_constructible<gcm128::encrypt_data>::value,
+              "an invocation may be transferred without being cloned");
 
 // Feeding the same input through the incremental interface in several pieces has
 // to give exactly what the single call gives.
@@ -441,6 +525,39 @@ TEST(gcm, builder_matches_the_single_call) {
 
   EXPECT_EQ(test::to_hex(once), test::to_hex(streamed));
   EXPECT_EQ(test::to_hex(once_tag), test::to_hex(streamed_tag));
+}
+
+// Transitioning from AAD to data consumes the old phase, and finishing consumes
+// the writer. Without that rule a retained phase object could produce two
+// encryptions with the same IV, key and initial counter.
+TEST(gcm, an_incremental_invocation_cannot_be_forked_or_reused) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> aad = test::hex(kAad);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+  gcm128 gcm(key);
+
+  auto aad_phase = gcm.encryptor(iv);
+  aad_phase.aad(aad);
+  auto writer = aad_phase.data();
+
+  EXPECT_THROW(aad_phase.aad(aad), std::logic_error);
+  EXPECT_THROW((void)aad_phase.data(), std::logic_error);
+
+  std::vector<uint8_t> output(plain.size());
+  std::vector<uint8_t> tag(16);
+  writer.write(plain, output).finish(tag);
+  EXPECT_THROW(writer.write(plain, output), std::logic_error);
+  EXPECT_THROW(writer.finish(tag), std::logic_error);
+
+  // Moving a live writer is a transfer. Its old object is erased and cannot
+  // become a second branch of the same key stream.
+  std::vector<uint8_t> next_iv = iv;
+  next_iv.back() ^= 1;
+  auto live = gcm.encryptor(next_iv).data();
+  auto moved = std::move(live);
+  EXPECT_THROW(live.write(plain, output), std::logic_error);
+  EXPECT_NO_THROW(moved.write(plain, output).finish(tag));
 }
 
 // The writer can hold the output buffer and keep its own place in it, which is
@@ -497,6 +614,25 @@ TEST(gcm, a_writer_that_holds_its_buffer_refuses_to_overrun_it) {
   writer.write(ctl::bytes(plain).first(16));
   EXPECT_THROW(writer.write(ctl::bytes(plain).subview(16, 16)),
                std::invalid_argument);
+}
+
+// A held buffer lets finish distinguish a properly appended tag from one that
+// would overwrite data already produced. A rejected location leaves the
+// invocation live so the caller can supply the right tag buffer and finish.
+TEST(gcm, a_holding_writer_refuses_a_tag_on_top_of_its_output) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+  gcm128 gcm(key);
+
+  std::vector<uint8_t> packet(plain.size() + gcm128::tag_size);
+  auto writer = gcm.encryptor(iv).data(packet);
+  writer.write(plain);
+  EXPECT_THROW(
+      writer.finish(ctl::writable_bytes(packet).first(gcm128::tag_size)),
+      std::invalid_argument);
+  EXPECT_NO_THROW(writer.finish(
+      ctl::writable_bytes(packet).last(gcm128::tag_size)));
 }
 
 // A rejected run must not advance either the key stream or the output cursor,

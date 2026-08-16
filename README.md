@@ -257,6 +257,38 @@ Define `CTL_NO_HW_ACCEL` to leave all of it out. The published vectors pass
 either way, and every cipher with two paths has a test that runs the same inputs
 through both and compares.
 
+## GHASH without a table either
+
+The tag of GCM is a multiplication in GF(2^128) per block. With PCLMULQDQ or
+PMULL that is one instruction; without them it used to be a loop of a hundred
+and twenty eight shifts and masks, which is where software GCM spent three
+quarters of its time. A table would fix that and cannot be used here: a GHASH
+table is built from the subkey and indexed by data derived from it, which is a
+cache timing channel on the one value that has to stay secret.
+
+There is a third way, and it needs no table. An ordinary integer multiply is
+already a carry-less multiply that also carries, so the only problem is to stop
+the carries from reaching anything that is kept. Splitting each operand into the
+bits at positions congruent to 0, 1, 2 and 3 modulo four does that: every
+partial product of one piece by another lands at a position congruent to the sum
+of the two, so the three positions above each one receive nothing but carries
+and are masked away. Sixteen multiplications then give an exact half product,
+the other half comes from handing the same routine its operands backwards, and
+Karatsuba over the two halves makes three of those rather than four.
+
+| | one bit at a time | by multiplication |
+| --- | --- | --- |
+| GHASH, x86-64 | 133 MB/s | 560 |
+| AES-128-GCM, x86-64, software throughout | 95 | 271 |
+
+It is chosen by the width of a general register rather than taken everywhere.
+Where a 64 bit multiply has to be built out of 32 bit ones it stops being a
+bargain, and the two MIPS targets disagree by more than the factor itself:
+emulated, MIPS64 gains three quarters and MIPS32r2 loses a quarter. So a target
+with narrow registers keeps the loop, and the two are checked against each other
+on every target either way, over single bits in each of the 128 positions and
+four thousand random pairs.
+
 ## AES without tables
 
 The table driven AES indexes memory with a value that depends on the key. Which
@@ -282,16 +314,17 @@ so that the two software paths are what is being compared.
 
 | | Tables | Table free |
 | --- | --- | --- |
-| ECB, four blocks per pass | 551 MB/s | 166 |
-| CTR | 391 | 145 |
-| GCM | 85 | 59 |
-| CBC encrypt, one block at a time | 399 | 46 |
+| ECB, four blocks per pass | 565 MB/s | 162 |
+| CTR | 490 | 142 |
+| XTS | 482 | 143 |
+| GCM | 271 | 102 |
+| CBC encrypt, one block at a time | 436 | 44 |
 
-Three to four times the cost where blocks can go through together, and about ten
-where they cannot. CBC encryption chains, so it hands over one block at a time
-and three of the four lanes are idle; a mode that can run blocks in parallel does
-not pay that. GCM moves least because in software the tag, not the cipher, is
-most of the work.
+About three and a half times the cost where blocks can go through together, and
+ten where they cannot. CBC encryption chains, so it hands over one block at a
+time and three of the four lanes are idle; a mode that can run blocks in
+parallel does not pay that. GCM moves least of the parallel modes, since the tag
+is a share of its work that the cipher choice does not touch.
 
 That the tables are gone is checked rather than asserted, and checking it found
 something. A program that uses AES through a mode and never names the reference
@@ -305,7 +338,8 @@ function decides now, and the tables are absent at `/O2` and at `/Od` alike.
 There is nothing left to index.
 
 Worth saying plainly: on a processor with no AES instructions, LEA is table free
-by construction and four times faster than this. Where the cipher is negotiable,
+by construction and three to five times faster than this, depending on the mode.
+Where the cipher is negotiable,
 that is the better answer, and this path is for where it is not — a format or a
 protocol that names AES, on a processor that has no instruction for it.
 
@@ -326,35 +360,37 @@ object is the size it was and a key setup is as quick as it was.
 
 ## Measured throughput
 
-AES-128 over a 4096 byte buffer, Intel Core Ultra 7 265K, MSVC `/O2`.
+AES-128 over a 4096 byte buffer, Intel Core Ultra 7 265K, MSVC `/O2`. Every
+figure in this section was taken in one sitting, because these numbers are only
+comparable to one another if the machine was in the same state for all of them,
+and figures carried over from an earlier session have twice been wrong here in
+a way that looked like a code change.
 
 | Mode | Software | Accelerated |
 | --- | --- | --- |
-| ECB | 543 MB/s | 11,510 MB/s |
-| XTS | 472 | 6,230 |
-| CTR | 470 | 4,470 |
-| GCM | 103 | 1,970 |
-| CBC, which chains and cannot be parallelized | 426 | 1,590 |
+| ECB | 565 MB/s | 11,505 MB/s |
+| CTR | 490 | 4,600 |
+| XTS | 482 | 6,403 |
+| GCM | 271 | 1,971 |
+| CBC, which chains and cannot be parallelized | 436 | 1,623 |
 
-XTS over 512 byte sectors reaches 4,440 MB/s. ARIA runs at 132 MB/s in software
-and 294 MB/s with the vector path, and ARIA-XTS at 221 MB/s. No operation
-performs a heap allocation.
+No operation performs a heap allocation.
 
-The other two ciphers, over the same 4096 byte buffer.
+The other two ciphers, over the same buffer.
 
 | | ECB | CTR | XTS | GCM |
 | --- | --- | --- | --- | --- |
-| LEA-128, eight blocks at a time | 3,530 MB/s | 2,140 | 2,640 | 1,330 |
-| LEA-128, four blocks at a time | 1,820 | 1,500 | 1,570 | 1,100 |
-| LEA-128, one block at a time | 729 | 598 | 593 | 613 |
-| ARIA-128, vector path | 290 | 234 | 219 | 222 |
-| ARIA-128, one block at a time | 132 | — | — | — |
+| LEA-128, eight blocks at a time, AVX2 | 3,545 MB/s | 2,259 | 2,749 | 1,366 |
+| LEA-128, four blocks at a time, SSE2 | 1,873 | 1,520 | 1,589 | 1,130 |
+| LEA-128, one block at a time | 823 | 541 | 453 | 227 |
+| ARIA-128, vector path | 247 | 226 | 204 | 199 |
+| ARIA-128, one block at a time | 117 | 112 | 105 | 86 |
 
-Worth comparing LEA against the 543 MB/s the software path of AES reaches in the
-table above. Without AES-NI it is six times faster than AES, and it gets there
-without a table. Against AES with AES-NI it is a third of the throughput in ECB
-and about two thirds in GCM, where the tag rather than the cipher is most of the
-work.
+The row that matters is the third one against the software column above: with
+no instruction to help either cipher, LEA is about half again the throughput of
+AES and gets there with no table at all. Where both have their instructions AES
+is three times LEA in ECB, since AES-NI has no equal here, and the gap narrows
+in GCM where the tag is a share of the work.
 
 ARIA does not move with any of this, because its vector path processes one block
 at a time and it says so: a mode asks its cipher whether handing over a batch is
@@ -422,19 +458,19 @@ handling and the vector paths are covered rather than assumed.
 
 | | How | Result |
 | --- | --- | --- |
-| x86-64, AES-NI and AVX2 | on the machine | 119 tests |
-| x86-64, `CTL_NO_HW_ACCEL` | on the machine | 119 tests |
-| x86-64, `CTL_AES_CONSTANT_TIME` | on the machine | 119 tests |
-| x86-64, both of those together | on the machine | 119 tests |
-| ARM64, cryptographic instructions and NEON | cross built, run under qemu | 119 tests |
-| ARM64, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 119 tests |
-| ARM 32 bit, NEON | cross built, run under qemu | 119 tests |
-| MIPS64 little endian, MSA | cross built, run under qemu | 119 tests |
+| x86-64, AES-NI and AVX2 | on the machine | 120 tests |
+| x86-64, `CTL_NO_HW_ACCEL` | on the machine | 120 tests |
+| x86-64, `CTL_AES_CONSTANT_TIME` | on the machine | 120 tests |
+| x86-64, both of those together | on the machine | 120 tests |
+| ARM64, cryptographic instructions and NEON | cross built, run under qemu | 120 tests |
+| ARM64, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 120 tests |
+| ARM 32 bit, NEON | cross built, run under qemu | 120 tests |
+| MIPS64 little endian, MSA | cross built, run under qemu | 120 tests |
 | MIPS64 big endian, MSA | not supported, see below | |
-| MIPS64 little endian, no MSA | cross built, run under qemu | 119 tests |
-| MIPS64 little endian, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 119 tests |
-| MIPS64 big endian | cross built, run under qemu | 119 tests |
-| MIPS32r2, no SIMD of any kind | cross built, run under qemu | 119 tests |
+| MIPS64 little endian, no MSA | cross built, run under qemu | 120 tests |
+| MIPS64 little endian, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 120 tests |
+| MIPS64 big endian | cross built, run under qemu | 120 tests |
+| MIPS32r2, no SIMD of any kind | cross built, run under qemu | 120 tests |
 
 The MIPS32r2 row is the oldest thing here: a single core with no MSA, since
 that needs release 5, and no cryptographic instructions, since MIPS has none at
@@ -490,9 +526,9 @@ through cache timing; the AES-NI path, the ARM path and the table free path do
 not have that property, and neither does LEA on any path, since it has no table
 to index.
 
-GHASH is either the carry-less instruction or a bit at a time, and never a
-table, for the same reason: a GHASH table is built from the hash subkey and
-indexed by data derived from it.
+GHASH never uses a table either, for the same reason and a sharper one: a
+GHASH table is built from the hash subkey itself and indexed by data derived
+from it. What it uses instead is described below.
 
 ## Building the tests
 
