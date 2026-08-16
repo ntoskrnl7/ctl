@@ -134,6 +134,82 @@ inline bool has_byte_shuffle() {
   return supported;
 }
 
+/**
+ * @brief Queries a bit of EBX from the extended CPUID leaf (7, subleaf 0)
+ *
+ * The instruction sets added after the basic leaf ran out of bits are reported
+ * here.
+ *
+ * @param bit bit position to check
+ * @return true if the feature is supported
+ */
+inline bool extended_feature_bit(unsigned int bit) {
+#if defined(CTL_ARCH_X86)
+#if defined(_MSC_VER)
+  int registers[4] = {0, 0, 0, 0};
+  __cpuidex(registers, 7, 0);
+  return ((static_cast<unsigned int>(registers[1]) >> bit) & 1u) != 0;
+#else
+  unsigned int eax = 0;
+  unsigned int ebx = 0;
+  unsigned int ecx = 0;
+  unsigned int edx = 0;
+  if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx))
+    return false;
+  return ((ebx >> bit) & 1u) != 0;
+#endif
+#else
+  (void)bit;
+  return false;
+#endif
+}
+
+/**
+ * @brief Whether the operating system preserves the wide vector registers
+ *
+ * A processor reporting AVX is not enough. The upper half of each register is
+ * state the operating system has to know to save across a context switch, and
+ * one that does not know about it will silently corrupt the value instead. The
+ * processor reports what the operating system enabled through XCR0, which is
+ * what this reads, and which may only be read once the processor says the
+ * instruction that reads it is available.
+ */
+inline bool os_saves_wide_vectors() {
+#if defined(CTL_ARCH_X86)
+  // OSXSAVE, which is the operating system saying XGETBV may be executed.
+  if (!feature_bit(27))
+    return false;
+
+  unsigned long long enabled;
+#if defined(_MSC_VER)
+  enabled = _xgetbv(0);
+#else
+  unsigned int low = 0;
+  unsigned int high = 0;
+  __asm__ __volatile__("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
+  enabled = (static_cast<unsigned long long>(high) << 32) | low;
+#endif
+  // Bit 1 is the lower half of each vector register and bit 2 the upper half.
+  // Both have to be saved.
+  return (enabled & 0x6ull) == 0x6ull;
+#else
+  return false;
+#endif
+}
+
+/**
+ * @brief Whether AVX2 is supported and usable
+ *
+ * Three things have to hold: the processor has AVX, the operating system saves
+ * the wide registers, and the processor has the integer instructions of AVX2
+ * rather than only the floating point ones of AVX.
+ */
+inline bool has_avx2() {
+  static const bool supported =
+      feature_bit(28) && os_saves_wide_vectors() && extended_feature_bit(5);
+  return supported;
+}
+
 } // namespace cpu
 } // namespace detail
 } // namespace ctl

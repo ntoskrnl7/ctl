@@ -226,13 +226,14 @@ Chosen at run time through CPUID, so one binary runs anywhere.
   layer becomes seven byte shuffles. The state then stays in one register for
   the whole block instead of being written out and read back every round, which
   is where the time was going.
-- **SSE2 for LEA**, which needs no instruction set of its own at all. A round is
-  four 32 bit words put through addition, exclusive or and rotation, and none of
-  those look outside their own lane, so four blocks run through four lanes with
-  the sequence one block uses. The cost is that there is no rotate below
-  AVX-512, so each of the three becomes a pair of shifts and an or, and that
-  four blocks have to be exchanged into lanes on the way in and back on the way
-  out. It comes to two and a half times the throughput of one block at a time.
+- **SSE2, and AVX2 where it is there, for LEA**, which needs no instruction set
+  of its own at all. A round is four 32 bit words put through addition,
+  exclusive or and rotation, and none of those look outside their own lane, so
+  four blocks run through four lanes with the sequence one block uses, or eight
+  through eight. The cost is that there is no rotate below AVX-512, so each of
+  the three becomes a pair of shifts and an or, and that the blocks have to be
+  exchanged into lanes on the way in and back on the way out. The two together
+  come to about five times the throughput of one block at a time.
 
 Define `CTL_NO_HW_ACCEL` to leave all of it out. The published vectors pass
 either way, and every cipher with two paths has a test that runs the same inputs
@@ -244,11 +245,11 @@ AES-128 over a 4096 byte buffer, Intel Core Ultra 7 265K, MSVC `/O2`.
 
 | Mode | Software | Accelerated |
 | --- | --- | --- |
-| ECB | 543 MB/s | 11,500 MB/s |
-| XTS | 472 | 6,220 |
-| CTR | 470 | 4,560 |
-| CBC, which chains and cannot be parallelized | 426 | 1,600 |
-| GCM | 103 | 941 |
+| ECB | 543 MB/s | 11,510 MB/s |
+| XTS | 472 | 6,230 |
+| CTR | 470 | 4,470 |
+| GCM | 103 | 1,970 |
+| CBC, which chains and cannot be parallelized | 426 | 1,590 |
 
 XTS over 512 byte sectors reaches 4,440 MB/s. ARIA runs at 132 MB/s in software
 and 294 MB/s with the vector path, and ARIA-XTS at 221 MB/s. No operation
@@ -258,20 +259,21 @@ The other two ciphers, over the same 4096 byte buffer.
 
 | | ECB | CTR | XTS | GCM |
 | --- | --- | --- | --- | --- |
-| LEA-128, four blocks at a time | 1,837 MB/s | 1,485 | 1,557 | 613 |
+| LEA-128, eight blocks at a time | 3,530 MB/s | 2,140 | 2,640 | 1,330 |
+| LEA-128, four blocks at a time | 1,820 | 1,500 | 1,570 | 1,100 |
 | LEA-128, one block at a time | 729 | 598 | 593 | 613 |
-| ARIA-128, vector path | 291 | 234 | 221 | 224 |
+| ARIA-128, vector path | 290 | 234 | 219 | 222 |
 | ARIA-128, one block at a time | 132 | — | — | — |
 
 Worth comparing LEA against the 543 MB/s the software path of AES reaches in the
-table above. Without AES-NI it is more than three times faster than AES, which is
-what it was designed for, and it gets there without a table.
+table above. Without AES-NI it is six times faster than AES, and it gets there
+without a table. Against AES with AES-NI it is a third of the throughput in ECB
+and about two thirds in GCM, where the tag rather than the cipher is most of the
+work.
 
-GCM is the one that does not move, and it is the mode rather than the cipher.
-CTR and XTS ask their cipher for a batch and get four blocks in one pass; GCM
-produces its key stream a block at a time and so never reaches that entry point.
-Its figure is what the carry-less multiply does for GHASH, not what the vector
-path does for LEA.
+ARIA does not move with any of this, because its vector path processes one block
+at a time and it says so: a mode asks its cipher whether handing over a batch is
+worth anything, and ARIA answers no.
 
 Describing a buffer by a view rather than by a pointer and a length is close to
 free. Measured against the interface it replaced, six runs of each interleaved so

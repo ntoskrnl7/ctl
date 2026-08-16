@@ -193,18 +193,25 @@ TEST(lea, the_vector_path_reproduces_the_spec_vector) {
   const std::vector<uint8_t> key = test::hex("0f1e2d3c4b5a69788796a5b4c3d2e1f0");
   const std::vector<uint8_t> one = test::hex("101112131415161718191a1b1c1d1e1f");
 
-  // Four different blocks, the published one first, so a lane mix up moves it.
-  std::vector<uint8_t> four(4 * 16);
-  for (size_t b = 0; b < 4; ++b)
-    for (size_t i = 0; i < 16; ++i)
-      four[b * 16 + i] = static_cast<uint8_t>(one[i] + b);
-
   lea<128> cipher(key);
-  std::vector<uint8_t> out(four.size());
-  cipher.encrypt_blocks(four, out);
 
-  EXPECT_EQ(std::string("9fc84e3528c6c6185532c7a704648bfd"),
-            test::to_hex(out.data(), 16));
+  // Four blocks reaches the narrow path and eight the wide one, and the wide
+  // one picks its blocks up in pairs four apart rather than in order, which is
+  // the part most easily got wrong. The published block goes first in both, and
+  // the rest differ from it, so any lane ending up somewhere else moves it.
+  for (size_t count : {size_t(4), size_t(8)}) {
+    std::vector<uint8_t> blocks(count * 16);
+    for (size_t b = 0; b < count; ++b)
+      for (size_t i = 0; i < 16; ++i)
+        blocks[b * 16 + i] = static_cast<uint8_t>(one[i] + b);
+
+    std::vector<uint8_t> out(blocks.size());
+    cipher.encrypt_blocks(blocks, out);
+
+    EXPECT_EQ(std::string("9fc84e3528c6c6185532c7a704648bfd"),
+              test::to_hex(out.data(), 16))
+        << "over " << count << " blocks";
+  }
 }
 
 // Every bit of the key has to reach the ciphertext. A key schedule that drops a

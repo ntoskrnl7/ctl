@@ -27,13 +27,19 @@
  * block big endian produces a wrong answer that still round trips, so the
  * published vectors are what catches it.
  *
- * There is a vector path, and it needs nothing but SSE2. A round is four 32 bit
- * words put through addition, exclusive or and rotation, and none of those look
- * at anything outside their own lane, so four blocks go through four lanes with
- * the same instruction sequence a single block uses. ARIA had to borrow the AES
- * round instructions to get at its S-box, and AES needs AES-NI to be quick at
- * all; this needs neither, only the ability to add and shift four words at once,
- * which every 64 bit x86 processor has.
+ * There is a vector path, and the narrow one needs nothing but SSE2. A round is
+ * four 32 bit words put through addition, exclusive or and rotation, and none of
+ * those look at anything outside their own lane, so four blocks go through four
+ * lanes with the same instruction sequence a single block uses. ARIA had to
+ * borrow the AES round instructions to get at its S-box, and AES needs AES-NI to
+ * be quick at all; this needs neither, only the ability to add and shift four
+ * words at once, which every 64 bit x86 processor has. Where AVX2 is there as
+ * well the same thing runs eight blocks wide.
+ *
+ * The two together come to about five times one block at a time. What is left
+ * on the table is that there is no rotate instruction below AVX-512, so each of
+ * the three per round is a pair of shifts and an or; a machine with AVX-512
+ * would get those back.
  *
  * @version 0.1
  *
@@ -55,7 +61,7 @@
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
-#include <emmintrin.h>
+#include <immintrin.h>
 #endif
 #endif
 
@@ -151,11 +157,19 @@ public:
   static constexpr size_t preferred_batch = 8;
 
   /**
-   * @brief How many blocks the vector path takes at once
+   * @brief How many blocks the narrow vector path takes at once
    *
    * Four 32 bit lanes in a 128 bit register, one block per lane.
    */
   static constexpr size_t vector_blocks = 4;
+
+  /**
+   * @brief How many blocks the wide vector path takes at once
+   *
+   * Eight 32 bit lanes in a 256 bit register. A batch is exactly this, so a
+   * mode that hands over a batch reaches the wide path in one pass.
+   */
+  static constexpr size_t wide_blocks = 8;
 
   /**
    * @brief Key type, for declaring storage for a key
@@ -233,6 +247,7 @@ public:
   void set_key(key_view key) {
 #if defined(CTL_HAS_X86_HW_ACCEL)
     vector_ = ctl::detail::cpu::has_sse2();
+    wide_ = ctl::detail::cpu::has_avx2();
 #endif
 
     uint32_t t[key_words];
@@ -282,7 +297,7 @@ public:
     if (vector_) {
       for (size_t i = 0; i < rounds; ++i)
         for (size_t j = 0; j < round_key_words; ++j)
-          for (size_t lane = 0; lane < vector_blocks; ++lane)
+          for (size_t lane = 0; lane < wide_blocks; ++lane)
             rkv_[i][j][lane] = rk_[i][j];
     }
 #endif
@@ -390,6 +405,9 @@ public:
     uint8_t *out = output.data();
     size_t i = 0;
 #if defined(CTL_HAS_X86_HW_ACCEL)
+    if (wide_)
+      for (; i + wide_blocks <= count; i += wide_blocks)
+        eight<true>(in + i * block_size, out + i * block_size);
     if (vector_)
       for (; i + vector_blocks <= count; i += vector_blocks)
         four<true>(in + i * block_size, out + i * block_size);
@@ -416,6 +434,9 @@ public:
     uint8_t *out = output.data();
     size_t i = 0;
 #if defined(CTL_HAS_X86_HW_ACCEL)
+    if (wide_)
+      for (; i + wide_blocks <= count; i += wide_blocks)
+        eight<false>(in + i * block_size, out + i * block_size);
     if (vector_)
       for (; i + vector_blocks <= count; i += vector_blocks)
         four<false>(in + i * block_size, out + i * block_size);
@@ -477,6 +498,10 @@ public:
   void encrypt_batch_masked(batch_view input, batch_view mask,
                             writable_batch_view output) const {
 #if defined(CTL_HAS_X86_HW_ACCEL)
+    if (wide_) {
+      eight_combined<true, true>(input.data(), mask.data(), output.data());
+      return;
+    }
     if (vector_) {
       for (size_t i = 0; i < preferred_batch; i += vector_blocks)
         four_combined<true, true>(input.data() + i * block_size,
@@ -501,6 +526,10 @@ public:
   void decrypt_batch_masked(batch_view input, batch_view mask,
                             writable_batch_view output) const {
 #if defined(CTL_HAS_X86_HW_ACCEL)
+    if (wide_) {
+      eight_combined<false, true>(input.data(), mask.data(), output.data());
+      return;
+    }
     if (vector_) {
       for (size_t i = 0; i < preferred_batch; i += vector_blocks)
         four_combined<false, true>(input.data() + i * block_size,
@@ -528,6 +557,10 @@ public:
   void encrypt_batch_then_xor(batch_view input, batch_view operand,
                               writable_batch_view output) const {
 #if defined(CTL_HAS_X86_HW_ACCEL)
+    if (wide_) {
+      eight_combined<true, false>(input.data(), operand.data(), output.data());
+      return;
+    }
     if (vector_) {
       for (size_t i = 0; i < preferred_batch; i += vector_blocks)
         four_combined<true, false>(input.data() + i * block_size,
@@ -601,35 +634,32 @@ private:
   rounds_lanes(__m128i &x0, __m128i &x1, __m128i &x2, __m128i &x3) const {
     if constexpr (_Encrypt) {
       for (size_t i = 0; i < rounds; ++i) {
-        const uint32_t *rk = &rkv_[i][0][0];
+        const uint32_t(&rk)[round_key_words][wide_blocks] = rkv_[i];
         const __m128i carried = x0;
-        x0 = rotl_lanes<9>(_mm_add_epi32(
-            _mm_xor_si128(x0, load_key(rk + 0)),
-            _mm_xor_si128(x1, load_key(rk + 4))));
-        x1 = rotr_lanes<5>(_mm_add_epi32(
-            _mm_xor_si128(x1, load_key(rk + 8)),
-            _mm_xor_si128(x2, load_key(rk + 12))));
-        x2 = rotr_lanes<3>(_mm_add_epi32(
-            _mm_xor_si128(x2, load_key(rk + 16)),
-            _mm_xor_si128(x3, load_key(rk + 20))));
+        x0 = rotl_lanes<9>(_mm_add_epi32(_mm_xor_si128(x0, load_key(rk[0])),
+                                         _mm_xor_si128(x1, load_key(rk[1]))));
+        x1 = rotr_lanes<5>(_mm_add_epi32(_mm_xor_si128(x1, load_key(rk[2])),
+                                         _mm_xor_si128(x2, load_key(rk[3]))));
+        x2 = rotr_lanes<3>(_mm_add_epi32(_mm_xor_si128(x2, load_key(rk[4])),
+                                         _mm_xor_si128(x3, load_key(rk[5]))));
         x3 = carried;
       }
     } else {
       for (size_t i = rounds; i-- > 0;) {
-        const uint32_t *rk = &rkv_[i][0][0];
+        const uint32_t(&rk)[round_key_words][wide_blocks] = rkv_[i];
         const __m128i p0 = x3;
         const __m128i p1 = _mm_xor_si128(
             _mm_sub_epi32(rotr_lanes<9>(x0),
-                          _mm_xor_si128(p0, load_key(rk + 0))),
-            load_key(rk + 4));
+                          _mm_xor_si128(p0, load_key(rk[0]))),
+            load_key(rk[1]));
         const __m128i p2 = _mm_xor_si128(
             _mm_sub_epi32(rotl_lanes<5>(x1),
-                          _mm_xor_si128(p1, load_key(rk + 8))),
-            load_key(rk + 12));
+                          _mm_xor_si128(p1, load_key(rk[2]))),
+            load_key(rk[3]));
         const __m128i p3 = _mm_xor_si128(
             _mm_sub_epi32(rotl_lanes<3>(x2),
-                          _mm_xor_si128(p2, load_key(rk + 16))),
-            load_key(rk + 20));
+                          _mm_xor_si128(p2, load_key(rk[4]))),
+            load_key(rk[5]));
         x0 = p0;
         x1 = p1;
         x2 = p2;
@@ -727,6 +757,187 @@ private:
                                                           uint8_t *at) {
     _mm_storeu_si128(reinterpret_cast<__m128i *>(at), v);
   }
+
+  // The wide path repeats the narrow one with twice the lanes. The one thing
+  // that is not a simple substitution is where the blocks are picked up from,
+  // and that is what the pairing below is about.
+
+  /**
+   * @brief Rotates each of the eight lanes left
+   */
+  template <unsigned int _N>
+  static CTL_TARGET_AVX2 CTL_FORCEINLINE __m256i rotl_wide(__m256i v) {
+    return _mm256_or_si256(_mm256_slli_epi32(v, _N),
+                           _mm256_srli_epi32(v, 32 - _N));
+  }
+
+  /**
+   * @brief Rotates each of the eight lanes right
+   */
+  template <unsigned int _N>
+  static CTL_TARGET_AVX2 CTL_FORCEINLINE __m256i rotr_wide(__m256i v) {
+    return _mm256_or_si256(_mm256_srli_epi32(v, _N),
+                           _mm256_slli_epi32(v, 32 - _N));
+  }
+
+  /**
+   * @brief Reads a block and the one four along into the two halves
+   *
+   * The exchange below works within each half of the register and never across
+   * the middle, which is what the unpack instructions do and the only thing they
+   * do. So the halves are loaded with blocks that belong together under it:
+   * block j low and block j+4 high. Four of these cover eight blocks, the
+   * exchange transposes both halves at once, and every lane ends up holding one
+   * block. Loading the eight blocks in their natural order instead would need a
+   * crossing permute afterwards to undo the split.
+   */
+  static CTL_TARGET_AVX2 CTL_FORCEINLINE __m256i load_pair(const uint8_t *at) {
+    return _mm256_inserti128_si256(
+        _mm256_castsi128_si256(
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(at))),
+        _mm_loadu_si128(
+            reinterpret_cast<const __m128i *>(at + 4 * block_size)),
+        1);
+  }
+
+  /**
+   * @brief Writes the two halves back to a block and the one four along
+   */
+  static CTL_TARGET_AVX2 CTL_FORCEINLINE void store_pair(__m256i v,
+                                                         uint8_t *at) {
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(at),
+                     _mm256_castsi256_si128(v));
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(at + 4 * block_size),
+                     _mm256_extracti128_si256(v, 1));
+  }
+
+  /**
+   * @brief Reads one round key word already spread across eight lanes
+   */
+  static CTL_TARGET_AVX2 CTL_FORCEINLINE __m256i
+  load_key_wide(const uint32_t *at) {
+    return _mm256_loadu_si256(reinterpret_cast<const __m256i *>(at));
+  }
+
+  /**
+   * @brief Exchanges rows and columns within each half of the registers
+   */
+  static CTL_TARGET_AVX2 CTL_FORCEINLINE void
+  transpose_wide(__m256i &a, __m256i &b, __m256i &c, __m256i &d) {
+    const __m256i ab_low = _mm256_unpacklo_epi32(a, b);
+    const __m256i ab_high = _mm256_unpackhi_epi32(a, b);
+    const __m256i cd_low = _mm256_unpacklo_epi32(c, d);
+    const __m256i cd_high = _mm256_unpackhi_epi32(c, d);
+    a = _mm256_unpacklo_epi64(ab_low, cd_low);
+    b = _mm256_unpackhi_epi64(ab_low, cd_low);
+    c = _mm256_unpacklo_epi64(ab_high, cd_high);
+    d = _mm256_unpackhi_epi64(ab_high, cd_high);
+  }
+
+  /**
+   * @brief Runs every round over eight blocks held one to a lane
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   */
+  template <bool _Encrypt>
+  CTL_TARGET_AVX2 CTL_FORCEINLINE void
+  rounds_wide(__m256i &x0, __m256i &x1, __m256i &x2, __m256i &x3) const {
+    if constexpr (_Encrypt) {
+      for (size_t i = 0; i < rounds; ++i) {
+        const uint32_t(&rk)[round_key_words][wide_blocks] = rkv_[i];
+        const __m256i carried = x0;
+        x0 = rotl_wide<9>(
+            _mm256_add_epi32(_mm256_xor_si256(x0, load_key_wide(rk[0])),
+                             _mm256_xor_si256(x1, load_key_wide(rk[1]))));
+        x1 = rotr_wide<5>(
+            _mm256_add_epi32(_mm256_xor_si256(x1, load_key_wide(rk[2])),
+                             _mm256_xor_si256(x2, load_key_wide(rk[3]))));
+        x2 = rotr_wide<3>(
+            _mm256_add_epi32(_mm256_xor_si256(x2, load_key_wide(rk[4])),
+                             _mm256_xor_si256(x3, load_key_wide(rk[5]))));
+        x3 = carried;
+      }
+    } else {
+      for (size_t i = rounds; i-- > 0;) {
+        const uint32_t(&rk)[round_key_words][wide_blocks] = rkv_[i];
+        const __m256i p0 = x3;
+        const __m256i p1 = _mm256_xor_si256(
+            _mm256_sub_epi32(rotr_wide<9>(x0),
+                             _mm256_xor_si256(p0, load_key_wide(rk[0]))),
+            load_key_wide(rk[1]));
+        const __m256i p2 = _mm256_xor_si256(
+            _mm256_sub_epi32(rotl_wide<5>(x1),
+                             _mm256_xor_si256(p1, load_key_wide(rk[2]))),
+            load_key_wide(rk[3]));
+        const __m256i p3 = _mm256_xor_si256(
+            _mm256_sub_epi32(rotl_wide<3>(x2),
+                             _mm256_xor_si256(p2, load_key_wide(rk[4]))),
+            load_key_wide(rk[5]));
+        x0 = p0;
+        x1 = p1;
+        x2 = p2;
+        x3 = p3;
+      }
+    }
+  }
+
+  /**
+   * @brief Transforms eight blocks
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   */
+  template <bool _Encrypt>
+  CTL_TARGET_AVX2 void eight(const uint8_t *input, uint8_t *output) const {
+    __m256i a = load_pair(input + 0 * block_size);
+    __m256i b = load_pair(input + 1 * block_size);
+    __m256i c = load_pair(input + 2 * block_size);
+    __m256i d = load_pair(input + 3 * block_size);
+
+    transpose_wide(a, b, c, d);
+    rounds_wide<_Encrypt>(a, b, c, d);
+    transpose_wide(a, b, c, d);
+
+    store_pair(a, output + 0 * block_size);
+    store_pair(b, output + 1 * block_size);
+    store_pair(c, output + 2 * block_size);
+    store_pair(d, output + 3 * block_size);
+  }
+
+  /**
+   * @brief Transforms eight blocks, combining them with a second buffer
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   * @tparam _MaskInput true to combine on the way in as well
+   */
+  template <bool _Encrypt, bool _MaskInput>
+  CTL_TARGET_AVX2 void eight_combined(const uint8_t *input, const uint8_t *mask,
+                                      uint8_t *output) const {
+    __m256i a = load_pair(input + 0 * block_size);
+    __m256i b = load_pair(input + 1 * block_size);
+    __m256i c = load_pair(input + 2 * block_size);
+    __m256i d = load_pair(input + 3 * block_size);
+
+    const __m256i m0 = load_pair(mask + 0 * block_size);
+    const __m256i m1 = load_pair(mask + 1 * block_size);
+    const __m256i m2 = load_pair(mask + 2 * block_size);
+    const __m256i m3 = load_pair(mask + 3 * block_size);
+
+    if constexpr (_MaskInput) {
+      a = _mm256_xor_si256(a, m0);
+      b = _mm256_xor_si256(b, m1);
+      c = _mm256_xor_si256(c, m2);
+      d = _mm256_xor_si256(d, m3);
+    }
+
+    transpose_wide(a, b, c, d);
+    rounds_wide<_Encrypt>(a, b, c, d);
+    transpose_wide(a, b, c, d);
+
+    store_pair(_mm256_xor_si256(a, m0), output + 0 * block_size);
+    store_pair(_mm256_xor_si256(b, m1), output + 1 * block_size);
+    store_pair(_mm256_xor_si256(c, m2), output + 2 * block_size);
+    store_pair(_mm256_xor_si256(d, m3), output + 3 * block_size);
+  }
 #endif
 
   /**
@@ -758,13 +969,21 @@ private:
   bool vector_;
 
   /**
+   * @brief Whether the wide vector path is used, decided at the same time
+   */
+  bool wide_;
+
+  /**
    * @brief The same round keys with each word repeated across the lanes
    *
    * Held as words rather than as vectors so that the object needs no more
    * alignment than any other, and read back with an unaligned load, which costs
    * nothing on the processors this runs on.
+   *
+   * Enough copies for the wide path. The narrow one reads the first half of
+   * each, which holds the same value four times over, so one table serves both.
    */
-  uint32_t rkv_[rounds][round_key_words][vector_blocks];
+  uint32_t rkv_[rounds][round_key_words][wide_blocks];
 #endif
 };
 

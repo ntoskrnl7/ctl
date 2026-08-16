@@ -51,10 +51,12 @@
 #define CTL_TARGET_AESNI __attribute__((target("aes,ssse3,sse2")))
 #define CTL_TARGET_PCLMUL __attribute__((target("pclmul,ssse3,sse2")))
 #define CTL_TARGET_SSE2 __attribute__((target("sse2")))
+#define CTL_TARGET_AVX2 __attribute__((target("avx2")))
 #else
 #define CTL_TARGET_AESNI
 #define CTL_TARGET_PCLMUL
 #define CTL_TARGET_SSE2
+#define CTL_TARGET_AVX2
 #endif
 
 /**
