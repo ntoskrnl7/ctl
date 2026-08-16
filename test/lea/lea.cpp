@@ -15,6 +15,7 @@
 #include <array>
 
 #include <ctl/bytes>
+#include <ctl/detail/cpu>
 #include <ctl/symmetric/cipher/lea>
 
 #include "../vectors.h"
@@ -171,6 +172,27 @@ template <class Cipher> void check_paths_agree() {
 }
 
 } // namespace
+
+// A vector path that is compiled but never dispatched to passes every test
+// above, because the block at a time path answers for it and answers correctly.
+// This is the one that notices. It caught exactly that on ARM and MIPS, where
+// the decision was being made by asking whether the processor had SSE2.
+TEST(lea, a_compiled_vector_path_is_actually_reached) {
+  const std::vector<uint8_t> key(lea<128>::key_size);
+  lea<128> cipher(key);
+
+#if defined(CTL_LEA_LANES_SSE2)
+  // x86 decides at run time, so what has to hold is that the answer follows
+  // the processor rather than being stuck.
+  EXPECT_EQ(ctl::detail::cpu::has_sse2(), cipher.prefers_batching());
+#elif defined(CTL_LEA_HAS_LANES)
+  EXPECT_TRUE(cipher.prefers_batching())
+      << "a vector path is compiled in, but the cipher does not ask for "
+         "batches, so nothing would ever reach it";
+#else
+  EXPECT_FALSE(cipher.prefers_batching());
+#endif
+}
 
 TEST(lea, vector_path_agrees_with_software_128) {
   check_paths_agree<lea<128>>();

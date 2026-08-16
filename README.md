@@ -226,14 +226,22 @@ Chosen at run time through CPUID, so one binary runs anywhere.
   layer becomes seven byte shuffles. The state then stays in one register for
   the whole block instead of being written out and read back every round, which
   is where the time was going.
-- **SSE2, and AVX2 where it is there, for LEA**, which needs no instruction set
-  of its own at all. A round is four 32 bit words put through addition,
-  exclusive or and rotation, and none of those look outside their own lane, so
-  four blocks run through four lanes with the sequence one block uses, or eight
-  through eight. The cost is that there is no rotate below AVX-512, so each of
-  the three becomes a pair of shifts and an or, and that the blocks have to be
-  exchanged into lanes on the way in and back on the way out. The two together
-  come to about five times the throughput of one block at a time.
+- **SSE2 and AVX2 on x86, NEON on ARM, MSA on MIPS, for LEA**, which needs no
+  instruction set of its own at all. A round is four 32 bit words put through
+  addition, exclusive or and rotation, and none of those look outside their own
+  lane, so four blocks run through four lanes with the sequence one block uses,
+  or eight through eight where AVX2 is there. The cost is that only AVX-512 has
+  a vector rotate, so each of the three per round becomes a pair of shifts and
+  an or, and that the blocks have to be exchanged into lanes on the way in and
+  back on the way out. On x86 the two widths together come to about five times
+  the throughput of one block at a time.
+
+  The round is written once and each architecture says only what its handful of
+  lane operations are. NEON needs no run time check, since it is part of 64 bit
+  ARM, and it is asked for by the instructions it needs rather than by the name
+  of the architecture, which is what 32 bit ARM was being turned away by. MSA is
+  compiled in only when the compiler was told the target has it, and only where
+  words are already little endian.
 
 Define `CTL_NO_HW_ACCEL` to leave all of it out. The published vectors pass
 either way, and every cipher with two paths has a test that runs the same inputs
@@ -299,6 +307,63 @@ which is trading one mode against another rather than removing a cost. And
 putting dead code in front of an otherwise identical benchmark moves XTS by one
 percent on its own. So it is where the code lands, and it is left written down
 rather than explained away.
+
+## Where it has been run
+
+The published vectors and every test run on each of these, so the byte order
+handling and the vector paths are covered rather than assumed.
+
+| | How | Result |
+| --- | --- | --- |
+| x86-64, AES-NI and AVX2 | on the machine | 91 tests |
+| x86-64, `CTL_NO_HW_ACCEL` | on the machine | 91 tests |
+| ARM64, NEON | cross built, run under qemu | 91 tests |
+| ARM 32 bit, NEON | cross built, run under qemu | 91 tests |
+| MIPS64 little endian, MSA | cross built, run under qemu | 91 tests |
+| MIPS64 big endian, MSA | not supported, see below | |
+| MIPS64 little endian, no MSA | cross built, run under qemu | 91 tests |
+| MIPS64 big endian | cross built, run under qemu | 91 tests |
+| MIPS32r2, no SIMD of any kind | cross built, run under qemu | 91 tests |
+
+The MIPS32r2 row is the oldest thing here: a single core with no MSA, since
+that needs release 5, and no cryptographic instructions, since MIPS has none at
+any release. Nothing is accelerated there and everything still works, which is
+the point of the row. What that target does have is a rotate instruction, which
+is the one thing LEA asks of a processor, and no need for the eight and a half
+kilobytes of table AES carries.
+
+MSA is not tied to a byte order and big endian MIPS can have it. Not supporting
+it there is this library's limit rather than the hardware's. Opening the gate
+leaves five tests failing, every one of them the vector path of LEA disagreeing
+with the block at a time path, and the vector output is not a permutation of the
+right answer but different values, so what is wrong is the arithmetic and not
+the arrangement.
+
+Where it is not is worth writing down, because two plausible answers were tried
+and both made it worse. Probes on both byte orders say that ld.b gives the same
+word elements from the same sixteen bytes on each, that round keys load
+identically, and that the four step exchange produces the same result; so
+neither reversing the bytes of a block nor swapping the words inside each
+doubleword of the exchange is the fix. Each was tried on the strength of a
+difference that a probe with constant inputs appeared to show, and a probe
+written differently disagreed with the first, which says more about a cross
+compiler folding vector builtins than about the hardware.
+
+One thing that came out of looking is worth having on its own. Building for big
+endian with the MSA flag breaks three tests with none of this code compiled in,
+because the compiler turns ordinary loops into MSA there and gets them wrong;
+`-fno-tree-vectorize` makes those three pass. That is a fault in the compiler
+rather than in this library, and it is why no clean comparison was available
+until it was found. The block at a time path is correct on big endian MIPS and
+is what runs.
+
+The big endian row matters more than it looks. Every load and store of a word
+goes through `ctl/detail/endian`, which has a path for hosts whose byte order
+does not match the specification's, and until that row existed no test had ever
+taken it.
+
+What the emulated rows do not show is speed. They say the answers are right on
+those architectures, not how fast they arrive.
 
 ## Status and limits
 

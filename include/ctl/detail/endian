@@ -109,21 +109,42 @@ inline void store_be64(uint64_t v, uint8_t *p) {
 
 /**
  * @brief Reads a 32 bit word from a little endian byte string
+ *
+ * On a little endian host the bytes are already in the order wanted, so this is
+ * one load. Unlike the big endian pair above there is no swap to weigh against
+ * it, which is why that one is written out a byte at a time and this one is
+ * not.
  */
 inline uint32_t load_le32(const uint8_t *p) {
+#if defined(CTL_LITTLE_ENDIAN)
+  uint32_t value;
+  memcpy(&value, p, sizeof(value));
+  return value;
+#else
   return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
          (static_cast<uint32_t>(p[2]) << 16) |
          (static_cast<uint32_t>(p[3]) << 24);
+#endif
 }
 
 /**
  * @brief Writes a 32 bit word as a little endian byte string
+ *
+ * The store is where this matters most. Compilers recognise four byte loads as
+ * one word load and often do not recognise four byte stores as one word store:
+ * on MIPS32 the load became two instructions and the store stayed at seven,
+ * which over the four words of a LEA block was twenty instructions of pure
+ * waste on the way out.
  */
 inline void store_le32(uint32_t v, uint8_t *p) {
+#if defined(CTL_LITTLE_ENDIAN)
+  memcpy(p, &v, sizeof(v));
+#else
   p[0] = static_cast<uint8_t>(v);
   p[1] = static_cast<uint8_t>(v >> 8);
   p[2] = static_cast<uint8_t>(v >> 16);
   p[3] = static_cast<uint8_t>(v >> 24);
+#endif
 }
 
 /**

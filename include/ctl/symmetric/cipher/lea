@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file lea
  * @author jung-kwang lee (ntoskrnl7@gmail.com)
  * @brief LEA block cipher (KS X 3246, ISO/IEC 29192-2)
@@ -27,19 +27,27 @@
  * block big endian produces a wrong answer that still round trips, so the
  * published vectors are what catches it.
  *
- * There is a vector path, and the narrow one needs nothing but SSE2. A round is
+ * There is a vector path, and it asks almost nothing of the machine. A round is
  * four 32 bit words put through addition, exclusive or and rotation, and none of
  * those look at anything outside their own lane, so four blocks go through four
  * lanes with the same instruction sequence a single block uses. ARIA had to
  * borrow the AES round instructions to get at its S-box, and AES needs AES-NI to
  * be quick at all; this needs neither, only the ability to add and shift four
- * words at once, which every 64 bit x86 processor has. Where AVX2 is there as
- * well the same thing runs eight blocks wide.
+ * words at once. Three architectures provide that and the round below is written
+ * once for all of them, against the handful of operations named in lea_detail:
  *
- * The two together come to about five times one block at a time. What is left
- * on the table is that there is no rotate instruction below AVX-512, so each of
- * the three per round is a pair of shifts and an or; a machine with AVX-512
- * would get those back.
+ *   SSE2   on x86, chosen at run time, with AVX2 running eight blocks wide
+ *          where the processor and the operating system both have it
+ *   NEON   on 64 bit ARM, where there is nothing to choose because it is part
+ *          of the architecture
+ *   MSA    on MIPS, only when the compiler was told the target has it; a big
+ *          endian target uses a separate boundary around the same word lanes
+ *
+ * The rotation is the one operation none of them has as a single instruction
+ * below AVX-512. SSE2 and MSA take a pair of shifts and an or; NEON takes two,
+ * since it can shift and merge at once.
+ *
+ * On x86 the two widths together come to about five times one block at a time.
  *
  * @version 0.1
  *
@@ -57,12 +65,52 @@
 #include <ctl/detail/endian>
 #include <ctl/detail/memory>
 
+/**
+ * Which vector path is compiled in, if any.
+ *
+ * The four lane round is the same on all three: add, exclusive or and rotate,
+ * lane by lane. Only the spelling of the instructions differs, so the algorithm
+ * below is written once against the few operations named in lea_lanes, and each
+ * architecture says what those are.
+ *
+ * How the path is reached differs though. On x86 it is decided at run time,
+ * because a binary has to keep working on a processor without the instructions.
+ * On 64 bit ARM there is nothing to decide: NEON is part of the architecture.
+ * And MSA is not reached at run time either, because the compiler will not
+ * accept the instructions unless it was told the target has them, so being
+ * compiled at all is the decision.
+ *
+ * NEON is asked for by the instructions it needs rather than by the name of the
+ * architecture. 32 bit ARM has NEON and a gate that said ARM64 was turning it
+ * away; every operation the lanes below use is plain ARMv7 NEON, and the suite
+ * passes there with nothing else changed.
+ */
+#if !defined(CTL_NO_HW_ACCEL)
 #if defined(CTL_HAS_X86_HW_ACCEL)
+#define CTL_LEA_LANES_SSE2 1
+#define CTL_LEA_WIDE_AVX2 1
+#elif defined(__ARM_NEON)
+#define CTL_LEA_LANES_NEON 1
+#elif defined(__mips_msa)
+#define CTL_LEA_LANES_MSA 1
+#endif
+#endif
+
+#if defined(CTL_LEA_LANES_SSE2) || defined(CTL_LEA_LANES_NEON) ||              \
+    defined(CTL_LEA_LANES_MSA)
+#define CTL_LEA_HAS_LANES 1
+#endif
+
+#if defined(CTL_LEA_LANES_SSE2)
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <immintrin.h>
 #endif
+#elif defined(CTL_LEA_LANES_NEON)
+#include <arm_neon.h>
+#elif defined(CTL_LEA_LANES_MSA)
+#include <msa.h>
 #endif
 
 namespace ctl {
@@ -93,6 +141,202 @@ inline constexpr uint32_t delta[8] = {0xc3efe9dbu, 0x44626b02u, 0x79e27c8au,
  * @brief How far each word of the key schedule state is rotated
  */
 inline constexpr unsigned int key_rotations[6] = {1, 3, 6, 11, 13, 17};
+
+#if defined(CTL_LEA_HAS_LANES)
+
+/**
+ * @brief Four 32 bit words side by side, and what a LEA round does to them
+ *
+ * Everything the round needs and nothing else. A lane never looks at another
+ * lane except in transpose, which is not part of the round at all but of
+ * getting blocks into lanes and back out.
+ *
+ * Rotation is the one that is not a single instruction anywhere below AVX-512.
+ * SSE2 and MSA both take a pair of shifts and an or; NEON takes two, since it
+ * can shift and merge in one.
+ */
+struct lanes {
+#if defined(CTL_LEA_LANES_SSE2)
+  typedef __m128i type;
+
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE type load(const uint8_t *at) {
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(at));
+  }
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE type read(const uint32_t *at) {
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(at));
+  }
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE void store(type v, uint8_t *at) {
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(at), v);
+  }
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE type add(type a, type b) {
+    return _mm_add_epi32(a, b);
+  }
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE type sub(type a, type b) {
+    return _mm_sub_epi32(a, b);
+  }
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE type bitxor(type a, type b) {
+    return _mm_xor_si128(a, b);
+  }
+  template <unsigned int _N>
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE type rotl(type v) {
+    return _mm_or_si128(_mm_slli_epi32(v, _N), _mm_srli_epi32(v, 32 - _N));
+  }
+  template <unsigned int _N>
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE type rotr(type v) {
+    return _mm_or_si128(_mm_srli_epi32(v, _N), _mm_slli_epi32(v, 32 - _N));
+  }
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE void transpose(type &a, type &b,
+                                                        type &c, type &d) {
+    const type ab_low = _mm_unpacklo_epi32(a, b);
+    const type ab_high = _mm_unpackhi_epi32(a, b);
+    const type cd_low = _mm_unpacklo_epi32(c, d);
+    const type cd_high = _mm_unpackhi_epi32(c, d);
+    a = _mm_unpacklo_epi64(ab_low, cd_low);
+    b = _mm_unpackhi_epi64(ab_low, cd_low);
+    c = _mm_unpacklo_epi64(ab_high, cd_high);
+    d = _mm_unpackhi_epi64(ab_high, cd_high);
+  }
+
+#elif defined(CTL_LEA_LANES_NEON)
+  typedef uint32x4_t type;
+
+  static CTL_FORCEINLINE type load(const uint8_t *at) {
+    return vld1q_u32(reinterpret_cast<const uint32_t *>(at));
+  }
+  static CTL_FORCEINLINE type read(const uint32_t *at) {
+    return vld1q_u32(at);
+  }
+  static CTL_FORCEINLINE void store(type v, uint8_t *at) {
+    vst1q_u32(reinterpret_cast<uint32_t *>(at), v);
+  }
+  static CTL_FORCEINLINE type add(type a, type b) { return vaddq_u32(a, b); }
+  static CTL_FORCEINLINE type sub(type a, type b) { return vsubq_u32(a, b); }
+  static CTL_FORCEINLINE type bitxor(type a, type b) { return veorq_u32(a, b); }
+  // Shift right and insert does the shift and the merge together, so a rotation
+  // is two instructions here where SSE2 and MSA take three.
+  template <unsigned int _N> static CTL_FORCEINLINE type rotl(type v) {
+    return vsriq_n_u32(vshlq_n_u32(v, _N), v, 32 - _N);
+  }
+  template <unsigned int _N> static CTL_FORCEINLINE type rotr(type v) {
+    return vsriq_n_u32(vshlq_n_u32(v, 32 - _N), v, _N);
+  }
+  static CTL_FORCEINLINE void transpose(type &a, type &b, type &c, type &d) {
+    const uint32x4x2_t ab = vtrnq_u32(a, b);
+    const uint32x4x2_t cd = vtrnq_u32(c, d);
+    a = vcombine_u32(vget_low_u32(ab.val[0]), vget_low_u32(cd.val[0]));
+    b = vcombine_u32(vget_low_u32(ab.val[1]), vget_low_u32(cd.val[1]));
+    c = vcombine_u32(vget_high_u32(ab.val[0]), vget_high_u32(cd.val[0]));
+    d = vcombine_u32(vget_high_u32(ab.val[1]), vget_high_u32(cd.val[1]));
+  }
+
+#elif defined(CTL_LEA_LANES_MSA)
+  typedef v4u32 type;
+
+#if defined(CTL_LITTLE_ENDIAN)
+  // Loads and stores go a byte at a time rather than a word at a time. The
+  // instruction does the same work either way, but the word form requires the
+  // address to be aligned to a word and nothing here promises that: a mode
+  // stages its counters and tweaks in a plain array of bytes, which may land
+  // anywhere. x86 and NEON both have loads that do not care; MSA does not, so
+  // the element size is made one, which is the same thing.
+  //
+  // The round keys are not a byte string. They are words the key schedule
+  // produced, sitting in memory in the order the machine uses, so they are read
+  // as they are.
+  static CTL_FORCEINLINE type load(const uint8_t *at) {
+    return (type)__builtin_msa_ld_b(const_cast<uint8_t *>(at), 0);
+  }
+  static CTL_FORCEINLINE type read(const uint32_t *at) {
+    return (type)__builtin_msa_ld_b(const_cast<uint32_t *>(at), 0);
+  }
+  static CTL_FORCEINLINE void store(type v, uint8_t *at) {
+    __builtin_msa_st_b((v16i8)v, at, 0);
+  }
+  static CTL_FORCEINLINE type add(type a, type b) {
+    return (type)__builtin_msa_addv_w((v4i32)a, (v4i32)b);
+  }
+  static CTL_FORCEINLINE type sub(type a, type b) {
+    return (type)__builtin_msa_subv_w((v4i32)a, (v4i32)b);
+  }
+  static CTL_FORCEINLINE type bitxor(type a, type b) {
+    return (type)__builtin_msa_xor_v((v16u8)a, (v16u8)b);
+  }
+  template <unsigned int _N> static CTL_FORCEINLINE type rotl(type v) {
+    return (type)__builtin_msa_or_v(
+        (v16u8)__builtin_msa_slli_w((v4i32)v, _N),
+        (v16u8)__builtin_msa_srli_w((v4i32)v, 32 - _N));
+  }
+  template <unsigned int _N> static CTL_FORCEINLINE type rotr(type v) {
+    return (type)__builtin_msa_or_v(
+        (v16u8)__builtin_msa_srli_w((v4i32)v, _N),
+        (v16u8)__builtin_msa_slli_w((v4i32)v, 32 - _N));
+  }
+  static CTL_FORCEINLINE void transpose(type &a, type &b, type &c, type &d) {
+    // ilvr and ilvl interleave the right and left halves, which is what unpack
+    // does on x86, so the same four step exchange applies.
+    const v4i32 ab_low = __builtin_msa_ilvr_w((v4i32)b, (v4i32)a);
+    const v4i32 ab_high = __builtin_msa_ilvl_w((v4i32)b, (v4i32)a);
+    const v4i32 cd_low = __builtin_msa_ilvr_w((v4i32)d, (v4i32)c);
+    const v4i32 cd_high = __builtin_msa_ilvl_w((v4i32)d, (v4i32)c);
+    a = (type)__builtin_msa_ilvr_d((v2i64)cd_low, (v2i64)ab_low);
+    b = (type)__builtin_msa_ilvl_d((v2i64)cd_low, (v2i64)ab_low);
+    c = (type)__builtin_msa_ilvr_d((v2i64)cd_high, (v2i64)ab_high);
+    d = (type)__builtin_msa_ilvl_d((v2i64)cd_high, (v2i64)ab_high);
+  }
+#else
+  // MSA loads and stores are mixed endian with respect to a whole vector. On a
+  // big endian target, reinterpreting one register between byte, word and
+  // doubleword vector types therefore is not a bit-preserving cast. The little
+  // endian implementation above does that for the bytewise bit operations and
+  // for the doubleword half of the exchange, so it cannot be shared here.
+  //
+  // Keep the state a v4u32 from one boundary to the other instead. Blocks enter
+  // and leave through the byte-order helpers, round keys are already native
+  // words and need only be broadcast, and the ordinary vector operators keep
+  // their operation inside each 32 bit element. The exchange is written in
+  // terms of those elements as well. These scalar-looking boundaries occur
+  // only before and after a batch; all 24 to 32 rounds still run four blocks at
+  // once in MSA registers.
+  static CTL_FORCEINLINE type load(const uint8_t *at) {
+    return type{ctl::detail::load_le32(at + 0), ctl::detail::load_le32(at + 4),
+                ctl::detail::load_le32(at + 8),
+                ctl::detail::load_le32(at + 12)};
+  }
+  static CTL_FORCEINLINE type read(const uint32_t *at) {
+    // rkv_ repeats every word across the lanes, so one scalar read and fill is
+    // the same value as reading its four copies and avoids four insertions.
+    return (type)__builtin_msa_fill_w(static_cast<int32_t>(at[0]));
+  }
+  static CTL_FORCEINLINE void store(type v, uint8_t *at) {
+    ctl::detail::store_le32(v[0], at + 0);
+    ctl::detail::store_le32(v[1], at + 4);
+    ctl::detail::store_le32(v[2], at + 8);
+    ctl::detail::store_le32(v[3], at + 12);
+  }
+  static CTL_FORCEINLINE type add(type a, type b) { return a + b; }
+  static CTL_FORCEINLINE type sub(type a, type b) { return a - b; }
+  static CTL_FORCEINLINE type bitxor(type a, type b) { return a ^ b; }
+  template <unsigned int _N> static CTL_FORCEINLINE type rotl(type v) {
+    return (v << _N) | (v >> (32 - _N));
+  }
+  template <unsigned int _N> static CTL_FORCEINLINE type rotr(type v) {
+    return (v >> _N) | (v << (32 - _N));
+  }
+  static CTL_FORCEINLINE void transpose(type &a, type &b, type &c, type &d) {
+    const type ta = {a[0], b[0], c[0], d[0]};
+    const type tb = {a[1], b[1], c[1], d[1]};
+    const type tc = {a[2], b[2], c[2], d[2]};
+    const type td = {a[3], b[3], c[3], d[3]};
+    a = ta;
+    b = tb;
+    c = tc;
+    d = td;
+  }
+#endif
+#endif
+};
+
+#endif
 
 } // namespace lea_detail
 
@@ -224,7 +468,7 @@ public:
    */
   ~lea() {
     ctl::detail::secure_zero(rk_, sizeof(rk_));
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
     ctl::detail::secure_zero(rkv_, sizeof(rkv_));
 #endif
   }
@@ -245,8 +489,17 @@ public:
    * @param key the key
    */
   void set_key(key_view key) {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_LANES_SSE2)
+    // On x86 the instructions are asked for, because a binary built with them
+    // still has to run on a processor that does not have them.
     vector_ = ctl::detail::cpu::has_sse2();
+#elif defined(CTL_LEA_HAS_LANES)
+    // Everywhere else there is nothing to ask. NEON is part of 64 bit ARM, and
+    // MSA is not in the binary at all unless the compiler was told the target
+    // has it, so reaching this line is the answer.
+    vector_ = true;
+#endif
+#if defined(CTL_LEA_WIDE_AVX2)
     wide_ = ctl::detail::cpu::has_avx2();
 #endif
 
@@ -288,7 +541,7 @@ public:
       }
     }
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
     // Every lane of the vector path wants the same round key word, so the
     // broadcast is done once here instead of six times per round inside the
     // loop. It costs four times the room, which for LEA-128 is a little over
@@ -381,7 +634,7 @@ public:
    * several independent blocks into one pass.
    */
   bool prefers_batching() const {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
     return vector_;
 #else
     return false;
@@ -404,10 +657,12 @@ public:
     const uint8_t *in = input.data();
     uint8_t *out = output.data();
     size_t i = 0;
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
+#if defined(CTL_LEA_WIDE_AVX2)
     if (wide_)
       for (; i + wide_blocks <= count; i += wide_blocks)
         eight<true>(in + i * block_size, out + i * block_size);
+#endif
     if (vector_)
       for (; i + vector_blocks <= count; i += vector_blocks)
         four<true>(in + i * block_size, out + i * block_size);
@@ -433,10 +688,12 @@ public:
     const uint8_t *in = input.data();
     uint8_t *out = output.data();
     size_t i = 0;
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
+#if defined(CTL_LEA_WIDE_AVX2)
     if (wide_)
       for (; i + wide_blocks <= count; i += wide_blocks)
         eight<false>(in + i * block_size, out + i * block_size);
+#endif
     if (vector_)
       for (; i + vector_blocks <= count; i += vector_blocks)
         four<false>(in + i * block_size, out + i * block_size);
@@ -497,11 +754,13 @@ public:
    */
   void encrypt_batch_masked(batch_view input, batch_view mask,
                             writable_batch_view output) const {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
+#if defined(CTL_LEA_WIDE_AVX2)
     if (wide_) {
       eight_combined<true, true>(input.data(), mask.data(), output.data());
       return;
     }
+#endif
     if (vector_) {
       for (size_t i = 0; i < preferred_batch; i += vector_blocks)
         four_combined<true, true>(input.data() + i * block_size,
@@ -525,11 +784,13 @@ public:
    */
   void decrypt_batch_masked(batch_view input, batch_view mask,
                             writable_batch_view output) const {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
+#if defined(CTL_LEA_WIDE_AVX2)
     if (wide_) {
       eight_combined<false, true>(input.data(), mask.data(), output.data());
       return;
     }
+#endif
     if (vector_) {
       for (size_t i = 0; i < preferred_batch; i += vector_blocks)
         four_combined<false, true>(input.data() + i * block_size,
@@ -556,11 +817,13 @@ public:
    */
   void encrypt_batch_then_xor(batch_view input, batch_view operand,
                               writable_batch_view output) const {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
+#if defined(CTL_LEA_WIDE_AVX2)
     if (wide_) {
       eight_combined<true, false>(input.data(), operand.data(), output.data());
       return;
     }
+#endif
     if (vector_) {
       for (size_t i = 0; i < preferred_batch; i += vector_blocks)
         four_combined<true, false>(input.data() + i * block_size,
@@ -578,88 +841,61 @@ public:
   }
 
 private:
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
   /**
-   * @brief Rotates each of the four lanes left
-   *
-   * There is no rotate instruction below AVX-512, so it is the usual pair of
-   * shifts and an or. Three instructions where the scalar path has one is the
-   * price of the vector path, and four lanes is what pays it.
+   * @brief The lane operations of whichever vector path was compiled in
    */
-  template <unsigned int _N>
-  static CTL_TARGET_SSE2 CTL_FORCEINLINE __m128i rotl_lanes(__m128i v) {
-    return _mm_or_si128(_mm_slli_epi32(v, _N), _mm_srli_epi32(v, 32 - _N));
-  }
+  typedef lea_detail::lanes lanes;
 
   /**
-   * @brief Rotates each of the four lanes right
+   * @brief Four blocks, one to a lane
    */
-  template <unsigned int _N>
-  static CTL_TARGET_SSE2 CTL_FORCEINLINE __m128i rotr_lanes(__m128i v) {
-    return _mm_or_si128(_mm_srli_epi32(v, _N), _mm_slli_epi32(v, 32 - _N));
-  }
-
-  /**
-   * @brief Exchanges rows and columns of four blocks
-   *
-   * Blocks arrive one after another, so a register loaded straight from memory
-   * holds the four words of one block. The round wants the opposite: one word
-   * of each of four blocks, so that a lane is a block and the four of them go
-   * through the round together. This is that exchange, and it is its own
-   * inverse, so the same eight instructions put the result back.
-   */
-  static CTL_TARGET_SSE2 CTL_FORCEINLINE void
-  transpose(__m128i &a, __m128i &b, __m128i &c, __m128i &d) {
-    const __m128i ab_low = _mm_unpacklo_epi32(a, b);
-    const __m128i ab_high = _mm_unpackhi_epi32(a, b);
-    const __m128i cd_low = _mm_unpacklo_epi32(c, d);
-    const __m128i cd_high = _mm_unpackhi_epi32(c, d);
-    a = _mm_unpacklo_epi64(ab_low, cd_low);
-    b = _mm_unpackhi_epi64(ab_low, cd_low);
-    c = _mm_unpacklo_epi64(ab_high, cd_high);
-    d = _mm_unpackhi_epi64(ab_high, cd_high);
-  }
+  typedef typename lanes::type vector;
 
   /**
    * @brief Runs every round over four blocks held one to a lane
    *
-   * The same sequence the scalar path runs, with each operation applied to four
-   * lanes at once. Nothing here looks outside its own lane, which is the whole
-   * reason this works.
+   * The same sequence the block at a time path runs, with each operation
+   * applied to four lanes at once. Nothing here looks outside its own lane,
+   * which is the whole reason this works and the reason it reads the same on
+   * every architecture.
    *
    * @tparam _Encrypt true to encrypt, false to decrypt
    */
   template <bool _Encrypt>
-  CTL_TARGET_SSE2 CTL_FORCEINLINE void
-  rounds_lanes(__m128i &x0, __m128i &x1, __m128i &x2, __m128i &x3) const {
+  CTL_FORCEINLINE void rounds_lanes(vector &x0, vector &x1, vector &x2,
+                                    vector &x3) const {
     if constexpr (_Encrypt) {
       for (size_t i = 0; i < rounds; ++i) {
         const uint32_t(&rk)[round_key_words][wide_blocks] = rkv_[i];
-        const __m128i carried = x0;
-        x0 = rotl_lanes<9>(_mm_add_epi32(_mm_xor_si128(x0, load_key(rk[0])),
-                                         _mm_xor_si128(x1, load_key(rk[1]))));
-        x1 = rotr_lanes<5>(_mm_add_epi32(_mm_xor_si128(x1, load_key(rk[2])),
-                                         _mm_xor_si128(x2, load_key(rk[3]))));
-        x2 = rotr_lanes<3>(_mm_add_epi32(_mm_xor_si128(x2, load_key(rk[4])),
-                                         _mm_xor_si128(x3, load_key(rk[5]))));
+        const vector carried = x0;
+        x0 = lanes::template rotl<9>(
+            lanes::add(lanes::bitxor(x0, lanes::read(rk[0])),
+                       lanes::bitxor(x1, lanes::read(rk[1]))));
+        x1 = lanes::template rotr<5>(
+            lanes::add(lanes::bitxor(x1, lanes::read(rk[2])),
+                       lanes::bitxor(x2, lanes::read(rk[3]))));
+        x2 = lanes::template rotr<3>(
+            lanes::add(lanes::bitxor(x2, lanes::read(rk[4])),
+                       lanes::bitxor(x3, lanes::read(rk[5]))));
         x3 = carried;
       }
     } else {
       for (size_t i = rounds; i-- > 0;) {
         const uint32_t(&rk)[round_key_words][wide_blocks] = rkv_[i];
-        const __m128i p0 = x3;
-        const __m128i p1 = _mm_xor_si128(
-            _mm_sub_epi32(rotr_lanes<9>(x0),
-                          _mm_xor_si128(p0, load_key(rk[0]))),
-            load_key(rk[1]));
-        const __m128i p2 = _mm_xor_si128(
-            _mm_sub_epi32(rotl_lanes<5>(x1),
-                          _mm_xor_si128(p1, load_key(rk[2]))),
-            load_key(rk[3]));
-        const __m128i p3 = _mm_xor_si128(
-            _mm_sub_epi32(rotl_lanes<3>(x2),
-                          _mm_xor_si128(p2, load_key(rk[4]))),
-            load_key(rk[5]));
+        const vector p0 = x3;
+        const vector p1 = lanes::bitxor(
+            lanes::sub(lanes::template rotr<9>(x0),
+                       lanes::bitxor(p0, lanes::read(rk[0]))),
+            lanes::read(rk[1]));
+        const vector p2 = lanes::bitxor(
+            lanes::sub(lanes::template rotl<5>(x1),
+                       lanes::bitxor(p1, lanes::read(rk[2]))),
+            lanes::read(rk[3]));
+        const vector p3 = lanes::bitxor(
+            lanes::sub(lanes::template rotl<3>(x2),
+                       lanes::bitxor(p2, lanes::read(rk[4]))),
+            lanes::read(rk[5]));
         x0 = p0;
         x1 = p1;
         x2 = p2;
@@ -669,32 +905,35 @@ private:
   }
 
   /**
-   * @brief Reads one round key word already spread across the lanes
-   */
-  static CTL_TARGET_SSE2 CTL_FORCEINLINE __m128i load_key(const uint32_t *at) {
-    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(at));
-  }
-
-  /**
    * @brief Transforms four blocks
+   *
+   * Blocks arrive one after another, so a register loaded straight from memory
+   * holds the four words of one block. The round wants the opposite: one word
+   * of each of four blocks, so that a lane is a block. That is what the
+   * exchange is for, and it is its own inverse, so the same one puts the result
+   * back.
+   *
+   * The words of LEA are little endian, which on every processor this path runs
+   * on is the order the bytes are already in, so the load needs no rearranging.
+   * This is where AES and ARIA would have to shuffle.
    *
    * @tparam _Encrypt true to encrypt, false to decrypt
    */
   template <bool _Encrypt>
-  CTL_TARGET_SSE2 void four(const uint8_t *input, uint8_t *output) const {
-    __m128i a = load_block(input + 0 * block_size);
-    __m128i b = load_block(input + 1 * block_size);
-    __m128i c = load_block(input + 2 * block_size);
-    __m128i d = load_block(input + 3 * block_size);
+  void four(const uint8_t *input, uint8_t *output) const {
+    vector a = lanes::load(input + 0 * block_size);
+    vector b = lanes::load(input + 1 * block_size);
+    vector c = lanes::load(input + 2 * block_size);
+    vector d = lanes::load(input + 3 * block_size);
 
-    transpose(a, b, c, d);
+    lanes::transpose(a, b, c, d);
     rounds_lanes<_Encrypt>(a, b, c, d);
-    transpose(a, b, c, d);
+    lanes::transpose(a, b, c, d);
 
-    store_block(a, output + 0 * block_size);
-    store_block(b, output + 1 * block_size);
-    store_block(c, output + 2 * block_size);
-    store_block(d, output + 3 * block_size);
+    lanes::store(a, output + 0 * block_size);
+    lanes::store(b, output + 1 * block_size);
+    lanes::store(c, output + 2 * block_size);
+    lanes::store(d, output + 3 * block_size);
   }
 
   /**
@@ -710,54 +949,37 @@ private:
    * counter based mode needs
    */
   template <bool _Encrypt, bool _MaskInput>
-  CTL_TARGET_SSE2 void four_combined(const uint8_t *input, const uint8_t *mask,
-                                     uint8_t *output) const {
-    __m128i a = load_block(input + 0 * block_size);
-    __m128i b = load_block(input + 1 * block_size);
-    __m128i c = load_block(input + 2 * block_size);
-    __m128i d = load_block(input + 3 * block_size);
+  void four_combined(const uint8_t *input, const uint8_t *mask,
+                     uint8_t *output) const {
+    vector a = lanes::load(input + 0 * block_size);
+    vector b = lanes::load(input + 1 * block_size);
+    vector c = lanes::load(input + 2 * block_size);
+    vector d = lanes::load(input + 3 * block_size);
 
-    const __m128i m0 = load_block(mask + 0 * block_size);
-    const __m128i m1 = load_block(mask + 1 * block_size);
-    const __m128i m2 = load_block(mask + 2 * block_size);
-    const __m128i m3 = load_block(mask + 3 * block_size);
+    const vector m0 = lanes::load(mask + 0 * block_size);
+    const vector m1 = lanes::load(mask + 1 * block_size);
+    const vector m2 = lanes::load(mask + 2 * block_size);
+    const vector m3 = lanes::load(mask + 3 * block_size);
 
     if constexpr (_MaskInput) {
-      a = _mm_xor_si128(a, m0);
-      b = _mm_xor_si128(b, m1);
-      c = _mm_xor_si128(c, m2);
-      d = _mm_xor_si128(d, m3);
+      a = lanes::bitxor(a, m0);
+      b = lanes::bitxor(b, m1);
+      c = lanes::bitxor(c, m2);
+      d = lanes::bitxor(d, m3);
     }
 
-    transpose(a, b, c, d);
+    lanes::transpose(a, b, c, d);
     rounds_lanes<_Encrypt>(a, b, c, d);
-    transpose(a, b, c, d);
+    lanes::transpose(a, b, c, d);
 
-    store_block(_mm_xor_si128(a, m0), output + 0 * block_size);
-    store_block(_mm_xor_si128(b, m1), output + 1 * block_size);
-    store_block(_mm_xor_si128(c, m2), output + 2 * block_size);
-    store_block(_mm_xor_si128(d, m3), output + 3 * block_size);
+    lanes::store(lanes::bitxor(a, m0), output + 0 * block_size);
+    lanes::store(lanes::bitxor(b, m1), output + 1 * block_size);
+    lanes::store(lanes::bitxor(c, m2), output + 2 * block_size);
+    lanes::store(lanes::bitxor(d, m3), output + 3 * block_size);
   }
+#endif
 
-  /**
-   * @brief Reads one block
-   *
-   * The words of LEA are little endian, which is the order the bytes are
-   * already in on the processors this path runs on, so the load needs no
-   * rearranging. This is where AES and ARIA would have to shuffle.
-   */
-  static CTL_TARGET_SSE2 CTL_FORCEINLINE __m128i load_block(const uint8_t *at) {
-    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(at));
-  }
-
-  /**
-   * @brief Writes one block
-   */
-  static CTL_TARGET_SSE2 CTL_FORCEINLINE void store_block(__m128i v,
-                                                          uint8_t *at) {
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(at), v);
-  }
-
+#if defined(CTL_LEA_WIDE_AVX2)
   // The wide path repeats the narrow one with twice the lanes. The one thing
   // that is not a simple substitution is where the blocks are picked up from,
   // and that is what the pairing below is about.
@@ -962,16 +1184,18 @@ private:
    */
   uint32_t rk_[rounds][round_key_words];
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_LEA_HAS_LANES)
   /**
    * @brief Whether the vector path is used, decided once when the key is set
    */
   bool vector_;
 
+#if defined(CTL_LEA_WIDE_AVX2)
   /**
    * @brief Whether the wide vector path is used, decided at the same time
    */
   bool wide_;
+#endif
 
   /**
    * @brief The same round keys with each word repeated across the lanes
