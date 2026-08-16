@@ -118,12 +118,12 @@ template <class Cipher> void check_paths_agree() {
     }
 
     cipher.encrypt_block(block, by_dispatch);
-    cipher.encrypt_block_software(block, by_software);
+    cipher.encrypt_block_reference(block, by_software);
     ASSERT_EQ(test::to_hex(by_software), test::to_hex(by_dispatch))
         << "encrypt mismatch at round " << round;
 
     cipher.decrypt_block(by_dispatch, by_dispatch);
-    cipher.decrypt_block_software(by_software, by_software);
+    cipher.decrypt_block_reference(by_software, by_software);
     ASSERT_EQ(test::to_hex(by_software), test::to_hex(by_dispatch))
         << "decrypt mismatch at round " << round;
     ASSERT_EQ(test::to_hex(block), test::to_hex(by_dispatch))

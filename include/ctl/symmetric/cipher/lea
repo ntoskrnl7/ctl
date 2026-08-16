@@ -713,10 +713,10 @@ public:
    * @param input the blocks to encrypt, a whole number of them
    * @param output where the results go, at least as long as input
    */
-  void encrypt_blocks_software(ctl::bytes input,
+  void encrypt_blocks_reference(ctl::bytes input,
                                ctl::writable_bytes output) const {
     const size_t count = ctl::detail::require_whole_blocks(
-        "ctl::symmetric::cipher::lea::encrypt_blocks_software", input, output,
+        "ctl::symmetric::cipher::lea::encrypt_blocks_reference", input, output,
         block_size);
     for (size_t i = 0; i < count; ++i)
       encrypt_block(block_view(input.data() + i * block_size),
@@ -730,10 +730,10 @@ public:
    * @param input the blocks to decrypt, a whole number of them
    * @param output where the results go, at least as long as input
    */
-  void decrypt_blocks_software(ctl::bytes input,
+  void decrypt_blocks_reference(ctl::bytes input,
                                ctl::writable_bytes output) const {
     const size_t count = ctl::detail::require_whole_blocks(
-        "ctl::symmetric::cipher::lea::decrypt_blocks_software", input, output,
+        "ctl::symmetric::cipher::lea::decrypt_blocks_reference", input, output,
         block_size);
     for (size_t i = 0; i < count; ++i)
       decrypt_block(block_view(input.data() + i * block_size),
@@ -837,6 +837,7 @@ public:
       encrypt_block(block_view(input.data() + i * block_size), buffer);
       ctl::detail::xor_block<block_size>(buffer, operand.data() + i * block_size,
                                         output.data() + i * block_size);
+      ctl::detail::secure_zero(buffer, sizeof(buffer));
     }
   }
 

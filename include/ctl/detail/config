@@ -29,14 +29,23 @@
 #endif
 
 /**
- * Whether the hardware accelerated paths are compiled in
+ * Whether the x86 accelerated paths are compiled in
  *
- * The accelerated paths implemented so far are AES-NI and PCLMULQDQ on x86.
- * There is no ARMv8 Crypto Extensions path yet, so ARM targets use the
- * software path only.
+ * AES-NI and PCLMULQDQ, and the vector path of LEA.
  */
 #if defined(CTL_ARCH_X86) && !defined(CTL_NO_HW_ACCEL)
 #define CTL_HAS_X86_HW_ACCEL 1
+#endif
+
+/**
+ * Whether the ARM accelerated paths are compiled in
+ *
+ * The cryptographic instructions of ARMv8, which are optional, so whether they
+ * are used is still decided at run time. NEON is separate and is not optional,
+ * which is why the vector path of LEA does not appear here.
+ */
+#if defined(CTL_ARCH_ARM64) && !defined(CTL_NO_HW_ACCEL)
+#define CTL_HAS_ARM_HW_ACCEL 1
 #endif
 
 /**
@@ -57,6 +66,20 @@
 #define CTL_TARGET_PCLMUL
 #define CTL_TARGET_SSE2
 #define CTL_TARGET_AVX2
+#endif
+
+/**
+ * Attribute that enables the ARMv8 cryptographic instructions for one function
+ *
+ * They are optional, so a binary that is to run anywhere cannot be built with
+ * them globally. GCC and Clang can turn them on for a single function, which
+ * is what lets the decision be made at run time. MSVC on ARM64 accepts the
+ * intrinsics unconditionally.
+ */
+#if defined(CTL_HAS_ARM_HW_ACCEL) && (defined(__GNUC__) || defined(__clang__))
+#define CTL_TARGET_ARM_CRYPTO __attribute__((target("+crypto")))
+#else
+#define CTL_TARGET_ARM_CRYPTO
 #endif
 
 /**

@@ -156,14 +156,14 @@ template <class Cipher> void check_paths_agree() {
     std::vector<uint8_t> by_software(plain.size());
 
     cipher.encrypt_blocks(plain, by_dispatch);
-    cipher.encrypt_blocks_software(plain, by_software);
+    cipher.encrypt_blocks_reference(plain, by_software);
     ASSERT_EQ(test::to_hex(by_software), test::to_hex(by_dispatch))
         << "encrypt mismatch over " << blocks << " blocks";
 
     std::vector<uint8_t> back_dispatch(plain.size());
     std::vector<uint8_t> back_software(plain.size());
     cipher.decrypt_blocks(by_dispatch, back_dispatch);
-    cipher.decrypt_blocks_software(by_dispatch, back_software);
+    cipher.decrypt_blocks_reference(by_dispatch, back_software);
     ASSERT_EQ(test::to_hex(back_software), test::to_hex(back_dispatch))
         << "decrypt mismatch over " << blocks << " blocks";
     ASSERT_EQ(test::to_hex(plain), test::to_hex(back_dispatch))

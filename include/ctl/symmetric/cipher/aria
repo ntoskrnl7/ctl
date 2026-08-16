@@ -617,7 +617,7 @@ public:
    * @param input the block to encrypt
    * @param output where the result goes, may be the same buffer as input
    */
-  void encrypt_block_software(block_view input,
+  void encrypt_block_reference(block_view input,
                               writable_block_view output) const {
     crypt_software(ek_, input.data(), output.data());
   }
@@ -628,7 +628,7 @@ public:
    * @param input the block to decrypt
    * @param output where the result goes, may be the same buffer as input
    */
-  void decrypt_block_software(block_view input,
+  void decrypt_block_reference(block_view input,
                               writable_block_view output) const {
     crypt_software(dk_, input.data(), output.data());
   }

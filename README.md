@@ -219,8 +219,12 @@ block and past that limit the key stream repeats.
 
 Chosen at run time through CPUID, so one binary runs anywhere.
 
-- **AES-NI** for AES, interleaving eight blocks so the parallel modes reach the
-  throughput the instruction can sustain rather than its latency.
+- **AES-NI on x86 and the ARMv8 cryptographic instructions on ARM** for AES,
+  interleaving eight blocks so the parallel modes reach the throughput the
+  instruction can sustain rather than its latency. The two divide a round
+  differently: AESENC ends with the round key and AESE begins with it, so the
+  schedule is offset by one between them, and decryption takes the equivalent
+  inverse cipher keys on both but reads them in opposite directions.
 - **PCLMULQDQ** for the GHASH of GCM, folding four blocks into a single
   reduction.
 - **AES-NI and SSSE3 for ARIA**, which has no instruction of its own. Its SB1 is
@@ -349,15 +353,15 @@ handling and the vector paths are covered rather than assumed.
 
 | | How | Result |
 | --- | --- | --- |
-| x86-64, AES-NI and AVX2 | on the machine | 91 tests |
-| x86-64, `CTL_NO_HW_ACCEL` | on the machine | 91 tests |
-| ARM64, NEON | cross built, run under qemu | 91 tests |
-| ARM 32 bit, NEON | cross built, run under qemu | 91 tests |
-| MIPS64 little endian, MSA | cross built, run under qemu | 91 tests |
+| x86-64, AES-NI and AVX2 | on the machine | 112 tests |
+| x86-64, `CTL_NO_HW_ACCEL` | on the machine | 112 tests |
+| ARM64, cryptographic instructions and NEON | cross built, run under qemu | 112 tests |
+| ARM 32 bit, NEON | cross built, run under qemu | 112 tests |
+| MIPS64 little endian, MSA | cross built, run under qemu | 112 tests |
 | MIPS64 big endian, MSA | not supported, see below | |
-| MIPS64 little endian, no MSA | cross built, run under qemu | 91 tests |
-| MIPS64 big endian | cross built, run under qemu | 91 tests |
-| MIPS32r2, no SIMD of any kind | cross built, run under qemu | 91 tests |
+| MIPS64 little endian, no MSA | cross built, run under qemu | 112 tests |
+| MIPS64 big endian | cross built, run under qemu | 112 tests |
+| MIPS32r2, no SIMD of any kind | cross built, run under qemu | 112 tests |
 
 The MIPS32r2 row is the oldest thing here: a single core with no MSA, since
 that needs release 5, and no cryptographic instructions, since MIPS has none at

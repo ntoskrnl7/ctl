@@ -29,12 +29,21 @@
 #include <ctl/detail/memory>
 #include <ctl/detail/sbox>
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <immintrin.h>
 #endif
+#elif defined(CTL_HAS_ARM_HW_ACCEL)
+#include <arm_neon.h>
+#endif
+
+/**
+ * Whether there is a hardware path at all, whichever architecture provides it
+ */
+#if defined(CTL_AES_HAS_HARDWARE) || defined(CTL_HAS_ARM_HW_ACCEL)
+#define CTL_AES_HAS_HARDWARE 1
 #endif
 
 namespace ctl {
@@ -238,7 +247,7 @@ public:
   ~aes() {
     ctl::detail::secure_zero(ek_, sizeof(ek_));
     ctl::detail::secure_zero(dk_, sizeof(dk_));
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     ctl::detail::secure_zero(ek_bytes_, sizeof(ek_bytes_));
     ctl::detail::secure_zero(dk_bytes_, sizeof(dk_bytes_));
 #endif
@@ -282,12 +291,16 @@ public:
       for (size_t c = 0; c < 4; ++c)
         dk_[4 * r + c] = inv_mix_column(dk_[4 * r + c]);
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     // The hardware path loads round keys in byte order, so a separate copy is
     // prepared. The decryption round keys of the equivalent inverse cipher
     // match exactly what the AESDEC instruction expects and can be used as
     // they are.
+#if defined(CTL_HAS_X86_HW_ACCEL)
     hardware_ = ctl::detail::cpu::has_aes();
+#else
+    hardware_ = ctl::detail::cpu::has_arm_aes();
+#endif
     if (hardware_) {
       for (size_t i = 0; i < round_key_words; ++i) {
         ctl::detail::store_be32(ek_[i], ek_bytes_ + 4 * i);
@@ -308,13 +321,17 @@ public:
    * @param output where the result goes, may be the same buffer as input
    */
   void encrypt_block(block_view input, writable_block_view output) const {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     if (hardware_) {
+#if defined(CTL_HAS_X86_HW_ACCEL)
       encrypt_block_aes_ni(input.data(), output.data());
+#else
+      encrypt_block_arm(input.data(), output.data());
+#endif
       return;
     }
 #endif
-    encrypt_block_software(input, output);
+    encrypt_block_reference(input, output);
   }
 
   /**
@@ -326,7 +343,7 @@ public:
    * @param input the block to encrypt
    * @param output where the result goes, may be the same buffer as input
    */
-  void encrypt_block_software(block_view input,
+  void encrypt_block_reference(block_view input,
                               writable_block_view output) const {
     uint32_t s0 = ctl::detail::load_be32(input.data() + 0) ^ ek_[0];
     uint32_t s1 = ctl::detail::load_be32(input.data() + 4) ^ ek_[1];
@@ -370,13 +387,17 @@ public:
    * @param output where the result goes, may be the same buffer as input
    */
   void decrypt_block(block_view input, writable_block_view output) const {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     if (hardware_) {
+#if defined(CTL_HAS_X86_HW_ACCEL)
       decrypt_block_aes_ni(input.data(), output.data());
+#else
+      decrypt_block_arm(input.data(), output.data());
+#endif
       return;
     }
 #endif
-    decrypt_block_software(input, output);
+    decrypt_block_reference(input, output);
   }
 
   /**
@@ -387,7 +408,7 @@ public:
    * buffer. Modes of operation consult this to choose their path.
    */
   bool prefers_batching() const {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     return hardware_;
 #else
     return false;
@@ -419,19 +440,18 @@ public:
         block_size);
     const uint8_t *in = input.data();
     uint8_t *out = output.data();
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     if (hardware_) {
       size_t i = 0;
       for (; i + preferred_batch <= count; i += preferred_batch)
-        encrypt_wide_aes_ni<preferred_batch>(in + i * block_size,
-                                            out + i * block_size);
+        encrypt_wide<preferred_batch>(in + i * block_size, out + i * block_size);
       for (; i < count; ++i)
-        encrypt_block_aes_ni(in + i * block_size, out + i * block_size);
+        encrypt_block_one(in + i * block_size, out + i * block_size);
       return;
     }
 #endif
     for (size_t i = 0; i < count; ++i)
-      encrypt_block_software(block_view(in + i * block_size),
+      encrypt_block_reference(block_view(in + i * block_size),
                              writable_block_view(out + i * block_size));
   }
 
@@ -450,19 +470,18 @@ public:
         block_size);
     const uint8_t *in = input.data();
     uint8_t *out = output.data();
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     if (hardware_) {
       size_t i = 0;
       for (; i + preferred_batch <= count; i += preferred_batch)
-        decrypt_wide_aes_ni<preferred_batch>(in + i * block_size,
-                                            out + i * block_size);
+        decrypt_wide<preferred_batch>(in + i * block_size, out + i * block_size);
       for (; i < count; ++i)
-        decrypt_block_aes_ni(in + i * block_size, out + i * block_size);
+        decrypt_block_one(in + i * block_size, out + i * block_size);
       return;
     }
 #endif
     for (size_t i = 0; i < count; ++i)
-      decrypt_block_software(block_view(in + i * block_size),
+      decrypt_block_reference(block_view(in + i * block_size),
                              writable_block_view(out + i * block_size));
   }
 
@@ -496,9 +515,9 @@ public:
     const uint8_t *in = input.data();
     const uint8_t *m = mask.data();
     uint8_t *out = output.data();
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     if (hardware_) {
-      wide_masked_aes_ni<preferred_batch, true, true>(in, m, out);
+      wide_masked<preferred_batch, true, true>(in, m, out);
       return;
     }
 #endif
@@ -521,9 +540,9 @@ public:
     const uint8_t *in = input.data();
     const uint8_t *m = mask.data();
     uint8_t *out = output.data();
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     if (hardware_) {
-      wide_masked_aes_ni<preferred_batch, false, true>(in, m, out);
+      wide_masked<preferred_batch, false, true>(in, m, out);
       return;
     }
 #endif
@@ -549,9 +568,9 @@ public:
     const uint8_t *in = input.data();
     const uint8_t *op = operand.data();
     uint8_t *out = output.data();
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
     if (hardware_) {
-      wide_masked_aes_ni<preferred_batch, true, false>(in, op, out);
+      wide_masked<preferred_batch, true, false>(in, op, out);
       return;
     }
 #endif
@@ -566,7 +585,7 @@ public:
    * @param input the block to decrypt
    * @param output where the result goes, may be the same buffer as input
    */
-  void decrypt_block_software(block_view input,
+  void decrypt_block_reference(block_view input,
                               writable_block_view output) const {
     uint32_t s0 = ctl::detail::load_be32(input.data() + 0) ^ dk_[0];
     uint32_t s1 = ctl::detail::load_be32(input.data() + 4) ^ dk_[1];
@@ -733,6 +752,71 @@ private:
     ctl::detail::xor_block<block_size>(buffer, operand, output);
   }
 
+#if defined(CTL_AES_HAS_HARDWARE)
+  /**
+   * @brief Encrypts one block on whichever hardware path there is
+   */
+  CTL_FORCEINLINE void encrypt_block_one(const uint8_t *input,
+                                         uint8_t *output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    encrypt_block_aes_ni(input, output);
+#else
+    encrypt_block_arm(input, output);
+#endif
+  }
+
+  /**
+   * @brief Decrypts one block on whichever hardware path there is
+   */
+  CTL_FORCEINLINE void decrypt_block_one(const uint8_t *input,
+                                         uint8_t *output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    decrypt_block_aes_ni(input, output);
+#else
+    decrypt_block_arm(input, output);
+#endif
+  }
+
+  /**
+   * @brief Encrypts _Width blocks on whichever hardware path there is
+   */
+  template <size_t _Width>
+  CTL_FORCEINLINE void encrypt_wide(const uint8_t *input,
+                                    uint8_t *output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    encrypt_wide_aes_ni<_Width>(input, output);
+#else
+    encrypt_wide_arm<_Width>(input, output);
+#endif
+  }
+
+  /**
+   * @brief Decrypts _Width blocks on whichever hardware path there is
+   */
+  template <size_t _Width>
+  CTL_FORCEINLINE void decrypt_wide(const uint8_t *input,
+                                    uint8_t *output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    decrypt_wide_aes_ni<_Width>(input, output);
+#else
+    decrypt_wide_arm<_Width>(input, output);
+#endif
+  }
+
+  /**
+   * @brief Transforms _Width blocks with a mask, on whichever path there is
+   */
+  template <size_t _Width, bool _Encrypt, bool _MaskInput>
+  CTL_FORCEINLINE void wide_masked(const uint8_t *input, const uint8_t *mask,
+                                   uint8_t *output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    wide_masked_aes_ni<_Width, _Encrypt, _MaskInput>(input, mask, output);
+#else
+    wide_masked_arm<_Width, _Encrypt, _MaskInput>(input, mask, output);
+#endif
+  }
+#endif
+
 #if defined(CTL_HAS_X86_HW_ACCEL)
   /**
    * @brief Encrypts one block with AES-NI
@@ -897,6 +981,162 @@ private:
   }
 #endif
 
+#if defined(CTL_HAS_ARM_HW_ACCEL)
+  /**
+   * @brief One round of encryption with the ARMv8 instructions
+   *
+   * AESE and AESENC do not divide the round the same way, and getting that
+   * wrong is the whole difficulty here.
+   *
+   * AESENC on x86 is ShiftRows, SubBytes, MixColumns and then the round key.
+   * AESE on ARM is the round key first, then SubBytes and ShiftRows, with
+   * MixColumns left to AESMC. So the key that goes into a round here is the one
+   * the round before it would have finished with on x86, and the schedule ends
+   * up shifted by one: the loop stops one short, one more AESE follows without
+   * a MixColumns, and the last key is applied with a plain exclusive or.
+   */
+  static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE uint8x16_t
+  round_arm(uint8x16_t state, uint8x16_t key) {
+    return vaesmcq_u8(vaeseq_u8(state, key));
+  }
+
+  /**
+   * @brief One round of decryption with the ARMv8 instructions
+   */
+  static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE uint8x16_t
+  inverse_round_arm(uint8x16_t state, uint8x16_t key) {
+    return vaesimcq_u8(vaesdq_u8(state, key));
+  }
+
+  /**
+   * @brief Reads one round key
+   */
+  static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE uint8x16_t
+  round_key_arm(const uint8_t *at, size_t index) {
+    return vld1q_u8(at + index * block_size);
+  }
+
+  /**
+   * @brief Encrypts _Width blocks with the ARMv8 instructions
+   *
+   * The same reason for interleaving as on x86: the instruction has a latency
+   * as well as a throughput, and a lone block waits out the latency every
+   * round.
+   */
+  template <size_t _Width>
+  CTL_TARGET_ARM_CRYPTO void encrypt_wide_arm(const uint8_t *input,
+                                              uint8_t *output) const {
+    uint8x16_t state[_Width];
+    for (size_t w = 0; w < _Width; ++w)
+      state[w] = vld1q_u8(input + w * block_size);
+
+    for (size_t round = 0; round + 1 < rounds; ++round) {
+      const uint8x16_t key = round_key_arm(ek_bytes_, round);
+      for (size_t w = 0; w < _Width; ++w)
+        state[w] = round_arm(state[w], key);
+    }
+
+    const uint8x16_t last = round_key_arm(ek_bytes_, rounds - 1);
+    const uint8x16_t final = round_key_arm(ek_bytes_, rounds);
+    for (size_t w = 0; w < _Width; ++w) {
+      state[w] = veorq_u8(vaeseq_u8(state[w], last), final);
+      vst1q_u8(output + w * block_size, state[w]);
+    }
+  }
+
+  /**
+   * @brief Decrypts _Width blocks with the ARMv8 instructions
+   *
+   * The decryption keys of the equivalent inverse cipher, the same ones AESDEC
+   * takes on x86, and read in the same direction. That is worth stating,
+   * because the obvious alternative is wrong: AESD applies its key before the
+   * inverse steps, so it looks as though the plain schedule read backwards
+   * would do. It would not. AESIMC lands between one key and the next, which is
+   * exactly the arrangement the equivalent inverse cipher exists to describe,
+   * and its keys are the ones that already have InvMixColumns folded in.
+   */
+  template <size_t _Width>
+  CTL_TARGET_ARM_CRYPTO void decrypt_wide_arm(const uint8_t *input,
+                                              uint8_t *output) const {
+    uint8x16_t state[_Width];
+    for (size_t w = 0; w < _Width; ++w)
+      state[w] = vld1q_u8(input + w * block_size);
+
+    for (size_t round = 0; round + 1 < rounds; ++round) {
+      const uint8x16_t key = round_key_arm(dk_bytes_, round);
+      for (size_t w = 0; w < _Width; ++w)
+        state[w] = inverse_round_arm(state[w], key);
+    }
+
+    const uint8x16_t last = round_key_arm(dk_bytes_, rounds - 1);
+    const uint8x16_t final = round_key_arm(dk_bytes_, rounds);
+    for (size_t w = 0; w < _Width; ++w) {
+      state[w] = veorq_u8(vaesdq_u8(state[w], last), final);
+      vst1q_u8(output + w * block_size, state[w]);
+    }
+  }
+
+  /**
+   * @brief Encrypts one block with the ARMv8 instructions
+   */
+  CTL_TARGET_ARM_CRYPTO void encrypt_block_arm(const uint8_t *input,
+                                               uint8_t *output) const {
+    encrypt_wide_arm<1>(input, output);
+  }
+
+  /**
+   * @brief Decrypts one block with the ARMv8 instructions
+   */
+  CTL_TARGET_ARM_CRYPTO void decrypt_block_arm(const uint8_t *input,
+                                               uint8_t *output) const {
+    decrypt_wide_arm<1>(input, output);
+  }
+
+  /**
+   * @brief Transforms _Width blocks with a mask applied on both sides
+   *
+   * Everything stays in registers between the two exclusive ors, exactly as on
+   * x86 and for the same reason.
+   */
+  template <size_t _Width, bool _Encrypt, bool _MaskInput>
+  CTL_TARGET_ARM_CRYPTO void wide_masked_arm(const uint8_t *input,
+                                             const uint8_t *mask,
+                                             uint8_t *output) const {
+    uint8x16_t state[_Width];
+    for (size_t w = 0; w < _Width; ++w) {
+      state[w] = vld1q_u8(input + w * block_size);
+      if constexpr (_MaskInput)
+        state[w] = veorq_u8(state[w], vld1q_u8(mask + w * block_size));
+    }
+
+    if constexpr (_Encrypt) {
+      for (size_t round = 0; round + 1 < rounds; ++round) {
+        const uint8x16_t key = round_key_arm(ek_bytes_, round);
+        for (size_t w = 0; w < _Width; ++w)
+          state[w] = round_arm(state[w], key);
+      }
+      const uint8x16_t last = round_key_arm(ek_bytes_, rounds - 1);
+      const uint8x16_t final = round_key_arm(ek_bytes_, rounds);
+      for (size_t w = 0; w < _Width; ++w)
+        state[w] = veorq_u8(vaeseq_u8(state[w], last), final);
+    } else {
+      for (size_t round = 0; round + 1 < rounds; ++round) {
+        const uint8x16_t key = round_key_arm(dk_bytes_, round);
+        for (size_t w = 0; w < _Width; ++w)
+          state[w] = inverse_round_arm(state[w], key);
+      }
+      const uint8x16_t last = round_key_arm(dk_bytes_, rounds - 1);
+      const uint8x16_t final = round_key_arm(dk_bytes_, rounds);
+      for (size_t w = 0; w < _Width; ++w)
+        state[w] = veorq_u8(vaesdq_u8(state[w], last), final);
+    }
+
+    for (size_t w = 0; w < _Width; ++w)
+      vst1q_u8(output + w * block_size,
+               veorq_u8(state[w], vld1q_u8(mask + w * block_size)));
+  }
+#endif
+
   /**
    * @brief Round keys for encryption
    */
@@ -907,7 +1147,7 @@ private:
    */
   uint32_t dk_[round_key_words];
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_AES_HAS_HARDWARE)
   /**
    * @brief Whether AES-NI is used, determined once when the key is set
    */
