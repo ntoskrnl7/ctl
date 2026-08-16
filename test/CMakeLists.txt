@@ -50,6 +50,7 @@ file(GLOB SOURCE_FILES
   ${CMAKE_CURRENT_LIST_DIR}/*.cpp
   ${CMAKE_CURRENT_LIST_DIR}/aes/*.cpp
   ${CMAKE_CURRENT_LIST_DIR}/aria/*.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/lea/*.cpp
   ${CMAKE_CURRENT_LIST_DIR}/mode/*.cpp
 )
 

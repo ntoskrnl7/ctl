@@ -16,6 +16,7 @@
 
 #include <ctl/bytes>
 #include <ctl/symmetric/cipher/aes>
+#include <ctl/symmetric/cipher/lea>
 #include <ctl/symmetric/mode/gcm>
 
 #include "../vectors.h"
@@ -462,6 +463,35 @@ TEST(gcm, rejects_empty_iv) {
       gcm.encrypt(ctl::bytes(), {}, {plain}, output, tag);
   ASSERT_FALSE(result);
   EXPECT_EQ(mode::gcm<aes128>::invalid_iv_length, result.error().value);
+}
+
+// GCM needs a 128 bit block and nothing else from its cipher, so LEA composes
+// with it the same way AES does. There are no published vectors for that pair,
+// so what is checked is that it round trips and that a tampered tag is caught.
+TEST(gcm, composes_with_lea) {
+  using lea128 = ctl::symmetric::cipher::lea<128>;
+
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> aad = test::hex(kAad);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  mode::gcm<lea128> gcm(key);
+
+  std::vector<uint8_t> encrypted(plain.size());
+  std::vector<uint8_t> tag(mode::gcm<lea128>::tag_size);
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {plain}, encrypted, tag));
+  EXPECT_NE(test::to_hex(plain), test::to_hex(encrypted));
+
+  std::vector<uint8_t> decrypted(plain.size());
+  ASSERT_TRUE(gcm.decrypt(iv, {aad}, {encrypted}, decrypted, tag));
+  EXPECT_EQ(test::to_hex(plain), test::to_hex(decrypted));
+
+  tag[0] ^= 0x01;
+  std::vector<uint8_t> rejected(plain.size());
+  const auto result = gcm.decrypt(iv, {aad}, {encrypted}, rejected, tag);
+  ASSERT_FALSE(result);
+  EXPECT_EQ(mode::gcm<lea128>::authentication_failed, result.error().value);
 }
 
 // A tag is fixed length, so a buffer of the wrong length is refused instead of

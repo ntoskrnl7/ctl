@@ -1,0 +1,454 @@
+/**
+ * @file lea
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief LEA block cipher (KS X 3246, ISO/IEC 29192-2)
+ *
+ * A lightweight cipher published by the National Security Research Institute of
+ * Korea in 2013. The block is 128 bits and the key is 128, 192 or 256 bits, so
+ * it composes with every mode here exactly as AES and ARIA do.
+ *
+ * Where AES and ARIA substitute bytes through a table, LEA is built only from
+ * addition modulo 2^32, bitwise rotation and exclusive or. Two things follow
+ * from that, and both matter.
+ *
+ * The first is that there is no table to generate, and no table to get wrong.
+ * What the other two ciphers here spend a header on producing at compile time
+ * simply does not exist. Only the eight round constants are written out, and
+ * unlike an S-box they satisfy no property that could check them, so what
+ * confirms them is the published test vectors and nothing else.
+ *
+ * The second is that nothing is ever indexed by key dependent data. The software
+ * path of AES is table driven, which is what the note at the end of the README
+ * is about: a table lookup whose index depends on the key can leak through cache
+ * timing. LEA has no such lookup on any path, so it does not have that property
+ * to begin with, and it does not need a hardware path to avoid it.
+ *
+ * Words are little endian here, the opposite of AES, ARIA and GCM. Reading a
+ * block big endian produces a wrong answer that still round trips, so the
+ * published vectors are what catches it.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+#include <ctl/bytes>
+#include <ctl/detail/config>
+#include <ctl/detail/endian>
+#include <ctl/detail/memory>
+
+namespace ctl {
+namespace symmetric {
+namespace cipher {
+
+namespace lea_detail {
+
+/**
+ * @brief The round constants of the key schedule
+ *
+ * The only values in this library that are copied from a document and cannot be
+ * checked by any property of their own. An S-box has to be a permutation, and a
+ * round transformation table has to agree with the matrix it came from, so a
+ * mistyped byte in either fails the build. These are eight arbitrary words, and
+ * a mistyped digit here produces a cipher that is wrong and still round trips
+ * with itself. The known answer tests are what stands between that and the
+ * build passing.
+ *
+ * A key schedule of n words uses the first n of these, so LEA-128 uses four,
+ * LEA-192 six and LEA-256 all eight.
+ */
+inline constexpr uint32_t delta[8] = {0xc3efe9dbu, 0x44626b02u, 0x79e27c8au,
+                                      0x78df30ecu, 0x715ea49eu, 0xc785da0au,
+                                      0xe04ef22au, 0xe5c40957u};
+
+/**
+ * @brief How far each word of the key schedule state is rotated
+ */
+inline constexpr unsigned int key_rotations[6] = {1, 3, 6, 11, 13, 17};
+
+} // namespace lea_detail
+
+/**
+ * @brief LEA block cipher (KS X 3246, ISO/IEC 29192-2)
+ *
+ * The block size is fixed at 128 bits and only the key length is selected. Any
+ * byte string is a valid key, so setting a key cannot fail.
+ *
+ * @tparam _KeyBits key size in bits (128, 192 or 256)
+ */
+template <size_t _KeyBits = 128> class lea {
+  static_assert(_KeyBits == 128 || _KeyBits == 192 || _KeyBits == 256,
+                "LEA supports only 128, 192 and 256 bit keys. (KS X 3246)");
+
+public:
+  /**
+   * @brief Block size in bits
+   */
+  static constexpr size_t block_bits = 128;
+
+  /**
+   * @brief Block size in bytes
+   */
+  static constexpr size_t block_size = block_bits / 8;
+
+  /**
+   * @brief Key size in bits
+   */
+  static constexpr size_t key_bits = _KeyBits;
+
+  /**
+   * @brief Key size in bytes
+   */
+  static constexpr size_t key_size = key_bits / 8;
+
+  /**
+   * @brief Number of key words, which is four, six or eight
+   */
+  static constexpr size_t key_words = key_size / 4;
+
+  /**
+   * @brief Number of rounds
+   */
+  static constexpr size_t rounds = 2 * key_words + 16;
+
+  static_assert(rounds == (_KeyBits == 128 ? 24 : (_KeyBits == 192 ? 28 : 32)),
+                "LEA round count computation error");
+
+  /**
+   * @brief Number of words in one round key
+   */
+  static constexpr size_t round_key_words = 6;
+
+  /**
+   * @brief A good number of blocks to process in one batch
+   *
+   * Kept in line with the other ciphers so that a mode sizes its staging
+   * buffers the same way whichever cipher it was given.
+   */
+  static constexpr size_t preferred_batch = 8;
+
+  /**
+   * @brief Key type, for declaring storage for a key
+   */
+  typedef uint8_t key_t[key_size];
+
+  /**
+   * @brief Block type, for declaring storage for a block
+   */
+  typedef uint8_t block_t[block_size];
+
+  /**
+   * @brief A key handed over for reading
+   */
+  typedef ctl::fixed_bytes<key_size> key_view;
+
+  /**
+   * @brief A block handed over for reading
+   */
+  typedef ctl::fixed_bytes<block_size> block_view;
+
+  /**
+   * @brief A block handed over to be written
+   */
+  typedef ctl::writable_fixed_bytes<block_size> writable_block_view;
+
+  /**
+   * @brief One batch in bytes
+   */
+  static constexpr size_t batch_bytes = preferred_batch * block_size;
+
+  /**
+   * @brief One batch handed over for reading
+   */
+  typedef ctl::fixed_bytes<batch_bytes> batch_view;
+
+  /**
+   * @brief One batch handed over to be written
+   */
+  typedef ctl::writable_fixed_bytes<batch_bytes> writable_batch_view;
+
+  /**
+   * @brief Initializes with a key
+   *
+   * @param key the key
+   * @exception std::invalid_argument if the key is not key_size bytes
+   */
+  explicit lea(key_view key) { set_key(key); }
+
+  /**
+   * @brief Erases the round keys on destruction
+   */
+  ~lea() { ctl::detail::secure_zero(rk_, sizeof(rk_)); }
+
+  /**
+   * @brief Sets the key again
+   *
+   * The state starts as the key itself and every round advances it, so the
+   * round keys have to be produced in order and the whole schedule is built
+   * here rather than a round at a time.
+   *
+   * LEA-128 is the one that does not follow the general shape: its state stays
+   * four words, only four of them are updated per round, and the round key
+   * repeats one of them three times. The wider two update six of their words
+   * per round, walking around a state of six or eight, and their round key is
+   * simply those six.
+   *
+   * @param key the key
+   */
+  void set_key(key_view key) {
+    uint32_t t[key_words];
+    for (size_t i = 0; i < key_words; ++i)
+      t[i] = ctl::detail::load_le32(key.data() + 4 * i);
+
+    for (size_t i = 0; i < rounds; ++i) {
+      // The constant is rotated by the round number, which passes 32 for the
+      // wider keys, so the amount is reduced rather than shifting a word by
+      // more than its width.
+      const uint32_t d = lea_detail::delta[i % key_words];
+
+      if constexpr (key_words == 4) {
+        for (size_t j = 0; j < 4; ++j)
+          t[j] = ctl::detail::rotl32(
+              t[j] + ctl::detail::rotl32(
+                         d, static_cast<unsigned int>((i + j) & 31u)),
+              lea_detail::key_rotations[j]);
+
+        rk_[i][0] = t[0];
+        rk_[i][1] = t[1];
+        rk_[i][2] = t[2];
+        rk_[i][3] = t[1];
+        rk_[i][4] = t[3];
+        rk_[i][5] = t[1];
+      } else {
+        // For six words this picks j, since six times anything is a multiple of
+        // six; for eight it walks around the state six places per round. One
+        // expression covers both.
+        for (size_t j = 0; j < 6; ++j) {
+          const size_t at = (6 * i + j) % key_words;
+          t[at] = ctl::detail::rotl32(
+              t[at] + ctl::detail::rotl32(
+                          d, static_cast<unsigned int>((i + j) & 31u)),
+              lea_detail::key_rotations[j]);
+          rk_[i][j] = t[at];
+        }
+      }
+    }
+
+    ctl::detail::secure_zero(t, sizeof(t));
+  }
+
+  /**
+   * @brief Encrypts one block
+   *
+   * @param input the block to encrypt
+   * @param output where the result goes, may be the same buffer as input
+   */
+  void encrypt_block(block_view input, writable_block_view output) const {
+    uint32_t x0 = ctl::detail::load_le32(input.data() + 0);
+    uint32_t x1 = ctl::detail::load_le32(input.data() + 4);
+    uint32_t x2 = ctl::detail::load_le32(input.data() + 8);
+    uint32_t x3 = ctl::detail::load_le32(input.data() + 12);
+
+    for (size_t i = 0; i < rounds; ++i) {
+      const uint32_t *rk = rk_[i];
+      // The last word of the result is the first word of the input, so it is
+      // kept before the first word is overwritten. Everything else reads a word
+      // that has not been written yet, so the three assignments can stand in
+      // this order without further copies.
+      const uint32_t carried = x0;
+      x0 = ctl::detail::rotl32((x0 ^ rk[0]) + (x1 ^ rk[1]), 9);
+      x1 = ctl::detail::rotr32((x1 ^ rk[2]) + (x2 ^ rk[3]), 5);
+      x2 = ctl::detail::rotr32((x2 ^ rk[4]) + (x3 ^ rk[5]), 3);
+      x3 = carried;
+    }
+
+    ctl::detail::store_le32(x0, output.data() + 0);
+    ctl::detail::store_le32(x1, output.data() + 4);
+    ctl::detail::store_le32(x2, output.data() + 8);
+    ctl::detail::store_le32(x3, output.data() + 12);
+  }
+
+  /**
+   * @brief Decrypts one block
+   *
+   * Each round is undone in turn. The addition of the round becomes a
+   * subtraction and the rotations turn the other way, and because the first
+   * word of the round input was carried into the last word of its output, that
+   * is what the round starts from.
+   *
+   * @param input the block to decrypt
+   * @param output where the result goes, may be the same buffer as input
+   */
+  void decrypt_block(block_view input, writable_block_view output) const {
+    uint32_t x0 = ctl::detail::load_le32(input.data() + 0);
+    uint32_t x1 = ctl::detail::load_le32(input.data() + 4);
+    uint32_t x2 = ctl::detail::load_le32(input.data() + 8);
+    uint32_t x3 = ctl::detail::load_le32(input.data() + 12);
+
+    for (size_t i = rounds; i-- > 0;) {
+      const uint32_t *rk = rk_[i];
+      const uint32_t p0 = x3;
+      const uint32_t p1 =
+          (ctl::detail::rotr32(x0, 9) - (p0 ^ rk[0])) ^ rk[1];
+      const uint32_t p2 =
+          (ctl::detail::rotl32(x1, 5) - (p1 ^ rk[2])) ^ rk[3];
+      const uint32_t p3 =
+          (ctl::detail::rotl32(x2, 3) - (p2 ^ rk[4])) ^ rk[5];
+      x0 = p0;
+      x1 = p1;
+      x2 = p2;
+      x3 = p3;
+    }
+
+    ctl::detail::store_le32(x0, output.data() + 0);
+    ctl::detail::store_le32(x1, output.data() + 4);
+    ctl::detail::store_le32(x2, output.data() + 8);
+    ctl::detail::store_le32(x3, output.data() + 12);
+  }
+
+  /**
+   * @brief Whether passing blocks in batches is worthwhile
+   *
+   * There is no vector path yet, so batching would only add the cost of moving
+   * data through the staging buffers of the mode of operation.
+   */
+  bool prefers_batching() const { return false; }
+
+  /**
+   * @brief Encrypts several mutually independent blocks
+   *
+   * @param input the blocks to encrypt, a whole number of them
+   * @param output where the results go, at least as long as input and may be
+   * the same buffer
+   * @exception std::invalid_argument if input is not a whole number of blocks,
+   * or if output is shorter than input
+   */
+  void encrypt_blocks(ctl::bytes input, ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::lea::encrypt_blocks", input, output,
+        block_size);
+    for (size_t i = 0; i < count; ++i)
+      encrypt_block(block_view(input.data() + i * block_size),
+                    writable_block_view(output.data() + i * block_size));
+  }
+
+  /**
+   * @brief Decrypts several mutually independent blocks
+   *
+   * @param input the blocks to decrypt, a whole number of them
+   * @param output where the results go, at least as long as input and may be
+   * the same buffer
+   * @exception std::invalid_argument if input is not a whole number of blocks,
+   * or if output is shorter than input
+   */
+  void decrypt_blocks(ctl::bytes input, ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::lea::decrypt_blocks", input, output,
+        block_size);
+    for (size_t i = 0; i < count; ++i)
+      decrypt_block(block_view(input.data() + i * block_size),
+                    writable_block_view(output.data() + i * block_size));
+  }
+
+  /**
+   * @brief Encrypts one batch with a per block mask applied on both sides
+   *
+   * Computes output[i] = E(input[i] ^ mask[i]) ^ mask[i], which is what
+   * tweakable modes such as XTS need. There is no vector path, so this simply
+   * iterates; the entry point exists so that a mode works with any block cipher
+   * through the same code.
+   *
+   * @param input the batch to encrypt
+   * @param mask one mask per block
+   * @param output where the results go, may be the same buffer as input
+   */
+  void encrypt_batch_masked(batch_view input, batch_view mask,
+                            writable_batch_view output) const {
+    for (size_t i = 0; i < preferred_batch; ++i)
+      block_masked<true>(input.data() + i * block_size,
+                         mask.data() + i * block_size,
+                         output.data() + i * block_size);
+  }
+
+  /**
+   * @brief Decrypts one batch with a per block mask applied on both sides
+   *
+   * @param input the batch to decrypt
+   * @param mask one mask per block
+   * @param output where the results go, may be the same buffer as input
+   */
+  void decrypt_batch_masked(batch_view input, batch_view mask,
+                            writable_batch_view output) const {
+    for (size_t i = 0; i < preferred_batch; ++i)
+      block_masked<false>(input.data() + i * block_size,
+                          mask.data() + i * block_size,
+                          output.data() + i * block_size);
+  }
+
+  /**
+   * @brief Encrypts one batch and exclusive ors the results with a buffer
+   *
+   * Computes output[i] = E(input[i]) ^ operand[i], which is what counter based
+   * modes need.
+   *
+   * @param input the batch of counter blocks to encrypt
+   * @param operand what to combine the results with
+   * @param output where the results go, may be the same buffer as operand
+   */
+  void encrypt_batch_then_xor(batch_view input, batch_view operand,
+                              writable_batch_view output) const {
+    for (size_t i = 0; i < preferred_batch; ++i) {
+      uint8_t buffer[block_size];
+      encrypt_block(block_view(input.data() + i * block_size), buffer);
+      ctl::detail::xor_block<block_size>(buffer, operand.data() + i * block_size,
+                                        output.data() + i * block_size);
+    }
+  }
+
+private:
+  /**
+   * @brief Transforms one block with a mask applied on both sides
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   */
+  template <bool _Encrypt>
+  void block_masked(const uint8_t *input, const uint8_t *mask,
+                    uint8_t *output) const {
+    uint8_t buffer[block_size];
+    ctl::detail::xor_block<block_size>(input, mask, buffer);
+    if constexpr (_Encrypt)
+      encrypt_block(buffer, buffer);
+    else
+      decrypt_block(buffer, buffer);
+    ctl::detail::xor_block<block_size>(buffer, mask, output);
+  }
+
+  /**
+   * @brief The round keys, six words for each round
+   */
+  uint32_t rk_[rounds][round_key_words];
+};
+
+/**
+ * @brief LEA-128
+ */
+typedef lea<128> lea128;
+
+/**
+ * @brief LEA-192
+ */
+typedef lea<192> lea192;
+
+/**
+ * @brief LEA-256
+ */
+typedef lea<256> lea256;
+
+} // namespace cipher
+} // namespace symmetric
+} // namespace ctl

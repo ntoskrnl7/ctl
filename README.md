@@ -24,6 +24,7 @@ xts.encrypt(sector_number, sector, out);
 | --- | --- | --- |
 | AES | 128, 192, 256 | FIPS 197 appendix C, SP 800-38A F.1.1 |
 | ARIA | 128, 192, 256 | RFC 5794 appendix A |
+| LEA | 128, 192, 256 | the vectors published with KS X 3246 |
 | ECB | | SP 800-38A F.1.1 |
 | CBC | | SP 800-38A F.2.1 |
 | CTR | | SP 800-38A F.5.1 |
@@ -40,6 +41,11 @@ document, because RFC 5794 gives no definition for it, and a `static_assert`
 checks that what was copied is a permutation, so a single mistyped byte fails
 the build.
 
+LEA has no table to generate or transcribe. It is built from addition, rotation
+and exclusive or, and the only values copied from its document are eight round
+constants, which satisfy no property that could check them. The published
+vectors are what confirms those, and the tests say so where they sit.
+
 ## Requirements
 
 C++17 and CMake. The only dependency is
@@ -53,6 +59,7 @@ Headers carry no extension, in the same style as `ext`.
 #include <ctl/bytes>                    // bytes, writable_bytes
 #include <ctl/symmetric/cipher/aes>     // cipher::aes<128|192|256>
 #include <ctl/symmetric/cipher/aria>    // cipher::aria<128|192|256>
+#include <ctl/symmetric/cipher/lea>     // cipher::lea<128|192|256>
 #include <ctl/symmetric/mode/ecb>       // mode::ecb<Cipher>
 #include <ctl/symmetric/mode/cbc>       // mode::cbc<Cipher>
 #include <ctl/symmetric/mode/ctr>       // mode::ctr<Cipher>
@@ -240,6 +247,19 @@ XTS over 512 byte sectors reaches 4,440 MB/s. ARIA runs at 132 MB/s in software
 and 294 MB/s with the vector path, and ARIA-XTS at 221 MB/s. No operation
 performs a heap allocation.
 
+The other two ciphers, over the same 4096 byte buffer.
+
+| | ECB | CTR | XTS | GCM |
+| --- | --- | --- | --- | --- |
+| LEA-128 | 730 MB/s | 594 | 586 | 617 |
+| ARIA-128 | 291 | 234 | 221 | 224 |
+
+Neither has a hardware path for the cipher itself, so those are what the
+processor does with the algorithm as written. LEA is worth comparing against the
+543 MB/s the software path of AES reaches in the table above: it is faster than
+AES is without AES-NI, which is what it was designed for, and it gets there
+without a table.
+
 Describing a buffer by a view rather than by a pointer and a length is close to
 free. Measured against the interface it replaced, six runs of each interleaved so
 that neither sees a different thermal state, CBC, GCM, ARIA and ARIA-XTS are
@@ -277,7 +297,10 @@ The software AES path is table driven. That is the usual construction and is
 what the published vectors verify, but table lookups indexed by key dependent
 data can leak through cache timing. The AES-NI path does not have that property.
 Where an attacker can measure timing on the same machine and acceleration is not
-available, this matters.
+available, this matters. ARIA is table driven in the same way on its software
+path. LEA is not, and cannot be: it has no table, so there is no lookup to
+index, on any path. That is worth knowing where a build has to run without
+AES-NI and timing is part of the threat model.
 
 GHASH is either the carry-less instruction or a bit at a time, and never a
 table, for the same reason: a GHASH table is built from the hash subkey and

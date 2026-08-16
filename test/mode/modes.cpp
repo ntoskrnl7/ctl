@@ -11,6 +11,7 @@
 #include <ctl/bytes>
 #include <ctl/symmetric/cipher/aes>
 #include <ctl/symmetric/cipher/aria>
+#include <ctl/symmetric/cipher/lea>
 #include <ctl/symmetric/mode/cbc>
 #include <ctl/symmetric/mode/ctr>
 #include <ctl/symmetric/mode/ecb>
@@ -24,6 +25,7 @@ using aes128 = ctl::symmetric::cipher::aes<128>;
 using aes192 = ctl::symmetric::cipher::aes<192>;
 using aes256 = ctl::symmetric::cipher::aes<256>;
 using aria128 = ctl::symmetric::cipher::aria<128>;
+using lea128 = ctl::symmetric::cipher::lea<128>;
 
 namespace mode = ctl::symmetric::mode;
 
@@ -553,6 +555,45 @@ TEST(lengths, an_output_buffer_that_is_too_small_is_refused) {
                std::invalid_argument);
 }
 
+// These transforms run forward and promise exact in-place operation, not
+// memmove semantics. Writing one byte into the input would otherwise overwrite
+// data a later block has not read yet. Both directions are refused before a
+// byte is changed, consistently across the modes.
+TEST(buffers, shifted_input_and_output_overlap_is_refused) {
+  const std::vector<uint8_t> key(aes128::key_size, 0x31);
+  std::vector<uint8_t> storage(65);
+  for (size_t i = 0; i < 64; ++i)
+    storage[i] = static_cast<uint8_t>(i);
+
+  const ctl::bytes input = ctl::bytes(storage).first(64);
+  const ctl::writable_bytes shifted =
+      ctl::writable_bytes(storage).subview(1, 64);
+  const std::vector<uint8_t> before = storage;
+
+  mode::ecb<aes128> ecb(key);
+  EXPECT_THROW((void)ecb.encrypt(input, shifted), std::invalid_argument);
+  EXPECT_THROW((void)ecb.decrypt(input, shifted), std::invalid_argument);
+
+  mode::cbc<aes128>::iv_t iv = {0};
+  mode::cbc<aes128> cbc(key);
+  EXPECT_THROW((void)cbc.encrypt(iv, input, shifted), std::invalid_argument);
+  EXPECT_THROW((void)cbc.decrypt(iv, input, shifted), std::invalid_argument);
+
+  mode::ctr<aes128>::nonce_t nonce = {0};
+  mode::ctr<aes128> ctr(key);
+  EXPECT_THROW(ctr.crypt(nonce, 0, input, shifted), std::invalid_argument);
+
+  mode::xts<aes128>::component_key_t data_key = {0x11};
+  mode::xts<aes128>::component_key_t tweak_key = {0x22};
+  mode::xts<aes128> xts(data_key, tweak_key);
+  EXPECT_THROW((void)xts.encrypt(static_cast<uint64_t>(0), input, shifted),
+               std::invalid_argument);
+  EXPECT_THROW((void)xts.decrypt(static_cast<uint64_t>(0), input, shifted),
+               std::invalid_argument);
+
+  EXPECT_EQ(before, storage);
+}
+
 // An output buffer larger than the input is fine, and only the part that was
 // asked for is written.
 TEST(lengths, a_larger_output_buffer_is_left_alone_past_the_result) {
@@ -568,15 +609,18 @@ TEST(lengths, a_larger_output_buffer_is_left_alone_past_the_result) {
 
 // ---------------------------------------------------------------- composition
 
+namespace {
+
 // Because a mode takes the block cipher as a template argument, every mode
-// composes with ARIA through the same code. There are no published vectors for
-// ARIA in these modes, so only the round trip is checked.
-TEST(modes, compose_with_aria_roundtrip_only) {
+// composes with any 128 bit cipher through the same code. There are no
+// published vectors for ARIA or LEA in these modes, so only the round trip is
+// checked.
+template <class Cipher> void check_composition() {
   const std::vector<uint8_t> key = test::hex(kKey128);
   const std::vector<uint8_t> plain = test::hex(kPlaintext);
 
   {
-    mode::ecb<aria128> ecb(key);
+    mode::ecb<Cipher> ecb(key);
     std::vector<uint8_t> out(plain.size());
     std::vector<uint8_t> back(plain.size());
     ASSERT_TRUE(ecb.encrypt(plain, out));
@@ -586,8 +630,8 @@ TEST(modes, compose_with_aria_roundtrip_only) {
   }
 
   {
-    mode::cbc<aria128> cbc(key);
-    mode::cbc<aria128>::iv_t iv = {0};
+    mode::cbc<Cipher> cbc(key);
+    typename mode::cbc<Cipher>::iv_t iv = {0};
     std::vector<uint8_t> out(plain.size());
     std::vector<uint8_t> back(plain.size());
     ASSERT_TRUE(cbc.encrypt(iv, plain, out));
@@ -597,8 +641,8 @@ TEST(modes, compose_with_aria_roundtrip_only) {
   }
 
   {
-    mode::ctr<aria128> ctr(key);
-    mode::ctr<aria128>::nonce_t nonce = {0};
+    mode::ctr<Cipher> ctr(key);
+    typename mode::ctr<Cipher>::nonce_t nonce = {0};
     std::vector<uint8_t> out(plain.size());
     std::vector<uint8_t> back(plain.size());
     ctr.crypt(nonce, 0, plain, out);
@@ -608,14 +652,14 @@ TEST(modes, compose_with_aria_roundtrip_only) {
   }
 }
 
-TEST(xts, composes_with_aria_roundtrip_only) {
+template <class Cipher> void check_xts_composition() {
   const std::vector<uint8_t> key = test::hex("fb46fb3cab7f67ad5207bc232c50dcbb"
                                             "24dbd1564590855d4cb777b3ba6431c3");
   const std::vector<uint8_t> plain =
       test::hex("46409f7426eb4e3d33480534b80fe6e09fed6583907eb83c84");
 
-  mode::xts<aria128> xts =
-      make_xts_from_vector_key<mode::xts<aria128>>(key);
+  mode::xts<Cipher> xts =
+      make_xts_from_vector_key<mode::xts<Cipher>>(key);
 
   std::vector<uint8_t> encrypted(plain.size());
   ASSERT_TRUE(xts.encrypt(static_cast<uint64_t>(7), plain, encrypted));
@@ -624,4 +668,22 @@ TEST(xts, composes_with_aria_roundtrip_only) {
   std::vector<uint8_t> decrypted(plain.size());
   ASSERT_TRUE(xts.decrypt(static_cast<uint64_t>(7), encrypted, decrypted));
   EXPECT_EQ(test::to_hex(plain), test::to_hex(decrypted));
+}
+
+} // namespace
+
+TEST(modes, compose_with_aria_roundtrip_only) {
+  check_composition<aria128>();
+}
+
+TEST(modes, compose_with_lea_roundtrip_only) {
+  check_composition<lea128>();
+}
+
+TEST(xts, composes_with_aria_roundtrip_only) {
+  check_xts_composition<aria128>();
+}
+
+TEST(xts, composes_with_lea_roundtrip_only) {
+  check_xts_composition<lea128>();
 }
