@@ -13,6 +13,12 @@
  * the row identifier a ciphertext belongs to. Tampering with it makes tag
  * verification fail, which binds the ciphertext to its context.
  *
+ * An initialization vector belongs to one encryption under one key. Reusing
+ * the same IV with that key for distinct inputs breaks both confidentiality and
+ * the assurance the tag is meant to provide. This object deliberately keeps no
+ * registry of IVs: uniqueness has to hold across processes, restarts and
+ * devices, so the caller has to arrange it at that scope (SP 800-38D section 8).
+ *
  * The order in which GHASH consumes its inputs is fixed by the specification:
  * all of the AAD first, zero padded to a block boundary, then all of the
  * ciphertext, then the two lengths. AAD therefore cannot be supplied after
@@ -31,6 +37,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <stdexcept>
+#include <utility>
 
 #include <ext/result>
 
@@ -182,15 +189,18 @@ public:
   /**
    * @brief Encrypts and authenticates
    *
-   * @param iv initialization vector, any non zero length; 12 bytes recommended
+   * @param iv initialization vector, any non zero length; 12 bytes recommended;
+   * must not have been used for another encryption under this key
    * @param aad additional authenticated data, may be empty
    * @param plain data to encrypt, may be empty
    * @param output where the ciphertext goes, at least as long as the total of
-   * plain and may overlap it
+   * plain; it may be exactly in place, but any other overlap is refused
    * @param tag where the tag goes, tag_size bytes; the last tag_size bytes of a
    * buffer that also holds the ciphertext appends it there, which is the layout
-   * a wire format usually wants
-   * @exception std::invalid_argument if output cannot hold the ciphertext
+   * a wire format usually wants; it must not overlap the data output
+   * @exception std::invalid_argument if output cannot hold the ciphertext, or
+   * if an input piece partially overlaps the output, or if the tag overlaps
+   * the data output
    */
   [[nodiscard]] ext::void_result<error_status>
   encrypt(ctl::bytes iv, pieces aad, pieces plain, ctl::writable_bytes output,
@@ -203,6 +213,11 @@ public:
     ctl::detail::require_capacity("ctl::symmetric::mode::gcm::encrypt",
                                   "output", output.size(),
                                   static_cast<size_t>(data_size));
+    require_piece_layout("ctl::symmetric::mode::gcm::encrypt", plain, output,
+                         static_cast<size_t>(data_size));
+    ctl::detail::require_disjoint(
+        "ctl::symmetric::mode::gcm::encrypt", "output", output.data(),
+        static_cast<size_t>(data_size), "tag", tag.data(), tag_size);
 
     session state(cipher_, hash_, iv);
     for (const piece &p : aad)
@@ -231,9 +246,11 @@ public:
    * encrypting
    * @param cipher ciphertext to decrypt
    * @param output where the plaintext goes, at least as long as the total of
-   * cipher and may overlap it
+   * cipher; it may be exactly in place, but any other overlap is refused
    * @param tag the tag to verify against, tag_size bytes
-   * @exception std::invalid_argument if output cannot hold the plaintext
+   * @exception std::invalid_argument if output cannot hold the plaintext, or
+   * if an input piece partially overlaps the output, or if the tag overlaps
+   * the data output
    */
   [[nodiscard]] ext::void_result<error_status>
   decrypt(ctl::bytes iv, pieces aad, pieces cipher, ctl::writable_bytes output,
@@ -246,6 +263,11 @@ public:
     const size_t data_size = static_cast<size_t>(total_size);
     ctl::detail::require_capacity("ctl::symmetric::mode::gcm::decrypt",
                                   "output", output.size(), data_size);
+    require_piece_layout("ctl::symmetric::mode::gcm::decrypt", cipher, output,
+                         data_size);
+    ctl::detail::require_disjoint(
+        "ctl::symmetric::mode::gcm::decrypt", "output", output.data(),
+        data_size, "tag", tag.data(), tag_size);
 
     session state(cipher_, hash_, iv);
     for (const piece &p : aad)
@@ -281,7 +303,7 @@ private:
     session(const cipher_type &cipher, const ctl::detail::ghash &prepared,
             ctl::bytes iv)
         : cipher_(cipher), hash_(prepared), aad_bits_(0), data_bits_(0),
-          keystream_used_(block_size), aad_closed_(false) {
+          keystream_used_(block_size), aad_closed_(false), active_(true) {
       derive_initial_counter(iv);
       memcpy(counter_, initial_, block_size);
       // The tag is masked with the block cipher applied to the initial counter,
@@ -289,17 +311,63 @@ private:
       cipher_.encrypt_block(initial_, tag_mask_);
     }
 
-    ~session() {
+    session(const session &) = delete;
+    session &operator=(const session &) = delete;
+
+    /**
+     * @brief Transfers one invocation without leaving a usable clone behind
+     *
+     * Moving is how the AAD phase becomes a data phase. The source is erased
+     * and marked inactive, so retaining the old phase object cannot fork one
+     * IV and key stream into two encryptions.
+     */
+    session(session &&other) noexcept
+        : cipher_(other.cipher_), hash_(other.hash_),
+          aad_bits_(other.aad_bits_), data_bits_(other.data_bits_),
+          keystream_used_(other.keystream_used_),
+          aad_closed_(other.aad_closed_), active_(other.active_) {
+      memcpy(initial_, other.initial_, sizeof(initial_));
+      memcpy(counter_, other.counter_, sizeof(counter_));
+      memcpy(keystream_, other.keystream_, sizeof(keystream_));
+      memcpy(tag_mask_, other.tag_mask_, sizeof(tag_mask_));
+      other.erase();
+    }
+
+    session &operator=(session &&) = delete;
+
+    ~session() { erase(); }
+
+    /**
+     * @brief Refuses use after a phase transition, move or finish
+     */
+    void require_active(const char *where) const {
+      if (!active_)
+        throw std::logic_error(std::string(where) +
+                               " : this GCM invocation has already moved to "
+                               "another phase or been finished.");
+    }
+
+    /**
+     * @brief Erases all keyed state held by this invocation
+     */
+    void erase() {
       ctl::detail::secure_zero(initial_, sizeof(initial_));
       ctl::detail::secure_zero(counter_, sizeof(counter_));
       ctl::detail::secure_zero(keystream_, sizeof(keystream_));
       ctl::detail::secure_zero(tag_mask_, sizeof(tag_mask_));
+      hash_.erase();
+      aad_bits_ = 0;
+      data_bits_ = 0;
+      keystream_used_ = block_size;
+      aad_closed_ = true;
+      active_ = false;
     }
 
     /**
      * @brief Absorbs additional authenticated data
      */
     void absorb_aad(const uint8_t *data, size_t size) {
+      require_active("ctl::symmetric::mode::gcm::aad");
       hash_.update(data, size);
       aad_bits_ += static_cast<uint64_t>(size) * 8;
     }
@@ -308,6 +376,7 @@ private:
      * @brief Encrypts and absorbs the resulting ciphertext
      */
     void encrypt(const uint8_t *input, size_t size, uint8_t *output) {
+      require_active("ctl::symmetric::mode::gcm::encrypt_data::write");
       close_aad();
       require_within_limit(size);
       apply_keystream(input, size, output);
@@ -322,6 +391,7 @@ private:
      * buffer as the input.
      */
     void decrypt(const uint8_t *input, size_t size, uint8_t *output) {
+      require_active("ctl::symmetric::mode::gcm::decrypt_data::write");
       close_aad();
       require_within_limit(size);
       hash_.update(input, size);
@@ -333,6 +403,7 @@ private:
      * @brief Completes the hash and produces the tag
      */
     void finish(uint8_t *tag) {
+      require_active("ctl::symmetric::mode::gcm::finish");
       close_aad();
       hash_.pad();
 
@@ -346,6 +417,7 @@ private:
       ctl::detail::xor_block<block_size>(sum, tag_mask_, sum);
       memcpy(tag, sum, tag_size);
       ctl::detail::secure_zero(sum, sizeof(sum));
+      erase();
     }
 
   private:
@@ -515,6 +587,7 @@ private:
     uint64_t data_bits_;
     size_t keystream_used_;
     bool aad_closed_;
+    bool active_;
   };
 
 public:
@@ -526,11 +599,15 @@ public:
    * ciphertext, so supplying AAD once encryption has begun is not a mistake to
    * be reported at run time but something the type system refuses.
    *
+   * Each write checks the two ranges it receives. It cannot see a future
+   * input, so the caller must also make sure an output from one write does not
+   * overwrite input that will be supplied to another.
+   *
    * Created through gcm::encryptor. Must not outlive the gcm it came from.
    */
   class encrypt_data {
   public:
-    explicit encrypt_data(const session &state) : state_(state) {}
+    explicit encrypt_data(session &&state) : state_(std::move(state)) {}
 
     /**
      * @brief Encrypts one run of data and authenticates the result
@@ -538,14 +615,19 @@ public:
      * The key stream carries on between calls, so a run of any length is fine.
      *
      * @param input data to encrypt
-     * @param output where the ciphertext goes, at least as long as input and
-     * may overlap it
-     * @exception std::invalid_argument if output is shorter than input
+     * @param output where the ciphertext goes, at least as long as input; it
+     * may begin at the same address for in-place operation, but otherwise must
+     * be disjoint
+     * @exception std::invalid_argument if output is shorter than input, or if
+     * input and output partially overlap
      */
     encrypt_data &write(ctl::bytes input, ctl::writable_bytes output) {
       ctl::detail::require_capacity(
           "ctl::symmetric::mode::gcm::encrypt_data::write", "output",
           output.size(), input.size());
+      ctl::detail::require_exact_or_disjoint(
+          "ctl::symmetric::mode::gcm::encrypt_data::write", input.data(),
+          input.size(), output.data(), output.data(), input.size());
       state_.encrypt(input.data(), input.size(), output.data());
       return *this;
     }
@@ -553,12 +635,82 @@ public:
     /**
      * @brief Produces the authentication tag
      *
-     * @param tag where the tag goes, tag_size bytes
+     * @param tag where the tag goes, tag_size bytes; it must not overlap an
+     * earlier output, which this scatter writer no longer retains
      */
     void finish(writable_tag_view tag) { state_.finish(tag.data()); }
 
   private:
     session state_;
+  };
+
+  /**
+   * @brief Encryption in progress, data phase, writing into one buffer
+   *
+   * The same as encrypt_data except that it was told where the ciphertext goes
+   * and keeps track of how far it has got. What that removes is a running
+   * offset the caller would otherwise have to hold and advance by hand next to
+   * every write, which is the same shape of mistake as a length passed beside a
+   * pointer: two things that have to agree and nothing making them.
+   *
+   * Where each run goes somewhere different, which is the other reason to feed
+   * a cipher in pieces, encrypt_data is the one to use. Neither type has the
+   * other's write, so the two cannot be mixed up.
+   *
+   * Created through gcm::encryptor, then data with a buffer. Must not outlive
+   * the gcm it came from.
+   */
+  class encrypt_data_into {
+  public:
+    encrypt_data_into(session &&state, ctl::writable_bytes into)
+        : state_(std::move(state)), into_(into), written_(0) {}
+
+    /**
+     * @brief Encrypts one run of data into the next part of the buffer
+     *
+     * @param input data to encrypt
+     * @exception std::invalid_argument if what is left of the buffer is
+     * shorter than the run, or if input overlaps the held output anywhere
+     * other than the position where this run is written
+     */
+    encrypt_data_into &write(ctl::bytes input) {
+      ctl::detail::require_capacity(
+          "ctl::symmetric::mode::gcm::encrypt_data_into::write", "output",
+          into_.size() - written_, input.size());
+      uint8_t *const destination = into_.data() + written_;
+      ctl::detail::require_exact_or_disjoint(
+          "ctl::symmetric::mode::gcm::encrypt_data_into::write", input.data(),
+          input.size(), destination, into_.data(), into_.size());
+      state_.encrypt(input.data(), input.size(), destination);
+      written_ += input.size();
+      return *this;
+    }
+
+    /**
+     * @brief How much of the buffer has been written
+     */
+    size_t written() const { return written_; }
+
+    /**
+     * @brief Produces the authentication tag
+     *
+     * @param tag where the tag goes, tag_size bytes; it may be appended after
+     * what has been written but must not overlap it
+     * @exception std::invalid_argument if the tag overlaps data already written
+     */
+    void finish(writable_tag_view tag) {
+      state_.require_active(
+          "ctl::symmetric::mode::gcm::encrypt_data_into::finish");
+      ctl::detail::require_disjoint(
+          "ctl::symmetric::mode::gcm::encrypt_data_into::finish", "output",
+          into_.data(), written_, "tag", tag.data(), tag_size);
+      state_.finish(tag.data());
+    }
+
+  private:
+    session state_;
+    ctl::writable_bytes into_;
+    size_t written_;
   };
 
   /**
@@ -584,9 +736,26 @@ public:
     }
 
     /**
-     * @brief Moves on to the data phase
+     * @brief Moves on to the data phase, with each run written where the
+     * caller says
      */
-    encrypt_data data() { return encrypt_data(state_); }
+    encrypt_data data() {
+      state_.require_active("ctl::symmetric::mode::gcm::encrypt_aad::data");
+      return encrypt_data(std::move(state_));
+    }
+
+    /**
+     * @brief Moves on to the data phase, writing into one buffer
+     *
+     * The writer then holds the buffer and keeps its own place in it, so a run
+     * is written by naming only what to encrypt.
+     *
+     * @param output where all of the ciphertext goes, in order
+     */
+    encrypt_data_into data(ctl::writable_bytes output) {
+      state_.require_active("ctl::symmetric::mode::gcm::encrypt_aad::data");
+      return encrypt_data_into(std::move(state_), output);
+    }
 
     /**
      * @brief Produces the tag with no data at all, which is GMAC
@@ -613,11 +782,15 @@ public:
    * exactly the mistake authenticated encryption exists to prevent. Where that
    * obligation is hard to honour, use the single call interface instead.
    *
+   * Each write checks the two ranges it receives. It cannot see a future
+   * input, so the caller must also make sure an output from one write does not
+   * overwrite input that will be supplied to another.
+   *
    * Created through gcm::decryptor. Must not outlive the gcm it came from.
    */
   class decrypt_data {
   public:
-    explicit decrypt_data(const session &state) : state_(state) {}
+    explicit decrypt_data(session &&state) : state_(std::move(state)) {}
 
     /**
      * @brief Decrypts one run of ciphertext
@@ -626,14 +799,19 @@ public:
      * finish reports success.
      *
      * @param input ciphertext to decrypt
-     * @param output where the plaintext goes, at least as long as input and
-     * may overlap it
-     * @exception std::invalid_argument if output is shorter than input
+     * @param output where the plaintext goes, at least as long as input; it may
+     * begin at the same address for in-place operation, but otherwise must be
+     * disjoint
+     * @exception std::invalid_argument if output is shorter than input, or if
+     * input and output partially overlap
      */
     decrypt_data &write(ctl::bytes input, ctl::writable_bytes output) {
       ctl::detail::require_capacity(
           "ctl::symmetric::mode::gcm::decrypt_data::write", "output",
           output.size(), input.size());
+      ctl::detail::require_exact_or_disjoint(
+          "ctl::symmetric::mode::gcm::decrypt_data::write", input.data(),
+          input.size(), output.data(), output.data(), input.size());
       state_.decrypt(input.data(), input.size(), output.data());
       return *this;
     }
@@ -651,6 +829,73 @@ public:
 
   private:
     session state_;
+  };
+
+  /**
+   * @brief Decryption in progress, data phase, writing into one buffer
+   *
+   * What decrypt_data says about failure applies here unchanged: until the tag
+   * has been checked none of the plaintext is authentic, and on failure it all
+   * has to be discarded. Knowing where it went does not change that, because
+   * the buffer belongs to the caller and may already have been read from.
+   *
+   * Created through gcm::decryptor, then data with a buffer. Must not outlive
+   * the gcm it came from.
+   */
+  class decrypt_data_into {
+  public:
+    decrypt_data_into(session &&state, ctl::writable_bytes into)
+        : state_(std::move(state)), into_(into), written_(0) {}
+
+    /**
+     * @brief Decrypts one run of ciphertext into the next part of the buffer
+     *
+     * @param input ciphertext to decrypt
+     * @exception std::invalid_argument if what is left of the buffer is
+     * shorter than the run, or if input overlaps the held output anywhere
+     * other than the position where this run is written
+     */
+    decrypt_data_into &write(ctl::bytes input) {
+      ctl::detail::require_capacity(
+          "ctl::symmetric::mode::gcm::decrypt_data_into::write", "output",
+          into_.size() - written_, input.size());
+      uint8_t *const destination = into_.data() + written_;
+      ctl::detail::require_exact_or_disjoint(
+          "ctl::symmetric::mode::gcm::decrypt_data_into::write", input.data(),
+          input.size(), destination, into_.data(), into_.size());
+      state_.decrypt(input.data(), input.size(), destination);
+      written_ += input.size();
+      return *this;
+    }
+
+    /**
+     * @brief How much of the buffer has been written
+     */
+    size_t written() const { return written_; }
+
+    /**
+     * @brief Verifies the authentication tag
+     *
+     * The tag may follow the data in the same allocation but must not overlap
+     * bytes already written.
+     *
+     * @return success only if the data is authentic; on failure the caller must
+     * discard every byte of plaintext it received
+     * @exception std::invalid_argument if the tag overlaps data already written
+     */
+    [[nodiscard]] ext::void_result<error_status> finish(tag_view tag) {
+      state_.require_active(
+          "ctl::symmetric::mode::gcm::decrypt_data_into::finish");
+      ctl::detail::require_disjoint(
+          "ctl::symmetric::mode::gcm::decrypt_data_into::finish", "output",
+          into_.data(), written_, "tag", tag.data(), tag_size);
+      return verify(state_, tag);
+    }
+
+  private:
+    session state_;
+    ctl::writable_bytes into_;
+    size_t written_;
   };
 
   /**
@@ -673,9 +918,23 @@ public:
     }
 
     /**
-     * @brief Moves on to the data phase
+     * @brief Moves on to the data phase, with each run written where the
+     * caller says
      */
-    decrypt_data data() { return decrypt_data(state_); }
+    decrypt_data data() {
+      state_.require_active("ctl::symmetric::mode::gcm::decrypt_aad::data");
+      return decrypt_data(std::move(state_));
+    }
+
+    /**
+     * @brief Moves on to the data phase, writing into one buffer
+     *
+     * @param output where all of the plaintext goes, in order
+     */
+    decrypt_data_into data(ctl::writable_bytes output) {
+      state_.require_active("ctl::symmetric::mode::gcm::decrypt_aad::data");
+      return decrypt_data_into(std::move(state_), output);
+    }
 
     /**
      * @brief Verifies the tag with no data at all, which is GMAC
@@ -692,9 +951,11 @@ public:
    * @brief Begins an encryption that is fed over several calls
    *
    * Use this when the data does not all exist at once. When it does, the single
-   * call interface is both simpler and impossible to misuse.
+   * call interface is simpler and can erase all plaintext if verification
+   * fails.
    *
-   * @param iv initialization vector, any non zero length; 12 bytes recommended
+   * @param iv initialization vector, any non zero length; 12 bytes recommended;
+   * must not have been used for another encryption under this key
    * @exception std::invalid_argument if iv is empty
    */
   encrypt_aad encryptor(ctl::bytes iv) const & {
@@ -736,6 +997,22 @@ public:
   decrypt_aad decryptor(ctl::bytes iv) const && = delete;
 
 private:
+  /**
+   * @brief Checks every input piece before a single call writes anything
+   */
+  static void require_piece_layout(const char *where, pieces input,
+                                   ctl::writable_bytes output,
+                                   size_t output_size) {
+    size_t offset = 0;
+    for (const piece &p : input) {
+      if (!p.empty())
+        ctl::detail::require_exact_or_disjoint(
+            where, p.data(), p.size(), output.data() + offset, output.data(),
+            output_size);
+      offset += p.size();
+    }
+  }
+
   /**
    * @brief Completes a session and compares the tag in constant time
    */

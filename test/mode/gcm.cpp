@@ -11,6 +11,7 @@
  */
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <type_traits>
 #include <utility>
 
@@ -265,6 +266,74 @@ TEST(gcm, works_in_place) {
   EXPECT_EQ(test::to_hex(plain), test::to_hex(buffer));
 }
 
+// In-place operation still has to work when the input is described by several
+// pieces. Each piece begins exactly where its own result is written.
+TEST(gcm, works_in_place_across_piece_boundaries) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> aad = test::hex(kAad);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  mode::gcm<aes128> gcm(key);
+  std::vector<uint8_t> buffer = plain;
+  std::vector<uint8_t> tag(16);
+
+  const ctl::bytes plain_view(buffer);
+  ASSERT_TRUE(gcm.encrypt(
+      iv, {aad},
+      {plain_view.first(7), plain_view.subview(7, 20),
+       plain_view.last(plain.size() - 27)},
+      buffer, tag));
+
+  const ctl::bytes cipher_view(buffer);
+  ASSERT_TRUE(gcm.decrypt(
+      iv, {aad},
+      {cipher_view.first(7), cipher_view.subview(7, 20),
+       cipher_view.last(buffer.size() - 27)},
+      buffer, tag));
+  EXPECT_EQ(test::to_hex(plain), test::to_hex(buffer));
+}
+
+// A forward loop cannot implement memmove semantics: when output begins one
+// byte into input it overwrites a byte that has not been read yet. The opposite
+// direction happens to work for that loop, but accepting only one direction
+// would be a fragile contract, so every partial overlap is refused.
+TEST(gcm, refuses_partially_overlapping_single_call_buffers) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> aad = test::hex(kAad);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+  mode::gcm<aes128> gcm(key);
+  std::vector<uint8_t> tag(16);
+
+  std::vector<uint8_t> shifted(plain.size() + 1);
+  std::copy(plain.begin(), plain.end(), shifted.begin());
+  const std::vector<uint8_t> before = shifted;
+  EXPECT_THROW(
+      (void)gcm.encrypt(
+          iv, {aad}, {ctl::bytes(shifted).first(plain.size())},
+          ctl::writable_bytes(shifted).subview(1, plain.size()), tag),
+      std::invalid_argument);
+  EXPECT_EQ(before, shifted);
+
+  std::fill(shifted.begin(), shifted.end(), 0);
+  std::copy(plain.begin(), plain.end(), shifted.begin() + 1);
+  EXPECT_THROW(
+      (void)gcm.encrypt(
+          iv, {aad}, {ctl::bytes(shifted).subview(1, plain.size())},
+          ctl::writable_bytes(shifted).first(plain.size()), tag),
+      std::invalid_argument);
+
+  std::vector<uint8_t> cipher(plain.size());
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {plain}, cipher, tag));
+  std::copy(cipher.begin(), cipher.end(), shifted.begin());
+  EXPECT_THROW(
+      (void)gcm.decrypt(
+          iv, {aad}, {ctl::bytes(shifted).first(cipher.size())},
+          ctl::writable_bytes(shifted).subview(1, cipher.size()), tag),
+      std::invalid_argument);
+}
+
 // Naming the last tag_size bytes of one buffer as the tag appends it to the
 // ciphertext, which is the layout a wire format usually wants. This is the
 // property that made a separate tag argument the better choice.
@@ -348,6 +417,142 @@ TEST(gcm, builder_matches_the_single_call) {
 
   EXPECT_EQ(test::to_hex(once), test::to_hex(streamed));
   EXPECT_EQ(test::to_hex(once_tag), test::to_hex(streamed_tag));
+}
+
+// The writer can hold the output buffer and keep its own place in it, which is
+// what removes the running offset the caller would otherwise have to advance by
+// hand next to every write. It has to agree with doing that by hand.
+TEST(gcm, a_writer_that_holds_its_buffer_matches_one_that_does_not) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> aad = test::hex(kAad);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  gcm128 gcm(key);
+
+  std::vector<uint8_t> by_hand(plain.size());
+  std::vector<uint8_t> by_hand_tag(16);
+  {
+    const ctl::bytes source(plain);
+    const ctl::writable_bytes out(by_hand);
+    auto writer = gcm.encryptor(iv).aad(aad).data();
+    size_t written = 0;
+    for (size_t run : {size_t(7), size_t(20), size_t(33)}) {
+      writer.write(source.subview(written, run), out.subview(written, run));
+      written += run;
+    }
+    writer.finish(by_hand_tag);
+  }
+
+  std::vector<uint8_t> held(plain.size());
+  std::vector<uint8_t> held_tag(16);
+  {
+    auto writer = gcm.encryptor(iv).aad(aad).data(held);
+    size_t at = 0;
+    for (size_t run : {size_t(7), size_t(20), size_t(33)}) {
+      writer.write(ctl::bytes(plain).subview(at, run));
+      at += run;
+    }
+    EXPECT_EQ(plain.size(), writer.written());
+    writer.finish(held_tag);
+  }
+
+  EXPECT_EQ(test::to_hex(by_hand), test::to_hex(held));
+  EXPECT_EQ(test::to_hex(by_hand_tag), test::to_hex(held_tag));
+}
+
+TEST(gcm, a_writer_that_holds_its_buffer_refuses_to_overrun_it) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  gcm128 gcm(key);
+
+  std::vector<uint8_t> small(20);
+  auto writer = gcm.encryptor(iv).data(small);
+  writer.write(ctl::bytes(plain).first(16));
+  EXPECT_THROW(writer.write(ctl::bytes(plain).subview(16, 16)),
+               std::invalid_argument);
+}
+
+// A rejected run must not advance either the key stream or the output cursor,
+// so the caller can correct the buffer selection and retry.
+TEST(gcm, incremental_writers_refuse_partial_overlap_before_advancing) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+  gcm128 gcm(key);
+
+  std::vector<uint8_t> shifted(plain.size() + 1);
+  std::copy(plain.begin(), plain.end(), shifted.begin());
+  std::vector<uint8_t> cipher(plain.size());
+  std::vector<uint8_t> tag(16);
+  auto writer = gcm.encryptor(iv).data();
+  EXPECT_THROW(
+      writer.write(ctl::bytes(shifted).first(plain.size()),
+                   ctl::writable_bytes(shifted).subview(1, plain.size())),
+      std::invalid_argument);
+  writer.write(plain, cipher).finish(tag);
+
+  std::copy(cipher.begin(), cipher.end(), shifted.begin());
+  std::vector<uint8_t> recovered(plain.size());
+  auto reader = gcm.decryptor(iv).data();
+  EXPECT_THROW(
+      reader.write(ctl::bytes(shifted).first(cipher.size()),
+                   ctl::writable_bytes(shifted).subview(1, cipher.size())),
+      std::invalid_argument);
+  reader.write(cipher, recovered);
+  ASSERT_TRUE(reader.finish(tag));
+  EXPECT_EQ(test::to_hex(plain), test::to_hex(recovered));
+}
+
+// A holding writer may read from its output only at the exact position it is
+// about to write. That permits chunked in-place operation without accepting a
+// shifted range elsewhere in the buffer.
+TEST(gcm, holding_writers_allow_only_the_current_in_place_position) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+  gcm128 gcm(key);
+
+  std::vector<uint8_t> buffer = plain;
+  std::vector<uint8_t> tag(16);
+  auto writer = gcm.encryptor(iv).data(buffer);
+  EXPECT_THROW(writer.write(ctl::bytes(buffer).subview(1, 7)),
+               std::invalid_argument);
+  EXPECT_EQ(0u, writer.written());
+  writer.write(ctl::bytes(buffer).first(7));
+  writer.write(ctl::bytes(buffer).last(buffer.size() - 7));
+  writer.finish(tag);
+
+  auto reader = gcm.decryptor(iv).data(buffer);
+  EXPECT_THROW(reader.write(ctl::bytes(buffer).subview(1, 7)),
+               std::invalid_argument);
+  EXPECT_EQ(0u, reader.written());
+  reader.write(ctl::bytes(buffer).first(7));
+  reader.write(ctl::bytes(buffer).last(buffer.size() - 7));
+  ASSERT_TRUE(reader.finish(tag));
+  EXPECT_EQ(test::to_hex(plain), test::to_hex(buffer));
+}
+
+TEST(gcm, a_holding_writer_decrypts_and_verifies) {
+  const std::vector<uint8_t> key = test::hex(kKey128);
+  const std::vector<uint8_t> iv = test::hex(kIv96);
+  const std::vector<uint8_t> aad = test::hex(kAad);
+  const std::vector<uint8_t> plain = test::hex(kPlain60);
+
+  gcm128 gcm(key);
+
+  std::vector<uint8_t> cipher(plain.size());
+  std::vector<uint8_t> tag(16);
+  ASSERT_TRUE(gcm.encrypt(iv, {aad}, {plain}, cipher, tag));
+
+  std::vector<uint8_t> recovered(plain.size());
+  auto reader = gcm.decryptor(iv).aad(aad).data(recovered);
+  reader.write(ctl::bytes(cipher).first(13));
+  reader.write(ctl::bytes(cipher).last(cipher.size() - 13));
+  ASSERT_TRUE(reader.finish(tag));
+  EXPECT_EQ(test::to_hex(plain), test::to_hex(recovered));
 }
 
 TEST(gcm, builder_reproduces_the_official_vector) {
