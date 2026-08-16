@@ -230,24 +230,40 @@ AES-128 over a 4096 byte buffer, Intel Core Ultra 7 265K, MSVC `/O2`.
 
 | Mode | Software | Accelerated |
 | --- | --- | --- |
-| ECB | 543 MB/s | 11,400 MB/s |
-| XTS | 472 | 6,200 |
-| CTR | 470 | 4,400 |
+| ECB | 543 MB/s | 11,500 MB/s |
+| XTS | 472 | 6,220 |
+| CTR | 470 | 4,560 |
 | CBC, which chains and cannot be parallelized | 426 | 1,600 |
-| GCM | 103 | 948 |
+| GCM | 103 | 941 |
 
-XTS over 512 byte sectors reaches 4,500 MB/s. ARIA runs at 132 MB/s in software
-and 291 MB/s with the vector path, and ARIA-XTS at 230 MB/s. No operation
+XTS over 512 byte sectors reaches 4,440 MB/s. ARIA runs at 132 MB/s in software
+and 294 MB/s with the vector path, and ARIA-XTS at 221 MB/s. No operation
 performs a heap allocation.
 
-Describing a buffer by a view rather than by a pointer and a length costs
-nothing measurable in most places. Running the same benchmark against the
-interface it replaced, interleaved so that neither sees a different thermal
-state, puts every mode within the couple of percent the runs vary by on their
-own, except CTR. CTR crosses into the cipher once per batch rather than once per
-call, and there the three buffers describing themselves rather than sharing one
-block count measures two to three percent slower. That number is real and not
-noise, and it buys the only thing that made those three buffers checkable.
+Describing a buffer by a view rather than by a pointer and a length is close to
+free. Measured against the interface it replaced, six runs of each interleaved so
+that neither sees a different thermal state, CBC, GCM, ARIA and ARIA-XTS are
+level, CTR is slightly ahead, ECB is about one percent behind and XTS is about
+two percent behind at both data unit sizes.
+
+Two places had to be shaped for this rather than just converted. Where a mode
+hands work to its cipher inside a loop, once per batch rather than once per
+call, the batch is one length both sides already know, so it is part of the
+argument types; a pointer and a length together do not fit in a register on
+x86-64, and three of them stated separately cost CTR two to three percent before
+the length moved into the type. And a mode's own private helpers take pointers,
+since the range was settled by the entry point that called them.
+
+XTS's two percent is not in the code that runs. It appeared at the commit where
+the entry points started taking views, not at the batch rework; ECB moved by the
+same amount there and CBC did not, though CBC takes the same two views. The
+generated batch loop is the same in both, three pointers where there used to be
+three pointers and a count. Forcing back the one inlining decision that did
+change moves XTS to half a percent behind and takes CTR from ahead to level,
+which is trading one mode against another rather than removing a cost. And
+putting dead code in front of an otherwise identical benchmark moves XTS by one
+percent on its own. So it is where the code lands, and it is left written down
+rather than explained away.
 
 ## Status and limits
 

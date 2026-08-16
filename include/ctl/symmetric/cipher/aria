@@ -496,6 +496,21 @@ public:
   typedef ctl::writable_fixed_bytes<block_size> writable_block_view;
 
   /**
+   * @brief One batch in bytes
+   */
+  static constexpr size_t batch_bytes = preferred_batch * block_size;
+
+  /**
+   * @brief One batch handed over for reading
+   */
+  typedef ctl::fixed_bytes<batch_bytes> batch_view;
+
+  /**
+   * @brief One batch handed over to be written
+   */
+  typedef ctl::writable_fixed_bytes<batch_bytes> writable_batch_view;
+
+  /**
    * @brief Initializes with a key
    *
    * The length the key has to be is part of key_view, so an array or a
@@ -677,19 +692,16 @@ public:
    * iterates; the interface exists so that a mode works with any block cipher
    * through the same code.
    *
-   * @param input the blocks to encrypt, a whole number of them
-   * @param mask one mask per block, at least as long as input
-   * @param output where the results go, at least as long as input and may be
-   * the same buffer
-   * @exception std::invalid_argument if input is not a whole number of blocks,
-   * or if mask or output is shorter than input
+   * Exactly one batch, whose length is part of the argument types, matching the
+   * shape AES uses so that a mode reaches either cipher through the same code.
+   *
+   * @param input the batch to encrypt
+   * @param mask one mask per block
+   * @param output where the results go, may be the same buffer as input
    */
-  void encrypt_blocks_masked(ctl::bytes input, ctl::bytes mask,
-                             ctl::writable_bytes output) const {
-    const size_t count = ctl::detail::require_whole_blocks(
-        "ctl::symmetric::cipher::aria::encrypt_blocks_masked", input, "mask",
-        mask, output, block_size);
-    for (size_t i = 0; i < count; ++i)
+  void encrypt_batch_masked(batch_view input, batch_view mask,
+                            writable_batch_view output) const {
+    for (size_t i = 0; i < preferred_batch; ++i)
       block_masked(ek_, input.data() + i * block_size,
                    mask.data() + i * block_size,
                    output.data() + i * block_size);
@@ -700,19 +712,13 @@ public:
    *
    * Computes output[i] = D(input[i] ^ mask[i]) ^ mask[i].
    *
-   * @param input the blocks to decrypt, a whole number of them
-   * @param mask one mask per block, at least as long as input
-   * @param output where the results go, at least as long as input and may be
-   * the same buffer
-   * @exception std::invalid_argument if input is not a whole number of blocks,
-   * or if mask or output is shorter than input
+   * @param input the batch to decrypt
+   * @param mask one mask per block
+   * @param output where the results go, may be the same buffer as input
    */
-  void decrypt_blocks_masked(ctl::bytes input, ctl::bytes mask,
-                             ctl::writable_bytes output) const {
-    const size_t count = ctl::detail::require_whole_blocks(
-        "ctl::symmetric::cipher::aria::decrypt_blocks_masked", input, "mask",
-        mask, output, block_size);
-    for (size_t i = 0; i < count; ++i)
+  void decrypt_batch_masked(batch_view input, batch_view mask,
+                            writable_batch_view output) const {
+    for (size_t i = 0; i < preferred_batch; ++i)
       block_masked(dk_, input.data() + i * block_size,
                    mask.data() + i * block_size,
                    output.data() + i * block_size);
@@ -724,19 +730,13 @@ public:
    * Computes output[i] = E(input[i]) ^ operand[i], which is what counter based
    * modes need.
    *
-   * @param input the counter blocks to encrypt, a whole number of them
-   * @param operand what to combine the results with, at least as long as input
-   * @param output where the results go, at least as long as input and may be
-   * the same buffer as operand
-   * @exception std::invalid_argument if input is not a whole number of blocks,
-   * or if operand or output is shorter than input
+   * @param input the batch of counter blocks to encrypt
+   * @param operand what to combine the results with
+   * @param output where the results go, may be the same buffer as operand
    */
-  void encrypt_blocks_then_xor(ctl::bytes input, ctl::bytes operand,
-                               ctl::writable_bytes output) const {
-    const size_t count = ctl::detail::require_whole_blocks(
-        "ctl::symmetric::cipher::aria::encrypt_blocks_then_xor", input,
-        "operand", operand, output, block_size);
-    for (size_t i = 0; i < count; ++i) {
+  void encrypt_batch_then_xor(batch_view input, batch_view operand,
+                              writable_batch_view output) const {
+    for (size_t i = 0; i < preferred_batch; ++i) {
       uint8_t buffer[block_size];
       crypt(ek_, input.data() + i * block_size, buffer);
       ctl::detail::xor_block<block_size>(buffer, operand.data() + i * block_size,

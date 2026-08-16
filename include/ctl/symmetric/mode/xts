@@ -24,6 +24,37 @@
  *    The test values in the IEEE appendix print the already converted byte
  *    string, so reading them back as an integer does not line up.
  *
+ * This mode measures about two percent below the pointer and length interface it
+ * replaced, over both 512 and 4096 byte data units, where every other mode is
+ * level with it or ahead. Four things were done to find out why, and what they
+ * found is that the two percent is not in the code that runs.
+ *
+ * Which change it appeared at: the first one, where the entry points started
+ * taking views. Not the batch rework after it. ECB moved by the same amount at
+ * the same commit and CBC did not, though CBC takes the same two views, so it
+ * tracks throughput rather than argument shape.
+ *
+ * What the generated code does: the batch loop is the same. Both versions call
+ * out to the cipher, with three pointers where there used to be three pointers
+ * and a count. There is one real difference: the compiler used to inline
+ * encrypt_block into the helper below and now does not, so the single block path
+ * costs a call. That path runs zero times at either size measured, since 512 and
+ * 4096 bytes are both whole numbers of batches with nothing left over.
+ *
+ * Whether forcing that back changes anything: it moves 512 byte units from two
+ * percent behind to half a percent behind and takes CTR from one and a half
+ * percent ahead to level. Trading one mode against another without touching the
+ * code that runs is what layout does, not what a cost does.
+ *
+ * How far layout alone reaches: putting dead code in front of an otherwise
+ * identical benchmark moves this mode by one percent and ECB by half a percent.
+ *
+ * So it is where the code lands. Left as measured rather than given a cause.
+ *
+ * Whoever looks at this next: measure with a standalone benchmark, not one
+ * linked into the test binary. That was tried and moved unrelated modes by three
+ * percent, which is more than the thing being looked for.
+ *
  * @version 0.1
  *
  * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
@@ -88,6 +119,11 @@ public:
    * @brief Number of blocks processed in one batch
    */
   static constexpr size_t batch_blocks = cipher_type::preferred_batch;
+
+  /**
+   * @brief One batch in bytes
+   */
+  static constexpr size_t batch_bytes = cipher_type::batch_bytes;
 
   /**
    * @brief Tweak type, for declaring storage for one
@@ -164,8 +200,9 @@ public:
    * @param tweak the 128 bit tweak, i in the specification
    * @param input the data to encrypt, at least block_size bytes
    * @param output where the ciphertext goes, at least as long as input and may
-   * be the same buffer
-   * @exception std::invalid_argument if output is shorter than input
+   * be exactly the same buffer; any other overlap is refused
+   * @exception std::invalid_argument if output is shorter than input, or if
+   * input and output partially overlap
    */
   [[nodiscard]] ext::void_result<error_status>
   encrypt(tweak_view tweak, ctl::bytes input,
@@ -176,6 +213,9 @@ public:
       return ext::err(status);
     ctl::detail::require_capacity("ctl::symmetric::mode::xts::encrypt",
                                   "output", output.size(), size);
+    ctl::detail::require_exact_or_disjoint(
+        "ctl::symmetric::mode::xts::encrypt", input.data(), size,
+        output.data(), output.data(), size);
 
     uint8_t encrypted_tweak[block_size];
     tweak_cipher_.encrypt_block(tweak, encrypted_tweak);
@@ -188,7 +228,7 @@ public:
     const size_t whole = remainder == 0 ? size / block_size
                                         : size / block_size - 1;
 
-    transform_blocks<true>(input, whole, t, output);
+    transform_blocks<true>(input.data(), whole, t, output.data());
 
     if (remainder != 0) {
       const size_t last = whole * block_size;
@@ -223,8 +263,9 @@ public:
    * @param tweak the 128 bit tweak, i in the specification
    * @param input the data to decrypt, at least block_size bytes
    * @param output where the plaintext goes, at least as long as input and may
-   * be the same buffer
-   * @exception std::invalid_argument if output is shorter than input
+   * be exactly the same buffer; any other overlap is refused
+   * @exception std::invalid_argument if output is shorter than input, or if
+   * input and output partially overlap
    */
   [[nodiscard]] ext::void_result<error_status>
   decrypt(tweak_view tweak, ctl::bytes input,
@@ -235,6 +276,9 @@ public:
       return ext::err(status);
     ctl::detail::require_capacity("ctl::symmetric::mode::xts::decrypt",
                                   "output", output.size(), size);
+    ctl::detail::require_exact_or_disjoint(
+        "ctl::symmetric::mode::xts::decrypt", input.data(), size,
+        output.data(), output.data(), size);
 
     uint8_t encrypted_tweak[block_size];
     tweak_cipher_.encrypt_block(tweak, encrypted_tweak);
@@ -245,7 +289,7 @@ public:
     const size_t whole = remainder == 0 ? size / block_size
                                         : size / block_size - 1;
 
-    transform_blocks<false>(input, whole, t, output);
+    transform_blocks<false>(input.data(), whole, t, output.data());
 
     if (remainder != 0) {
       const size_t last = whole * block_size;
@@ -416,6 +460,13 @@ private:
    * multiplication, but that is only a handful of operations and does not
    * become the bottleneck.
    *
+   * Takes pointers rather than views, unlike everything a caller can reach.
+   * Whether the range is there was settled by the entry point that got here,
+   * and count comes from the same length that was checked, so a view would only
+   * carry a length that is already known to be right. That is not free: a
+   * pointer and a length together do not fit in a register on this platform, and
+   * this runs once per data unit, which for 512 byte sectors is often.
+   *
    * @tparam _Encrypt true to encrypt, false to decrypt
    * @param input the data unit, of which the leading count blocks are processed
    * @param count number of blocks to process, which is fewer than the data unit
@@ -424,9 +475,9 @@ private:
    * @param output output, may be the same buffer as input
    */
   template <bool _Encrypt>
-  void transform_blocks(ctl::bytes input, size_t count, tweak_state &t,
-                        ctl::writable_bytes output) const {
-    uint8_t tweaks[batch_blocks * block_size];
+  void transform_blocks(const uint8_t *input, size_t count, tweak_state &t,
+                        uint8_t *output) const {
+    uint8_t tweaks[batch_bytes];
 
     size_t j = 0;
     while (data_cipher_.prefers_batching() && j + batch_blocks <= count) {
@@ -442,22 +493,24 @@ private:
       // the masked values in registers. Doing it separately would mean writing
       // the masked input to a buffer, letting the cipher read and write that
       // buffer, and reading it back to unmask.
+      // The loop condition puts this batch inside the range the entry point
+      // checked, so the length these name is known to be there and the views
+      // are built from the pointers directly.
+      typedef typename cipher_type::batch_view batch_in;
+      typedef typename cipher_type::writable_batch_view batch_out;
       const size_t at = j * block_size;
       if constexpr (_Encrypt)
-        data_cipher_.encrypt_blocks_masked(input.subview(at, sizeof(tweaks)),
-                                          tweaks,
-                                          output.subview(at, sizeof(tweaks)));
+        data_cipher_.encrypt_batch_masked(batch_in(input + at), tweaks,
+                                         batch_out(output + at));
       else
-        data_cipher_.decrypt_blocks_masked(input.subview(at, sizeof(tweaks)),
-                                          tweaks,
-                                          output.subview(at, sizeof(tweaks)));
+        data_cipher_.decrypt_batch_masked(batch_in(input + at), tweaks,
+                                         batch_out(output + at));
       j += batch_blocks;
     }
 
     // Blocks left over that do not fill a batch
     for (; j < count; ++j) {
-      transform<_Encrypt>(input.data() + j * block_size, t,
-                          output.data() + j * block_size);
+      transform<_Encrypt>(input + j * block_size, t, output + j * block_size);
       advance(t);
     }
 

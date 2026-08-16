@@ -29,6 +29,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -37,6 +38,9 @@
 #include <ctl/detail/config>
 
 namespace ctl {
+
+template <size_t _Size> class fixed_bytes;
+template <size_t _Size> class writable_fixed_bytes;
 
 namespace detail {
 
@@ -159,6 +163,58 @@ inline void require_capacity(const char *where, const char *what,
     throw_short_buffer(where, what, available, needed);
 }
 
+/**
+ * @brief Whether two non-owning byte ranges share at least one byte
+ *
+ * Relational comparison of pointers to unrelated objects is not defined for
+ * the built-in operators. std::less supplies the total order needed here,
+ * while addition stays within each view and its one-past-the-end pointer.
+ */
+inline bool ranges_overlap(const uint8_t *first, size_t first_size,
+                           const uint8_t *second, size_t second_size) {
+  if (first_size == 0 || second_size == 0)
+    return false;
+  const std::less<const uint8_t *> before;
+  return before(first, second + second_size) &&
+         before(second, first + first_size);
+}
+
+/**
+ * @brief Refuses a shifted overlap before an operation writes anything
+ *
+ * Forward block and stream transforms support an exact in-place operation,
+ * but cannot in general provide memmove semantics. The output range may be
+ * wider than this invocation writes; output_size names only the part that is
+ * actually used.
+ */
+inline void require_exact_or_disjoint(const char *where,
+                                      const uint8_t *input,
+                                      size_t input_size,
+                                      uint8_t *destination,
+                                      uint8_t *output,
+                                      size_t output_size) {
+  if (input_size == 0 || input == destination)
+    return;
+  if (ranges_overlap(input, input_size, output, output_size))
+    throw std::invalid_argument(
+        std::string(where) +
+        " : input and output partially overlap. They must be disjoint, or "
+        "the input must begin exactly where its result is written.");
+}
+
+/**
+ * @brief Requires two ranges not to share storage
+ */
+inline void require_disjoint(const char *where, const char *first_name,
+                             const uint8_t *first, size_t first_size,
+                             const char *second_name, const uint8_t *second,
+                             size_t second_size) {
+  if (ranges_overlap(first, first_size, second, second_size))
+    throw std::invalid_argument(std::string(where) + " : the " + first_name +
+                                " and " + second_name +
+                                " buffers overlap, but they must be disjoint.");
+}
+
 } // namespace detail
 
 /**
@@ -249,6 +305,21 @@ public:
     return bytes(data_ + size_ - count, count);
   }
 
+  /**
+   * @brief A view over _Count bytes at an offset, with the length in the type
+   *
+   * For a window whose length the program fixes rather than discovers, which is
+   * what a loop handing fixed size batches to a cipher works in. What comes back
+   * is a pointer and nothing else, so it goes to the callee in a register, and
+   * the length being part of the type means the callee has nothing left to
+   * check.
+   *
+   * @tparam _Count how long the window is
+   * @param offset where it starts
+   * @exception std::out_of_range if the window is not inside this view
+   */
+  template <size_t _Count> fixed_bytes<_Count> window(size_t offset) const;
+
 private:
   const uint8_t *data_;
   size_t size_;
@@ -308,6 +379,16 @@ public:
           "ctl::writable_bytes::last : the range lies outside the view.");
     return writable_bytes(data_ + size_ - count, count);
   }
+
+  /**
+   * @brief A window of _Count bytes at an offset, with the length in the type
+   *
+   * @tparam _Count how long the window is
+   * @param offset where it starts
+   * @exception std::out_of_range if the window is not inside this view
+   */
+  template <size_t _Count>
+  writable_fixed_bytes<_Count> window(size_t offset) const;
 
 private:
   uint8_t *data_;
@@ -478,6 +559,23 @@ inline fixed_bytes<_Size>::fixed_bytes(
     writable_fixed_bytes<_Size> view) noexcept
     : data_(view.data()) {}
 
+template <size_t _Count>
+inline fixed_bytes<_Count> bytes::window(size_t offset) const {
+  if (offset > size_ || _Count > size_ - offset)
+    throw std::out_of_range(
+        "ctl::bytes::window : the window lies outside the view.");
+  return fixed_bytes<_Count>(data_ + offset);
+}
+
+template <size_t _Count>
+inline writable_fixed_bytes<_Count>
+writable_bytes::window(size_t offset) const {
+  if (offset > size_ || _Count > size_ - offset)
+    throw std::out_of_range(
+        "ctl::writable_bytes::window : the window lies outside the view.");
+  return writable_fixed_bytes<_Count>(data_ + offset);
+}
+
 namespace detail {
 
 /**
@@ -510,6 +608,8 @@ inline size_t require_whole_blocks(const char *where, bytes input,
   if (input.size() % block_size != 0)
     throw_partial_block(where, input.size(), block_size);
   require_capacity(where, "output", output.size(), input.size());
+  require_exact_or_disjoint(where, input.data(), input.size(), output.data(),
+                            output.data(), input.size());
   return input.size() / block_size;
 }
 

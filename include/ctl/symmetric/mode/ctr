@@ -29,6 +29,7 @@
 #include <cstring>
 
 #include <ctl/bytes>
+#include <ctl/detail/endian>
 #include <ctl/detail/memory>
 
 namespace ctl {
@@ -88,6 +89,11 @@ public:
   static constexpr size_t batch_blocks = cipher_type::preferred_batch;
 
   /**
+   * @brief One batch in bytes
+   */
+  static constexpr size_t batch_bytes = cipher_type::batch_bytes;
+
+  /**
    * @brief Initializes with a key
    *
    * @param key the key, key_size bytes
@@ -107,13 +113,17 @@ public:
    * @param byte_offset position in the stream to start at, in bytes
    * @param input the data to process, of any length
    * @param output where the result goes, at least as long as input and may be
-   * the same buffer
-   * @exception std::invalid_argument if output is shorter than input
+   * exactly the same buffer; any other overlap is refused
+   * @exception std::invalid_argument if output is shorter than input, or if
+   * input and output partially overlap
    */
   void crypt(nonce_view nonce, offset_t byte_offset, ctl::bytes input,
              ctl::writable_bytes output) const {
     ctl::detail::require_capacity("ctl::symmetric::mode::ctr::crypt",
                                   "output", output.size(), input.size());
+    ctl::detail::require_exact_or_disjoint(
+        "ctl::symmetric::mode::ctr::crypt", input.data(), input.size(),
+        output.data(), output.data(), input.size());
 
     const size_t size = input.size();
     counter_state counter = load_counter(nonce.data());
@@ -142,9 +152,9 @@ public:
     // Over the block aligned stretch, several counter blocks are prepared and
     // encrypted at once. Key stream blocks are mutually independent, so they
     // can be interleaved on a hardware path.
-    uint8_t counters[batch_blocks * block_size];
-    for (; cipher_.prefers_batching() && i + sizeof(counters) <= size;
-         i += sizeof(counters)) {
+    uint8_t counters[batch_bytes];
+    for (; cipher_.prefers_batching() && i + batch_bytes <= size;
+         i += batch_bytes) {
       for (size_t b = 0; b < batch_blocks; ++b) {
         store_counter(counter, counters + b * block_size);
         increment(counter, 1);
@@ -154,19 +164,19 @@ public:
       // and reading it back just to exclusive or it.
       //
       // This is the one place in the library that crosses into the cipher once
-      // per batch rather than once per call, and describing the three buffers
-      // by view rather than by one shared block count measures about two to
-      // three percent slower here. Every other mode is within the couple of
-      // percent the runs vary by on their own. The three buffers being
-      // checkable at all is worth that, but the number is real and not noise.
+      // per batch rather than once per call, so the shape of these arguments is
+      // the only one that shows up in the throughput. All three are one fixed
+      // length that both sides know, so each costs a pointer and the three
+      // agree without being compared. Stating three lengths separately instead
+      // cost two to three percent, since a pointer and a length together do not
+      // fit in a register on this platform and have to be checked against one
+      // another on arrival.
       //
       // Staging four times as many counter blocks, so this is reached a quarter
-      // as often, was tried and made it worse rather than better, by about
-      // seven percent. So what costs is not the number of times this is
-      // reached. Do not try that again.
-      cipher_.encrypt_blocks_then_xor(counters,
-                                      input.subview(i, sizeof(counters)),
-                                      output.subview(i, sizeof(counters)));
+      // as often, was also tried and made it worse by about seven percent. How
+      // often it is reached is not what costs. Do not try that again.
+      cipher_.encrypt_batch_then_xor(counters, input.window<batch_bytes>(i),
+                                     output.window<batch_bytes>(i));
     }
 
     // Whole blocks left over that do not fill a batch
