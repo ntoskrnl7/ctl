@@ -50,9 +50,11 @@
     (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
 #define CTL_TARGET_AESNI __attribute__((target("aes,ssse3,sse2")))
 #define CTL_TARGET_PCLMUL __attribute__((target("pclmul,ssse3,sse2")))
+#define CTL_TARGET_SSE2 __attribute__((target("sse2")))
 #else
 #define CTL_TARGET_AESNI
 #define CTL_TARGET_PCLMUL
+#define CTL_TARGET_SSE2
 #endif
 
 /**

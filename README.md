@@ -226,6 +226,13 @@ Chosen at run time through CPUID, so one binary runs anywhere.
   layer becomes seven byte shuffles. The state then stays in one register for
   the whole block instead of being written out and read back every round, which
   is where the time was going.
+- **SSE2 for LEA**, which needs no instruction set of its own at all. A round is
+  four 32 bit words put through addition, exclusive or and rotation, and none of
+  those look outside their own lane, so four blocks run through four lanes with
+  the sequence one block uses. The cost is that there is no rotate below
+  AVX-512, so each of the three becomes a pair of shifts and an or, and that
+  four blocks have to be exchanged into lanes on the way in and back on the way
+  out. It comes to two and a half times the throughput of one block at a time.
 
 Define `CTL_NO_HW_ACCEL` to leave all of it out. The published vectors pass
 either way, and every cipher with two paths has a test that runs the same inputs
@@ -251,14 +258,20 @@ The other two ciphers, over the same 4096 byte buffer.
 
 | | ECB | CTR | XTS | GCM |
 | --- | --- | --- | --- | --- |
-| LEA-128 | 730 MB/s | 594 | 586 | 617 |
-| ARIA-128 | 291 | 234 | 221 | 224 |
+| LEA-128, four blocks at a time | 1,837 MB/s | 1,485 | 1,557 | 613 |
+| LEA-128, one block at a time | 729 | 598 | 593 | 613 |
+| ARIA-128, vector path | 291 | 234 | 221 | 224 |
+| ARIA-128, one block at a time | 132 | — | — | — |
 
-Neither has a hardware path for the cipher itself, so those are what the
-processor does with the algorithm as written. LEA is worth comparing against the
-543 MB/s the software path of AES reaches in the table above: it is faster than
-AES is without AES-NI, which is what it was designed for, and it gets there
-without a table.
+Worth comparing LEA against the 543 MB/s the software path of AES reaches in the
+table above. Without AES-NI it is more than three times faster than AES, which is
+what it was designed for, and it gets there without a table.
+
+GCM is the one that does not move, and it is the mode rather than the cipher.
+CTR and XTS ask their cipher for a batch and get four blocks in one pass; GCM
+produces its key stream a block at a time and so never reaches that entry point.
+Its figure is what the carry-less multiply does for GHASH, not what the vector
+path does for LEA.
 
 Describing a buffer by a view rather than by a pointer and a length is close to
 free. Measured against the interface it replaced, six runs of each interleaved so

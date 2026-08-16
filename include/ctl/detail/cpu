@@ -59,12 +59,57 @@ inline bool feature_bit(unsigned int bit) {
 }
 
 /**
+ * @brief Queries a bit of EDX from the basic CPUID leaf (1)
+ *
+ * The older instruction sets are reported in EDX rather than ECX, so they need
+ * a separate query.
+ *
+ * @param bit bit position to check
+ * @return true if the feature is supported
+ */
+inline bool legacy_feature_bit(unsigned int bit) {
+#if defined(CTL_ARCH_X86)
+#if defined(_MSC_VER)
+  int registers[4] = {0, 0, 0, 0};
+  __cpuid(registers, 1);
+  return ((static_cast<unsigned int>(registers[3]) >> bit) & 1u) != 0;
+#else
+  unsigned int eax = 0;
+  unsigned int ebx = 0;
+  unsigned int ecx = 0;
+  unsigned int edx = 0;
+  if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx))
+    return false;
+  return ((edx >> bit) & 1u) != 0;
+#endif
+#else
+  (void)bit;
+  return false;
+#endif
+}
+
+/**
  * @brief Whether the AES instruction set (AES-NI) is supported
  *
  * The query is performed once and the result is kept.
  */
 inline bool has_aes() {
   static const bool supported = feature_bit(25);
+  return supported;
+}
+
+/**
+ * @brief Whether SSE2 is supported
+ *
+ * Every 64 bit x86 processor has it, so on that target this is always true and
+ * the branch it guards folds away. It is still asked rather than assumed,
+ * because the same header is compiled for 32 bit x86, where it is not given.
+ *
+ * What uses it is the vector path of LEA, which needs nothing beyond 32 bit
+ * integer addition, shifts and exclusive or across four lanes.
+ */
+inline bool has_sse2() {
+  static const bool supported = legacy_feature_bit(26);
   return supported;
 }
 

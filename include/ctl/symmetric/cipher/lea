@@ -27,6 +27,14 @@
  * block big endian produces a wrong answer that still round trips, so the
  * published vectors are what catches it.
  *
+ * There is a vector path, and it needs nothing but SSE2. A round is four 32 bit
+ * words put through addition, exclusive or and rotation, and none of those look
+ * at anything outside their own lane, so four blocks go through four lanes with
+ * the same instruction sequence a single block uses. ARIA had to borrow the AES
+ * round instructions to get at its S-box, and AES needs AES-NI to be quick at
+ * all; this needs neither, only the ability to add and shift four words at once,
+ * which every 64 bit x86 processor has.
+ *
  * @version 0.1
  *
  * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
@@ -39,8 +47,17 @@
 
 #include <ctl/bytes>
 #include <ctl/detail/config>
+#include <ctl/detail/cpu>
 #include <ctl/detail/endian>
 #include <ctl/detail/memory>
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <emmintrin.h>
+#endif
+#endif
 
 namespace ctl {
 namespace symmetric {
@@ -128,9 +145,17 @@ public:
    * @brief A good number of blocks to process in one batch
    *
    * Kept in line with the other ciphers so that a mode sizes its staging
-   * buffers the same way whichever cipher it was given.
+   * buffers the same way whichever cipher it was given. The vector path takes
+   * four blocks at a time, so a batch is two passes of it.
    */
   static constexpr size_t preferred_batch = 8;
+
+  /**
+   * @brief How many blocks the vector path takes at once
+   *
+   * Four 32 bit lanes in a 128 bit register, one block per lane.
+   */
+  static constexpr size_t vector_blocks = 4;
 
   /**
    * @brief Key type, for declaring storage for a key
@@ -183,7 +208,12 @@ public:
   /**
    * @brief Erases the round keys on destruction
    */
-  ~lea() { ctl::detail::secure_zero(rk_, sizeof(rk_)); }
+  ~lea() {
+    ctl::detail::secure_zero(rk_, sizeof(rk_));
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    ctl::detail::secure_zero(rkv_, sizeof(rkv_));
+#endif
+  }
 
   /**
    * @brief Sets the key again
@@ -201,6 +231,10 @@ public:
    * @param key the key
    */
   void set_key(key_view key) {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    vector_ = ctl::detail::cpu::has_sse2();
+#endif
+
     uint32_t t[key_words];
     for (size_t i = 0; i < key_words; ++i)
       t[i] = ctl::detail::load_le32(key.data() + 4 * i);
@@ -238,6 +272,20 @@ public:
         }
       }
     }
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    // Every lane of the vector path wants the same round key word, so the
+    // broadcast is done once here instead of six times per round inside the
+    // loop. It costs four times the room, which for LEA-128 is a little over
+    // two kilobytes, and takes a load where the inner loop would otherwise have
+    // a move and a shuffle.
+    if (vector_) {
+      for (size_t i = 0; i < rounds; ++i)
+        for (size_t j = 0; j < round_key_words; ++j)
+          for (size_t lane = 0; lane < vector_blocks; ++lane)
+            rkv_[i][j][lane] = rk_[i][j];
+    }
+#endif
 
     ctl::detail::secure_zero(t, sizeof(t));
   }
@@ -314,10 +362,16 @@ public:
   /**
    * @brief Whether passing blocks in batches is worthwhile
    *
-   * There is no vector path yet, so batching would only add the cost of moving
-   * data through the staging buffers of the mode of operation.
+   * It is exactly when the vector path is available, since that is what turns
+   * several independent blocks into one pass.
    */
-  bool prefers_batching() const { return false; }
+  bool prefers_batching() const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    return vector_;
+#else
+    return false;
+#endif
+  }
 
   /**
    * @brief Encrypts several mutually independent blocks
@@ -332,9 +386,17 @@ public:
     const size_t count = ctl::detail::require_whole_blocks(
         "ctl::symmetric::cipher::lea::encrypt_blocks", input, output,
         block_size);
-    for (size_t i = 0; i < count; ++i)
-      encrypt_block(block_view(input.data() + i * block_size),
-                    writable_block_view(output.data() + i * block_size));
+    const uint8_t *in = input.data();
+    uint8_t *out = output.data();
+    size_t i = 0;
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (vector_)
+      for (; i + vector_blocks <= count; i += vector_blocks)
+        four<true>(in + i * block_size, out + i * block_size);
+#endif
+    for (; i < count; ++i)
+      encrypt_block(block_view(in + i * block_size),
+                    writable_block_view(out + i * block_size));
   }
 
   /**
@@ -349,6 +411,51 @@ public:
   void decrypt_blocks(ctl::bytes input, ctl::writable_bytes output) const {
     const size_t count = ctl::detail::require_whole_blocks(
         "ctl::symmetric::cipher::lea::decrypt_blocks", input, output,
+        block_size);
+    const uint8_t *in = input.data();
+    uint8_t *out = output.data();
+    size_t i = 0;
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (vector_)
+      for (; i + vector_blocks <= count; i += vector_blocks)
+        four<false>(in + i * block_size, out + i * block_size);
+#endif
+    for (; i < count; ++i)
+      decrypt_block(block_view(in + i * block_size),
+                    writable_block_view(out + i * block_size));
+  }
+
+  /**
+   * @brief Encrypts several blocks a block at a time, never using the vector
+   * path
+   *
+   * Kept public so that the test comparing the two paths has a reference to
+   * compare against.
+   *
+   * @param input the blocks to encrypt, a whole number of them
+   * @param output where the results go, at least as long as input
+   */
+  void encrypt_blocks_software(ctl::bytes input,
+                               ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::lea::encrypt_blocks_software", input, output,
+        block_size);
+    for (size_t i = 0; i < count; ++i)
+      encrypt_block(block_view(input.data() + i * block_size),
+                    writable_block_view(output.data() + i * block_size));
+  }
+
+  /**
+   * @brief Decrypts several blocks a block at a time, never using the vector
+   * path
+   *
+   * @param input the blocks to decrypt, a whole number of them
+   * @param output where the results go, at least as long as input
+   */
+  void decrypt_blocks_software(ctl::bytes input,
+                               ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::lea::decrypt_blocks_software", input, output,
         block_size);
     for (size_t i = 0; i < count; ++i)
       decrypt_block(block_view(input.data() + i * block_size),
@@ -369,6 +476,15 @@ public:
    */
   void encrypt_batch_masked(batch_view input, batch_view mask,
                             writable_batch_view output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (vector_) {
+      for (size_t i = 0; i < preferred_batch; i += vector_blocks)
+        four_combined<true, true>(input.data() + i * block_size,
+                                  mask.data() + i * block_size,
+                                  output.data() + i * block_size);
+      return;
+    }
+#endif
     for (size_t i = 0; i < preferred_batch; ++i)
       block_masked<true>(input.data() + i * block_size,
                          mask.data() + i * block_size,
@@ -384,6 +500,15 @@ public:
    */
   void decrypt_batch_masked(batch_view input, batch_view mask,
                             writable_batch_view output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (vector_) {
+      for (size_t i = 0; i < preferred_batch; i += vector_blocks)
+        four_combined<false, true>(input.data() + i * block_size,
+                                   mask.data() + i * block_size,
+                                   output.data() + i * block_size);
+      return;
+    }
+#endif
     for (size_t i = 0; i < preferred_batch; ++i)
       block_masked<false>(input.data() + i * block_size,
                           mask.data() + i * block_size,
@@ -402,6 +527,15 @@ public:
    */
   void encrypt_batch_then_xor(batch_view input, batch_view operand,
                               writable_batch_view output) const {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    if (vector_) {
+      for (size_t i = 0; i < preferred_batch; i += vector_blocks)
+        four_combined<true, false>(input.data() + i * block_size,
+                                   operand.data() + i * block_size,
+                                   output.data() + i * block_size);
+      return;
+    }
+#endif
     for (size_t i = 0; i < preferred_batch; ++i) {
       uint8_t buffer[block_size];
       encrypt_block(block_view(input.data() + i * block_size), buffer);
@@ -411,6 +545,190 @@ public:
   }
 
 private:
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  /**
+   * @brief Rotates each of the four lanes left
+   *
+   * There is no rotate instruction below AVX-512, so it is the usual pair of
+   * shifts and an or. Three instructions where the scalar path has one is the
+   * price of the vector path, and four lanes is what pays it.
+   */
+  template <unsigned int _N>
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE __m128i rotl_lanes(__m128i v) {
+    return _mm_or_si128(_mm_slli_epi32(v, _N), _mm_srli_epi32(v, 32 - _N));
+  }
+
+  /**
+   * @brief Rotates each of the four lanes right
+   */
+  template <unsigned int _N>
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE __m128i rotr_lanes(__m128i v) {
+    return _mm_or_si128(_mm_srli_epi32(v, _N), _mm_slli_epi32(v, 32 - _N));
+  }
+
+  /**
+   * @brief Exchanges rows and columns of four blocks
+   *
+   * Blocks arrive one after another, so a register loaded straight from memory
+   * holds the four words of one block. The round wants the opposite: one word
+   * of each of four blocks, so that a lane is a block and the four of them go
+   * through the round together. This is that exchange, and it is its own
+   * inverse, so the same eight instructions put the result back.
+   */
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE void
+  transpose(__m128i &a, __m128i &b, __m128i &c, __m128i &d) {
+    const __m128i ab_low = _mm_unpacklo_epi32(a, b);
+    const __m128i ab_high = _mm_unpackhi_epi32(a, b);
+    const __m128i cd_low = _mm_unpacklo_epi32(c, d);
+    const __m128i cd_high = _mm_unpackhi_epi32(c, d);
+    a = _mm_unpacklo_epi64(ab_low, cd_low);
+    b = _mm_unpackhi_epi64(ab_low, cd_low);
+    c = _mm_unpacklo_epi64(ab_high, cd_high);
+    d = _mm_unpackhi_epi64(ab_high, cd_high);
+  }
+
+  /**
+   * @brief Runs every round over four blocks held one to a lane
+   *
+   * The same sequence the scalar path runs, with each operation applied to four
+   * lanes at once. Nothing here looks outside its own lane, which is the whole
+   * reason this works.
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   */
+  template <bool _Encrypt>
+  CTL_TARGET_SSE2 CTL_FORCEINLINE void
+  rounds_lanes(__m128i &x0, __m128i &x1, __m128i &x2, __m128i &x3) const {
+    if constexpr (_Encrypt) {
+      for (size_t i = 0; i < rounds; ++i) {
+        const uint32_t *rk = &rkv_[i][0][0];
+        const __m128i carried = x0;
+        x0 = rotl_lanes<9>(_mm_add_epi32(
+            _mm_xor_si128(x0, load_key(rk + 0)),
+            _mm_xor_si128(x1, load_key(rk + 4))));
+        x1 = rotr_lanes<5>(_mm_add_epi32(
+            _mm_xor_si128(x1, load_key(rk + 8)),
+            _mm_xor_si128(x2, load_key(rk + 12))));
+        x2 = rotr_lanes<3>(_mm_add_epi32(
+            _mm_xor_si128(x2, load_key(rk + 16)),
+            _mm_xor_si128(x3, load_key(rk + 20))));
+        x3 = carried;
+      }
+    } else {
+      for (size_t i = rounds; i-- > 0;) {
+        const uint32_t *rk = &rkv_[i][0][0];
+        const __m128i p0 = x3;
+        const __m128i p1 = _mm_xor_si128(
+            _mm_sub_epi32(rotr_lanes<9>(x0),
+                          _mm_xor_si128(p0, load_key(rk + 0))),
+            load_key(rk + 4));
+        const __m128i p2 = _mm_xor_si128(
+            _mm_sub_epi32(rotl_lanes<5>(x1),
+                          _mm_xor_si128(p1, load_key(rk + 8))),
+            load_key(rk + 12));
+        const __m128i p3 = _mm_xor_si128(
+            _mm_sub_epi32(rotl_lanes<3>(x2),
+                          _mm_xor_si128(p2, load_key(rk + 16))),
+            load_key(rk + 20));
+        x0 = p0;
+        x1 = p1;
+        x2 = p2;
+        x3 = p3;
+      }
+    }
+  }
+
+  /**
+   * @brief Reads one round key word already spread across the lanes
+   */
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE __m128i load_key(const uint32_t *at) {
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(at));
+  }
+
+  /**
+   * @brief Transforms four blocks
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   */
+  template <bool _Encrypt>
+  CTL_TARGET_SSE2 void four(const uint8_t *input, uint8_t *output) const {
+    __m128i a = load_block(input + 0 * block_size);
+    __m128i b = load_block(input + 1 * block_size);
+    __m128i c = load_block(input + 2 * block_size);
+    __m128i d = load_block(input + 3 * block_size);
+
+    transpose(a, b, c, d);
+    rounds_lanes<_Encrypt>(a, b, c, d);
+    transpose(a, b, c, d);
+
+    store_block(a, output + 0 * block_size);
+    store_block(b, output + 1 * block_size);
+    store_block(c, output + 2 * block_size);
+    store_block(d, output + 3 * block_size);
+  }
+
+  /**
+   * @brief Transforms four blocks, combining them with a second buffer
+   *
+   * Exclusive or is applied lane by lane just as the round is, so it happens on
+   * the blocks as they were loaded, before and after the exchange rather than
+   * inside it. Nothing reaches memory between the two.
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   * @tparam _MaskInput true to combine on the way in as well, which is what a
+   * tweakable mode needs; false to combine only on the way out, which is what a
+   * counter based mode needs
+   */
+  template <bool _Encrypt, bool _MaskInput>
+  CTL_TARGET_SSE2 void four_combined(const uint8_t *input, const uint8_t *mask,
+                                     uint8_t *output) const {
+    __m128i a = load_block(input + 0 * block_size);
+    __m128i b = load_block(input + 1 * block_size);
+    __m128i c = load_block(input + 2 * block_size);
+    __m128i d = load_block(input + 3 * block_size);
+
+    const __m128i m0 = load_block(mask + 0 * block_size);
+    const __m128i m1 = load_block(mask + 1 * block_size);
+    const __m128i m2 = load_block(mask + 2 * block_size);
+    const __m128i m3 = load_block(mask + 3 * block_size);
+
+    if constexpr (_MaskInput) {
+      a = _mm_xor_si128(a, m0);
+      b = _mm_xor_si128(b, m1);
+      c = _mm_xor_si128(c, m2);
+      d = _mm_xor_si128(d, m3);
+    }
+
+    transpose(a, b, c, d);
+    rounds_lanes<_Encrypt>(a, b, c, d);
+    transpose(a, b, c, d);
+
+    store_block(_mm_xor_si128(a, m0), output + 0 * block_size);
+    store_block(_mm_xor_si128(b, m1), output + 1 * block_size);
+    store_block(_mm_xor_si128(c, m2), output + 2 * block_size);
+    store_block(_mm_xor_si128(d, m3), output + 3 * block_size);
+  }
+
+  /**
+   * @brief Reads one block
+   *
+   * The words of LEA are little endian, which is the order the bytes are
+   * already in on the processors this path runs on, so the load needs no
+   * rearranging. This is where AES and ARIA would have to shuffle.
+   */
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE __m128i load_block(const uint8_t *at) {
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(at));
+  }
+
+  /**
+   * @brief Writes one block
+   */
+  static CTL_TARGET_SSE2 CTL_FORCEINLINE void store_block(__m128i v,
+                                                          uint8_t *at) {
+    _mm_storeu_si128(reinterpret_cast<__m128i *>(at), v);
+  }
+#endif
+
   /**
    * @brief Transforms one block with a mask applied on both sides
    *
@@ -432,6 +750,22 @@ private:
    * @brief The round keys, six words for each round
    */
   uint32_t rk_[rounds][round_key_words];
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  /**
+   * @brief Whether the vector path is used, decided once when the key is set
+   */
+  bool vector_;
+
+  /**
+   * @brief The same round keys with each word repeated across the lanes
+   *
+   * Held as words rather than as vectors so that the object needs no more
+   * alignment than any other, and read back with an unaligned load, which costs
+   * nothing on the processors this runs on.
+   */
+  uint32_t rkv_[rounds][round_key_words][vector_blocks];
+#endif
 };
 
 /**

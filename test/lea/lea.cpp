@@ -127,6 +127,86 @@ TEST(lea, round_trips_128) { check_round_trip<lea<128>>(); }
 TEST(lea, round_trips_192) { check_round_trip<lea<192>>(); }
 TEST(lea, round_trips_256) { check_round_trip<lea<256>>(); }
 
+namespace {
+
+// The vector path takes four blocks at a time and the block at a time path
+// takes one, and they have to agree on every input. Counts that are not a
+// multiple of four matter as much as ones that are, since those are what leave
+// a tail for the block at a time path to finish.
+//
+// Where the vector path is not compiled in, or the processor does not have
+// SSE2, both calls go through the same code and this still passes meaningfully.
+template <class Cipher> void check_paths_agree() {
+  std::vector<uint8_t> key(Cipher::key_size);
+  for (size_t i = 0; i < key.size(); ++i)
+    key[i] = static_cast<uint8_t>(0x9c + i * 3);
+
+  Cipher cipher(key);
+
+  uint32_t state = 0x2b7e1516u;
+  for (size_t blocks = 0; blocks <= 21; ++blocks) {
+    std::vector<uint8_t> plain(blocks * Cipher::block_size);
+    for (size_t i = 0; i < plain.size(); ++i) {
+      state = state * 1664525u + 1013904223u;
+      plain[i] = static_cast<uint8_t>(state >> 24);
+    }
+
+    std::vector<uint8_t> by_dispatch(plain.size());
+    std::vector<uint8_t> by_software(plain.size());
+
+    cipher.encrypt_blocks(plain, by_dispatch);
+    cipher.encrypt_blocks_software(plain, by_software);
+    ASSERT_EQ(test::to_hex(by_software), test::to_hex(by_dispatch))
+        << "encrypt mismatch over " << blocks << " blocks";
+
+    std::vector<uint8_t> back_dispatch(plain.size());
+    std::vector<uint8_t> back_software(plain.size());
+    cipher.decrypt_blocks(by_dispatch, back_dispatch);
+    cipher.decrypt_blocks_software(by_dispatch, back_software);
+    ASSERT_EQ(test::to_hex(back_software), test::to_hex(back_dispatch))
+        << "decrypt mismatch over " << blocks << " blocks";
+    ASSERT_EQ(test::to_hex(plain), test::to_hex(back_dispatch))
+        << "round trip mismatch over " << blocks << " blocks";
+  }
+}
+
+} // namespace
+
+TEST(lea, vector_path_agrees_with_software_128) {
+  check_paths_agree<lea<128>>();
+}
+
+TEST(lea, vector_path_agrees_with_software_192) {
+  check_paths_agree<lea<192>>();
+}
+
+TEST(lea, vector_path_agrees_with_software_256) {
+  check_paths_agree<lea<256>>();
+}
+
+// The vector path transposes four blocks so that a lane is a block. If that
+// exchange were wrong in a way that is symmetric, encrypting and decrypting
+// would still round trip while the ciphertext of a run of blocks disagreed with
+// the same blocks encrypted one at a time. The known answer of the first block
+// pins the lane order down against the specification.
+TEST(lea, the_vector_path_reproduces_the_spec_vector) {
+  const std::vector<uint8_t> key = test::hex("0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+  const std::vector<uint8_t> one = test::hex("101112131415161718191a1b1c1d1e1f");
+
+  // Four different blocks, the published one first, so a lane mix up moves it.
+  std::vector<uint8_t> four(4 * 16);
+  for (size_t b = 0; b < 4; ++b)
+    for (size_t i = 0; i < 16; ++i)
+      four[b * 16 + i] = static_cast<uint8_t>(one[i] + b);
+
+  lea<128> cipher(key);
+  std::vector<uint8_t> out(four.size());
+  cipher.encrypt_blocks(four, out);
+
+  EXPECT_EQ(std::string("9fc84e3528c6c6185532c7a704648bfd"),
+            test::to_hex(out.data(), 16));
+}
+
 // Every bit of the key has to reach the ciphertext. A key schedule that drops a
 // word, which is easy to do where the state is walked around rather than
 // indexed directly, shows up here.
