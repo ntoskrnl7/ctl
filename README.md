@@ -9,6 +9,7 @@ mode through the same code and nothing dispatches virtually per block.
 ```cpp
 #include <ctl/symmetric/cipher/aes>
 #include <ctl/symmetric/mode/xts>
+#include <ctl/random/system>
 
 using namespace ctl::symmetric;
 
@@ -23,6 +24,7 @@ xts.encrypt(sector_number, sector, out);
 | | Sizes | Verified against |
 | --- | --- | --- |
 | AES | 128, 192, 256 | FIPS 197 appendix C, SP 800-38A F.1.1 |
+| CTR_DRBG | on any of the ciphers | NIST CAVP, the no derivation function vectors |
 | ARIA | 128, 192, 256 | RFC 5794 appendix A |
 | LEA | 128, 192, 256 | the vectors published with KS X 3246 |
 | ECB | | SP 800-38A F.1.1 |
@@ -57,6 +59,8 @@ Headers carry no extension, in the same style as `ext`.
 
 ```cpp
 #include <ctl/bytes>                    // bytes, writable_bytes
+#include <ctl/random/system>            // random_bytes, from the system
+#include <ctl/random/ctr_drbg>          // ctr_drbg<Cipher>, SP 800-90A
 #include <ctl/symmetric/cipher/aes>     // cipher::aes<128|192|256>
 #include <ctl/symmetric/cipher/aria>    // cipher::aria<128|192|256>
 #include <ctl/symmetric/cipher/lea>     // cipher::lea<128|192|256>
@@ -307,6 +311,36 @@ which is trading one mode against another rather than removing a cost. And
 putting dead code in front of an otherwise identical benchmark moves XTS by one
 percent on its own. So it is where the code lands, and it is left written down
 rather than explained away.
+
+### Where random bytes come from
+
+Two things, and they are not the same.
+
+Entropy cannot be computed. It has to be observed from the machine, so
+`ctl::random_bytes` asks the system for it: `BCryptGenRandom` on Windows,
+`getrandom` on Linux, `getentropy` on Apple and BSD. Nothing is implemented
+there because there is nothing there to implement.
+
+The generator is an algorithm, it is specified, and it is in `ctl/drbg`: the
+CTR_DRBG of SP 800-90A, on whichever block cipher it is given, checked against
+the CAVP vectors. That is what a validated deployment has to use, since what a
+validation scheme approves is a named generator with known answers behind it
+rather than whatever the host happened to do.
+
+```cpp
+uint8_t seed[ctl::ctr_drbg<cipher::aes<256>>::seed_size];
+ctl::random_bytes(seed);
+
+ctl::ctr_drbg<cipher::aes<256>> random(seed);
+mode::gcm<cipher::aes<256>>::tag_t tag;
+uint8_t iv[12];
+random.generate(iv);
+```
+
+The derivation function is not implemented, so a seed is exactly `seed_size`
+bytes and has to be full entropy, which is what the system source gives. Nothing
+reseeds on its own and the state does not survive `fork`, so a process that
+forks should seed the child again.
 
 ## Where it has been run
 

@@ -52,6 +52,7 @@ file(GLOB SOURCE_FILES
   ${CMAKE_CURRENT_LIST_DIR}/aria/*.cpp
   ${CMAKE_CURRENT_LIST_DIR}/lea/*.cpp
   ${CMAKE_CURRENT_LIST_DIR}/mode/*.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/random/*.cpp
 )
 
 add_executable(unittest ${SOURCE_FILES})

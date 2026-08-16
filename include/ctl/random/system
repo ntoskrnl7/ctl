@@ -1,0 +1,202 @@
+/**
+ * @file random/system
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief Random bytes from the operating system
+ *
+ * Every mode here rests on something the caller has to produce and never
+ * repeat: an initialization vector for CBC, an initial counter block for CTR, a
+ * nonce for GCM. Reusing one of those under the same key is not a degradation,
+ * it is a break, and for CTR and GCM it hands over the exclusive or of two
+ * plaintexts directly. So where those values come from is part of using this
+ * library correctly, and leaving it out would be leaving out the part most
+ * easily got wrong.
+ *
+ * What this is not is a generator. There is no algorithm here and no state to
+ * seed, because writing one is how the mistake usually happens. It asks the
+ * operating system, which is seeded from the machine and reseeded by it, and
+ * which is the only thing on a general purpose system that can answer this
+ * properly:
+ *
+ *   Windows  BCryptGenRandom, the system preferred generator
+ *   Linux    getrandom, and /dev/urandom where the kernel is too old for it
+ *   Apple    getentropy
+ *   BSD      getentropy
+ *
+ * None of them is std::random_device, which is allowed to be deterministic and
+ * has been on real implementations, and none of them is a seeded engine from
+ * <random>, which is not built for this and does not claim to be.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+#include <ctl/bytes>
+
+#if defined(_WIN32)
+// Declared rather than reached through windows.h and bcrypt.h, which a header
+// has no business pulling into everything that includes it. The declarations
+// match the ones in the platform headers, so including those as well is
+// harmless.
+extern "C" __declspec(dllimport) long __stdcall BCryptGenRandom(
+    void *algorithm, unsigned char *buffer, unsigned long size,
+    unsigned long flags);
+#if defined(_MSC_VER)
+#pragma comment(lib, "bcrypt")
+#endif
+#elif defined(__linux__)
+#include <cerrno>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <cstdio>
+#elif defined(__APPLE__) || defined(__unix__)
+#include <unistd.h>
+#endif
+
+namespace ctl {
+
+namespace detail {
+
+/**
+ * @brief The part of a request that fits in BCryptGenRandom's ULONG length
+ *
+ * Kept independent of _WIN32 so the 64-to-32 bit boundary can be exercised by
+ * the ordinary test build without allocating a multi-gigabyte buffer.
+ */
+constexpr size_t bcrypt_request_size(size_t remaining) {
+  const size_t limit =
+      static_cast<size_t>(std::numeric_limits<uint32_t>::max());
+  return remaining < limit ? remaining : limit;
+}
+
+/**
+ * @brief Reports that the operating system would not produce random bytes
+ *
+ * There is no sensible way to carry on from this. Continuing with whatever the
+ * buffer happened to hold is how a key ends up predictable, so it is not
+ * offered.
+ */
+[[noreturn]] CTL_NOINLINE inline void throw_no_entropy(const char *why) {
+  throw std::runtime_error(
+      std::string("ctl::random_bytes : the operating system did not provide "
+                  "random bytes (") +
+      why + ").");
+}
+
+} // namespace detail
+
+/**
+ * @brief Fills a buffer with random bytes
+ *
+ * @param output where the bytes go, all of it
+ * @exception std::runtime_error if the operating system would not provide them
+ */
+inline void random_bytes(ctl::writable_bytes output) {
+  if (output.empty())
+    return;
+
+#if defined(_WIN32)
+  // A null algorithm handle with this flag asks for the system preferred
+  // generator, so nothing has to be opened or closed.
+  const unsigned long use_system_preferred_rng = 0x00000002ul;
+  size_t filled = 0;
+  while (filled < output.size()) {
+    // BCryptGenRandom takes a 32 bit ULONG length even in a 64 bit process.
+    // Narrowing the whole view at once used to leave everything past 4 GiB
+    // untouched while still reporting success. Fill it in representable runs.
+    const size_t remaining = output.size() - filled;
+    const unsigned long run = static_cast<unsigned long>(
+        ctl::detail::bcrypt_request_size(remaining));
+    if (BCryptGenRandom(nullptr, output.data() + filled, run,
+                        use_system_preferred_rng) < 0)
+      ctl::detail::throw_no_entropy("BCryptGenRandom failed");
+    filled += static_cast<size_t>(run);
+  }
+
+#elif defined(__linux__)
+  size_t filled = 0;
+  while (filled < output.size()) {
+    // Called through syscall rather than the wrapper, which glibc only grew in
+    // 2.25 and which is the one thing here that would otherwise decide the
+    // lowest version this header builds against.
+    const long taken = static_cast<long>(::syscall(
+        SYS_getrandom, output.data() + filled, output.size() - filled, 0));
+    if (taken > 0) {
+      filled += static_cast<size_t>(taken);
+      continue;
+    }
+    if (taken < 0 && errno == EINTR)
+      continue;
+    if (taken < 0 && (errno == ENOSYS || errno == EPERM))
+      break; // Too old a kernel, or it is blocked. Fall through to the device.
+    ctl::detail::throw_no_entropy("getrandom failed");
+  }
+
+  if (filled < output.size()) {
+    std::FILE *device = std::fopen("/dev/urandom", "rb");
+    if (device == nullptr)
+      ctl::detail::throw_no_entropy("/dev/urandom could not be opened");
+    const size_t read =
+        std::fread(output.data() + filled, 1, output.size() - filled, device);
+    std::fclose(device);
+    if (read != output.size() - filled)
+      ctl::detail::throw_no_entropy("/dev/urandom was short");
+  }
+
+#elif defined(__APPLE__) || defined(__unix__)
+  // getentropy takes at most 256 bytes at a time.
+  size_t filled = 0;
+  while (filled < output.size()) {
+    const size_t run =
+        (output.size() - filled) < 256 ? (output.size() - filled) : 256;
+    if (::getentropy(output.data() + filled, run) != 0)
+      ctl::detail::throw_no_entropy("getentropy failed");
+    filled += run;
+  }
+
+#else
+  ctl::detail::throw_no_entropy("no source is known for this platform");
+#endif
+}
+
+/**
+ * @brief Random bytes from the operating system
+ *
+ * Holds nothing. It exists so that a caller can name where its nonces come from
+ * and so that a test can put something predictable in the same place, not
+ * because there is any state to keep.
+ */
+class rng {
+public:
+  /**
+   * @brief Fills a buffer with random bytes
+   *
+   * @param output where the bytes go, all of it
+   * @exception std::runtime_error if the operating system would not provide
+   * them
+   */
+  void fill(ctl::writable_bytes output) const { random_bytes(output); }
+
+  /**
+   * @brief Fills something whose length the algorithm fixes
+   *
+   * For the values that are the point of this: an initialization vector, an
+   * initial counter block, a nonce.
+   *
+   * @tparam _Size how many bytes, which comes from the type of the argument
+   */
+  template <size_t _Size>
+  void fill(ctl::writable_fixed_bytes<_Size> output) const {
+    random_bytes(output);
+  }
+};
+
+} // namespace ctl
