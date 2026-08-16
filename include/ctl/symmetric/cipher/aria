@@ -33,6 +33,9 @@
 
 #include <ctl/bytes>
 #include <ctl/detail/config>
+#if defined(__mips_msa) && !defined(CTL_NO_HW_ACCEL)
+#include <ctl/detail/aes_bitslice>
+#endif
 #include <ctl/detail/cpu>
 #include <ctl/detail/memory>
 #include <ctl/detail/sbox>
@@ -45,6 +48,8 @@
 #endif
 #elif defined(CTL_HAS_ARM_HW_ACCEL)
 #include <arm_neon.h>
+#elif defined(__mips_msa) && !defined(CTL_NO_HW_ACCEL)
+#include <msa.h>
 #endif
 
 /**
@@ -54,9 +59,16 @@
  * for two of the four S-boxes, and a full sixteen byte table lookup, which
  * covers the other two and the diffusion layer as well. x86 has them as AES-NI
  * and SSSE3, ARMv8 as the cryptographic extension and NEON. Both are still
- * decided at run time, since the AES part is optional on either.
+ * decided at run time, since the AES part is optional on either. MSA has no AES
+ * instruction, so its path bitslices eight blocks and evaluates all four
+ * S-boxes with a tower-field boolean circuit.
  */
-#if defined(CTL_HAS_X86_HW_ACCEL) || defined(CTL_HAS_ARM_HW_ACCEL)
+#if defined(__mips_msa) && !defined(CTL_NO_HW_ACCEL)
+#define CTL_ARIA_VECTOR_MSA 1
+#endif
+
+#if defined(CTL_HAS_X86_HW_ACCEL) || defined(CTL_HAS_ARM_HW_ACCEL) ||          \
+    defined(CTL_ARIA_VECTOR_MSA)
 #define CTL_ARIA_HAS_VECTOR 1
 #endif
 
@@ -262,6 +274,13 @@ struct nibble_tables {
 };
 
 /**
+ * @brief A sixteen byte constant, laid out for a byte shuffle
+ */
+struct byte_vector {
+  uint8_t byte[16];
+};
+
+/**
  * @brief Splits an affine map into the tables above
  */
 constexpr nibble_tables to_nibble_tables(const affine_map &map) {
@@ -277,6 +296,153 @@ constexpr nibble_tables to_nibble_tables(const affine_map &map) {
   tables.constant = map.constant;
   return tables;
 }
+
+#if defined(CTL_ARIA_VECTOR_MSA)
+
+constexpr uint8_t rotate_byte_left(uint8_t value, unsigned int bits) {
+  return static_cast<uint8_t>((value << bits) | (value >> (8 - bits)));
+}
+
+/**
+ * @brief The affine part of the AES S-box
+ */
+constexpr uint8_t aes_affine(uint8_t value) {
+  return static_cast<uint8_t>(value ^ rotate_byte_left(value, 1) ^
+                              rotate_byte_left(value, 2) ^
+                              rotate_byte_left(value, 3) ^
+                              rotate_byte_left(value, 4) ^ 0x63);
+}
+
+/**
+ * @brief Inverse of the AES affine map
+ */
+constexpr uint8_t aes_affine_inverse(uint8_t value) {
+  for (unsigned int candidate = 0; candidate < 256; ++candidate)
+    if (aes_affine(static_cast<uint8_t>(candidate)) == value)
+      return static_cast<uint8_t>(candidate);
+  return 0;
+}
+
+/**
+ * @brief Recovers an affine map from a function known to be affine
+ */
+constexpr affine_map derive_affine_map(uint8_t (*function)(uint8_t)) {
+  affine_map map = {};
+  map.constant = function(0);
+  for (unsigned int i = 0; i < 8; ++i)
+    map.column[i] =
+        static_cast<uint8_t>(function(static_cast<uint8_t>(1u << i)) ^
+                             map.constant);
+  return map;
+}
+
+constexpr bool affine_map_matches(const affine_map &map,
+                                  uint8_t (*function)(uint8_t)) {
+  for (unsigned int i = 0; i < 256; ++i)
+    if (apply_affine(map, static_cast<uint8_t>(i)) !=
+        function(static_cast<uint8_t>(i)))
+      return false;
+  return true;
+}
+
+constexpr uint8_t bit(uint8_t value, unsigned int at) {
+  return static_cast<uint8_t>((value >> at) & 1);
+}
+
+/**
+ * @brief The AES polynomial basis to the tower basis used by aes_bitslice
+ */
+constexpr uint8_t aes_to_tower(uint8_t value) {
+  const uint8_t x0 = bit(value, 0), x1 = bit(value, 1);
+  const uint8_t x2 = bit(value, 2), x3 = bit(value, 3);
+  const uint8_t x4 = bit(value, 4), x5 = bit(value, 5);
+  const uint8_t x6 = bit(value, 6), x7 = bit(value, 7);
+  return static_cast<uint8_t>(
+      ((x0 ^ x1 ^ x2 ^ x3 ^ x7) << 0) | ((x1 ^ x3) << 1) |
+      ((x3 ^ x4 ^ x6) << 2) | ((x1 ^ x2 ^ x6 ^ x7) << 3) |
+      ((x2 ^ x3 ^ x4 ^ x6 ^ x7) << 4) |
+      ((x1 ^ x4 ^ x6 ^ x7) << 5) |
+      ((x1 ^ x2 ^ x3 ^ x4 ^ x5 ^ x6) << 6) | ((x5 ^ x7) << 7));
+}
+
+/**
+ * @brief The tower basis back to the AES polynomial basis
+ */
+constexpr uint8_t tower_to_aes(uint8_t value) {
+  const uint8_t x0 = bit(value, 0), x1 = bit(value, 1);
+  const uint8_t x2 = bit(value, 2), x3 = bit(value, 3);
+  const uint8_t x4 = bit(value, 4), x5 = bit(value, 5);
+  const uint8_t x6 = bit(value, 6), x7 = bit(value, 7);
+  return static_cast<uint8_t>(
+      ((x0 ^ x1 ^ x2 ^ x4) << 0) | ((x4 ^ x6 ^ x7) << 1) |
+      ((x1 ^ x4 ^ x5) << 2) | ((x1 ^ x4 ^ x6 ^ x7) << 3) |
+      ((x1 ^ x3 ^ x4) << 4) | ((x1 ^ x2 ^ x5 ^ x7) << 5) |
+      ((x2 ^ x3 ^ x6 ^ x7) << 6) | ((x1 ^ x2 ^ x5) << 7));
+}
+
+/**
+ * @brief The tower basis back to AES with its S-box affine map folded in
+ */
+constexpr uint8_t tower_to_aes_affine(uint8_t value) {
+  const uint8_t x0 = bit(value, 0), x1 = bit(value, 1);
+  const uint8_t x2 = bit(value, 2), x3 = bit(value, 3);
+  const uint8_t x4 = bit(value, 4), x5 = bit(value, 5);
+  const uint8_t x6 = bit(value, 6), x7 = bit(value, 7);
+  return static_cast<uint8_t>(
+      ((1 ^ x0 ^ x6) << 0) | ((1 ^ x0 ^ x1 ^ x3 ^ x7) << 1) |
+      ((x0 ^ x1 ^ x2 ^ x3 ^ x4) << 2) | (x0 << 3) |
+      ((x0 ^ x2 ^ x3 ^ x4 ^ x5) << 4) |
+      ((1 ^ x2 ^ x3 ^ x7) << 5) | ((1 ^ x4 ^ x7) << 6) |
+      ((x2 ^ x7) << 7));
+}
+
+constexpr uint8_t sb12_tower_pre(uint8_t value) {
+  return aes_to_tower(value);
+}
+constexpr uint8_t sb3_tower_pre(uint8_t value) {
+  return aes_to_tower(aes_affine_inverse(value));
+}
+constexpr uint8_t sb4_tower_pre(uint8_t value) {
+  return aes_to_tower(
+      aes_affine_inverse(apply_affine(sb1_from_sb2, value)));
+}
+constexpr uint8_t sb1_tower_post(uint8_t value) {
+  return tower_to_aes_affine(value);
+}
+constexpr uint8_t sb2_tower_post(uint8_t value) {
+  return apply_affine(sb2_from_sb1, tower_to_aes_affine(value));
+}
+constexpr uint8_t sb34_tower_post(uint8_t value) {
+  return tower_to_aes(value);
+}
+
+inline constexpr affine_map sb12_tower_pre_map =
+    derive_affine_map(sb12_tower_pre);
+inline constexpr affine_map sb3_tower_pre_map =
+    derive_affine_map(sb3_tower_pre);
+inline constexpr affine_map sb4_tower_pre_map =
+    derive_affine_map(sb4_tower_pre);
+inline constexpr affine_map sb1_tower_post_map =
+    derive_affine_map(sb1_tower_post);
+inline constexpr affine_map sb2_tower_post_map =
+    derive_affine_map(sb2_tower_post);
+inline constexpr affine_map sb34_tower_post_map =
+    derive_affine_map(sb34_tower_post);
+
+static_assert(affine_map_matches(sb12_tower_pre_map, sb12_tower_pre),
+              "the AES to tower map is not affine");
+static_assert(affine_map_matches(sb3_tower_pre_map, sb3_tower_pre),
+              "the inverse AES input to tower map is not affine");
+static_assert(affine_map_matches(sb4_tower_pre_map, sb4_tower_pre),
+              "the inverse SB2 input to tower map is not affine");
+static_assert(affine_map_matches(sb1_tower_post_map, sb1_tower_post),
+              "the tower to AES S-box output map is not affine");
+static_assert(affine_map_matches(sb2_tower_post_map, sb2_tower_post),
+              "the tower to SB2 output map is not affine");
+static_assert(affine_map_matches(sb34_tower_post_map, sb34_tower_post),
+              "the tower to inverse S-box output map is not affine");
+
+#endif
 
 inline constexpr nibble_tables sb2_tables = to_nibble_tables(sb2_from_sb1);
 inline constexpr nibble_tables sb4_tables = to_nibble_tables(sb1_from_sb2);
@@ -370,13 +536,6 @@ constexpr bool shuffles_are_a_decomposition() {
 
 static_assert(shuffles_are_a_decomposition(),
               "the diffusion shuffles are not seven distinct permutations");
-
-/**
- * @brief A sixteen byte constant, laid out for a byte shuffle
- */
-struct byte_vector {
-  uint8_t byte[16];
-};
 
 constexpr byte_vector make_undo_row_shift() {
   byte_vector v = {};
@@ -555,6 +714,11 @@ public:
     // The vector path needs the AES instructions for two of the four S-boxes
     // and the byte shuffle for the other two and for the diffusion layer.
     simd_ = ctl::detail::cpu::has_aes() && ctl::detail::cpu::has_byte_shuffle();
+#elif defined(CTL_ARIA_VECTOR_MSA)
+    // MSA is either selected for the whole translation unit or absent from
+    // it. Unlike AES on x86 and ARM there is no optional instruction left to
+    // discover at run time.
+    simd_ = true;
 #elif defined(CTL_ARIA_HAS_VECTOR)
     // On ARM64 the shuffle is part of NEON, which is not optional, so only the
     // AES instructions are left to ask about.
@@ -590,6 +754,7 @@ public:
         uint8_t rotated[16];
         rotr128(w[(i + 1) & 3], rotations[group], rotated);
         ctl::detail::xor_bytes(w[i], rotated, ek_[index], 16);
+        ctl::detail::secure_zero(rotated, sizeof(rotated));
       }
 
     // dk1 = ek{n+1}, dk{i} = A(ek{n+2-i}), dk{n+1} = ek1
@@ -672,18 +837,24 @@ public:
   /**
    * @brief Whether passing blocks in batches is worthwhile
    *
-   * The vector path holds one block in one register and has nothing spare to
-   * interleave a second into, so batching gains nothing and only adds the cost
-   * of moving data through the staging buffers of the mode of operation.
+   * MSA has no AES S-box instruction. Its vector path therefore bitslices
+   * eight independent blocks across eight registers and needs a full batch.
+   * x86 and ARM still hold one block in one register and gain nothing from
+   * batching.
    */
-  bool prefers_batching() const { return false; }
+  bool prefers_batching() const {
+#if defined(CTL_ARIA_VECTOR_MSA)
+    return true;
+#else
+    return false;
+#endif
+  }
 
   /**
    * @brief Encrypts several mutually independent blocks
    *
-   * Batching buys ARIA nothing, so this simply iterates. The interface is kept
-   * in line so that a mode of operation works with any block cipher through
-   * the same code.
+   * The MSA path transforms eight blocks at once. Other vector paths and the
+   * software path simply iterate, keeping one interface for every block cipher.
    *
    * How many blocks there are is not taken as an argument. It follows from the
    * length of the input, and one number describing three buffers is what let a
@@ -700,8 +871,18 @@ public:
     const size_t count = ctl::detail::require_whole_blocks(
         "ctl::symmetric::cipher::aria::encrypt_blocks", input, output,
         block_size);
+#if defined(CTL_ARIA_VECTOR_MSA)
+    size_t i = 0;
+    for (; i + preferred_batch <= count; i += preferred_batch)
+      crypt_batch_msa(ek_, input.data() + i * block_size,
+                      output.data() + i * block_size);
+    for (; i < count; ++i)
+      crypt_software(ek_, input.data() + i * block_size,
+                     output.data() + i * block_size);
+#else
     for (size_t i = 0; i < count; ++i)
       crypt(ek_, input.data() + i * block_size, output.data() + i * block_size);
+#endif
   }
 
   /**
@@ -717,17 +898,25 @@ public:
     const size_t count = ctl::detail::require_whole_blocks(
         "ctl::symmetric::cipher::aria::decrypt_blocks", input, output,
         block_size);
+#if defined(CTL_ARIA_VECTOR_MSA)
+    size_t i = 0;
+    for (; i + preferred_batch <= count; i += preferred_batch)
+      crypt_batch_msa(dk_, input.data() + i * block_size,
+                      output.data() + i * block_size);
+    for (; i < count; ++i)
+      crypt_software(dk_, input.data() + i * block_size,
+                     output.data() + i * block_size);
+#else
     for (size_t i = 0; i < count; ++i)
       crypt(dk_, input.data() + i * block_size, output.data() + i * block_size);
+#endif
   }
 
   /**
    * @brief Encrypts several blocks with a per block mask applied on both sides
    *
    * Computes output[i] = E(input[i] ^ mask[i]) ^ mask[i], which is what
-   * tweakable modes such as XTS need. Batching buys ARIA nothing, so this
-   * simply iterates; the interface exists so that a mode works with any block
-   * cipher through the same code.
+   * tweakable modes such as XTS need.
    *
    * Exactly one batch, whose length is part of the argument types, matching the
    * shape AES uses so that a mode reaches either cipher through the same code.
@@ -738,10 +927,18 @@ public:
    */
   void encrypt_batch_masked(batch_view input, batch_view mask,
                             writable_batch_view output) const {
+#if defined(CTL_ARIA_VECTOR_MSA)
+    uint8_t buffer[batch_bytes];
+    ctl::detail::xor_bytes(input.data(), mask.data(), buffer, batch_bytes);
+    crypt_batch_msa(ek_, buffer, buffer);
+    ctl::detail::xor_bytes(buffer, mask.data(), output.data(), batch_bytes);
+    ctl::detail::secure_zero(buffer, sizeof(buffer));
+#else
     for (size_t i = 0; i < preferred_batch; ++i)
       block_masked(ek_, input.data() + i * block_size,
                    mask.data() + i * block_size,
                    output.data() + i * block_size);
+#endif
   }
 
   /**
@@ -755,10 +952,18 @@ public:
    */
   void decrypt_batch_masked(batch_view input, batch_view mask,
                             writable_batch_view output) const {
+#if defined(CTL_ARIA_VECTOR_MSA)
+    uint8_t buffer[batch_bytes];
+    ctl::detail::xor_bytes(input.data(), mask.data(), buffer, batch_bytes);
+    crypt_batch_msa(dk_, buffer, buffer);
+    ctl::detail::xor_bytes(buffer, mask.data(), output.data(), batch_bytes);
+    ctl::detail::secure_zero(buffer, sizeof(buffer));
+#else
     for (size_t i = 0; i < preferred_batch; ++i)
       block_masked(dk_, input.data() + i * block_size,
                    mask.data() + i * block_size,
                    output.data() + i * block_size);
+#endif
   }
 
   /**
@@ -773,12 +978,20 @@ public:
    */
   void encrypt_batch_then_xor(batch_view input, batch_view operand,
                               writable_batch_view output) const {
+#if defined(CTL_ARIA_VECTOR_MSA)
+    uint8_t buffer[batch_bytes];
+    crypt_batch_msa(ek_, input.data(), buffer);
+    ctl::detail::xor_bytes(buffer, operand.data(), output.data(), batch_bytes);
+    ctl::detail::secure_zero(buffer, sizeof(buffer));
+#else
     for (size_t i = 0; i < preferred_batch; ++i) {
       uint8_t buffer[block_size];
       crypt(ek_, input.data() + i * block_size, buffer);
       ctl::detail::xor_block<block_size>(buffer, operand.data() + i * block_size,
                                         output.data() + i * block_size);
+      ctl::detail::secure_zero(buffer, sizeof(buffer));
     }
+#endif
   }
 
 private:
@@ -943,7 +1156,7 @@ private:
    */
   void crypt(const uint8_t (&round_key)[round_key_count][16],
              const uint8_t *input, uint8_t *output) const {
-#if defined(CTL_ARIA_HAS_VECTOR)
+#if defined(CTL_ARIA_HAS_VECTOR) && !defined(CTL_ARIA_VECTOR_MSA)
     if (simd_) {
       crypt_vector(round_key, input, output);
       return;
@@ -1030,7 +1243,7 @@ private:
     substitute_bytes_inverse(type v) {
       return _mm_aesdeclast_si128(v, _mm_setzero_si128());
     }
-#else
+#elif defined(CTL_HAS_ARM_HW_ACCEL)
     typedef uint8x16_t type;
 
     CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type splat(uint8_t v) {
@@ -1071,6 +1284,32 @@ private:
     substitute_bytes_inverse(type v) {
       return vaesdq_u8(v, vdupq_n_u8(0));
     }
+#else
+    typedef v16u8 type;
+
+    static CTL_FORCEINLINE type splat(uint8_t v) {
+      return (type)__builtin_msa_fill_b(static_cast<int8_t>(v));
+    }
+    static CTL_FORCEINLINE type load(const uint8_t *at) {
+      return (type)__builtin_msa_ld_b(const_cast<uint8_t *>(at), 0);
+    }
+    static CTL_FORCEINLINE void store(type v, uint8_t *at) {
+      __builtin_msa_st_b((v16i8)v, at, 0);
+    }
+    static CTL_FORCEINLINE type bit_and(type a, type b) { return a & b; }
+    static CTL_FORCEINLINE type bit_or(type a, type b) { return a | b; }
+    static CTL_FORCEINLINE type bit_xor(type a, type b) { return a ^ b; }
+    static CTL_FORCEINLINE type shuffle(type table, type index) {
+      return (type)__builtin_msa_vshf_b((v16i8)index, (v16i8)table,
+                                        (v16i8)table);
+    }
+    template <unsigned int _Bit>
+    static CTL_FORCEINLINE type repeat_key_bit(type value) {
+      static_assert(_Bit < 8, "a byte has eight bits");
+      return (type)__builtin_msa_srai_b(
+          __builtin_msa_slli_b((v16i8)value, 7 - _Bit), 7);
+    }
+
 #endif
   };
 
@@ -1087,6 +1326,7 @@ private:
     return simd::load(v.byte);
   }
 
+#if !defined(CTL_ARIA_VECTOR_MSA)
   /**
    * @brief Applies SB1 to all sixteen bytes
    *
@@ -1156,6 +1396,7 @@ private:
     else
       return pick(s3, s4, s1, s2);
   }
+#endif
 
   /**
    * @brief The diffusion layer as seven shuffles added together
@@ -1169,6 +1410,170 @@ private:
     return result;
   }
 
+#if defined(CTL_ARIA_VECTOR_MSA)
+  /**
+   * @brief Eight blocks represented by one vector register per bit
+   *
+   * A byte lane keeps its ARIA byte position. Bit n of that lane represents
+   * block n, so bitwise field arithmetic transforms 128 S-box inputs at once.
+   */
+  typedef vector sliced_state[8];
+
+  static void slice_load(const uint8_t *input, sliced_state &state) {
+    uint8_t plane[8][16] = {};
+    for (unsigned int byte = 0; byte < block_size; ++byte) {
+      uint64_t gathered = 0;
+      for (unsigned int block = 0; block < preferred_batch; ++block)
+        gathered |= static_cast<uint64_t>(
+                        input[block * block_size + byte])
+                    << (8 * block);
+      const uint64_t transposed =
+          ctl::detail::bitslice::transpose_bits(gathered);
+      for (unsigned int bit = 0; bit < 8; ++bit)
+        plane[bit][byte] =
+            static_cast<uint8_t>(transposed >> (8 * bit));
+    }
+    for (unsigned int bit = 0; bit < 8; ++bit)
+      state[bit] = simd::load(plane[bit]);
+    ctl::detail::secure_zero(plane, sizeof(plane));
+  }
+
+  static void slice_store(const sliced_state &state, uint8_t *output) {
+    uint8_t plane[8][16];
+    for (unsigned int bit = 0; bit < 8; ++bit)
+      simd::store(state[bit], plane[bit]);
+
+    for (unsigned int byte = 0; byte < block_size; ++byte) {
+      uint64_t transposed = 0;
+      for (unsigned int bit = 0; bit < 8; ++bit)
+        transposed |= static_cast<uint64_t>(plane[bit][byte]) << (8 * bit);
+      const uint64_t gathered =
+          ctl::detail::bitslice::transpose_bits(transposed);
+      for (unsigned int block = 0; block < preferred_batch; ++block)
+        output[block * block_size + byte] =
+            static_cast<uint8_t>(gathered >> (8 * block));
+    }
+    ctl::detail::secure_zero(plane, sizeof(plane));
+  }
+
+  static CTL_FORCEINLINE void
+  add_sliced_round_key(sliced_state &state, const uint8_t *round_key) {
+    const vector key = simd::load(round_key);
+    state[0] =
+        simd::bit_xor(state[0], simd::template repeat_key_bit<0>(key));
+    state[1] =
+        simd::bit_xor(state[1], simd::template repeat_key_bit<1>(key));
+    state[2] =
+        simd::bit_xor(state[2], simd::template repeat_key_bit<2>(key));
+    state[3] =
+        simd::bit_xor(state[3], simd::template repeat_key_bit<3>(key));
+    state[4] =
+        simd::bit_xor(state[4], simd::template repeat_key_bit<4>(key));
+    state[5] =
+        simd::bit_xor(state[5], simd::template repeat_key_bit<5>(key));
+    state[6] =
+        simd::bit_xor(state[6], simd::template repeat_key_bit<6>(key));
+    state[7] =
+        simd::bit_xor(state[7], simd::template repeat_key_bit<7>(key));
+  }
+
+  static CTL_FORCEINLINE void
+  affine_sliced(sliced_state &state, const aria_detail::affine_map &map) {
+    sliced_state input;
+    for (unsigned int bit = 0; bit < 8; ++bit)
+      input[bit] = state[bit];
+
+    for (unsigned int output_bit = 0; output_bit < 8; ++output_bit) {
+      vector result =
+          simd::splat((map.constant >> output_bit) & 1 ? 0xff : 0);
+      for (unsigned int input_bit = 0; input_bit < 8; ++input_bit)
+        if ((map.column[input_bit] >> output_bit) & 1)
+          result = simd::bit_xor(result, input[input_bit]);
+      state[output_bit] = result;
+    }
+  }
+
+  static CTL_FORCEINLINE void
+  blend_affine(const sliced_state &input, const aria_detail::affine_map &map,
+               vector mask, sliced_state &result) {
+    sliced_state transformed;
+    for (unsigned int bit = 0; bit < 8; ++bit)
+      transformed[bit] = input[bit];
+    affine_sliced(transformed, map);
+    for (unsigned int bit = 0; bit < 8; ++bit)
+      result[bit] = simd::bit_or(
+          result[bit], simd::bit_and(transformed[bit], mask));
+  }
+
+  template <bool _Type1>
+  static CTL_FORCEINLINE void substitute_sliced(sliced_state &state) {
+    const vector position_0 = constant(aria_detail::selector[0]);
+    const vector position_1 = constant(aria_detail::selector[1]);
+    const vector position_2 = constant(aria_detail::selector[2]);
+    const vector position_3 = constant(aria_detail::selector[3]);
+
+    sliced_state input;
+    sliced_state result;
+    for (unsigned int bit = 0; bit < 8; ++bit) {
+      input[bit] = state[bit];
+      result[bit] = simd::splat(0);
+    }
+
+    blend_affine(
+        input, aria_detail::sb12_tower_pre_map,
+        _Type1 ? simd::bit_or(position_0, position_1)
+               : simd::bit_or(position_2, position_3),
+        result);
+    blend_affine(input, aria_detail::sb3_tower_pre_map,
+                 _Type1 ? position_2 : position_0, result);
+    blend_affine(input, aria_detail::sb4_tower_pre_map,
+                 _Type1 ? position_3 : position_1, result);
+
+    ctl::detail::bitslice::tower_inverter<simd>::apply(result);
+
+    for (unsigned int bit = 0; bit < 8; ++bit) {
+      input[bit] = result[bit];
+      state[bit] = simd::splat(0);
+    }
+    blend_affine(input, aria_detail::sb1_tower_post_map,
+                 _Type1 ? position_0 : position_2, state);
+    blend_affine(input, aria_detail::sb2_tower_post_map,
+                 _Type1 ? position_1 : position_3, state);
+    blend_affine(
+        input, aria_detail::sb34_tower_post_map,
+        _Type1 ? simd::bit_or(position_2, position_3)
+               : simd::bit_or(position_0, position_1),
+        state);
+  }
+
+  static CTL_FORCEINLINE void diffuse_sliced(sliced_state &state) {
+    for (unsigned int bit = 0; bit < 8; ++bit)
+      state[bit] = diffuse_vector(state[bit]);
+  }
+
+  void crypt_batch_msa(const uint8_t (&round_key)[round_key_count][16],
+                       const uint8_t *input, uint8_t *output) const {
+    sliced_state state;
+    slice_load(input, state);
+
+    for (size_t round = 1; round < rounds; ++round) {
+      add_sliced_round_key(state, round_key[round - 1]);
+      if (round & 1)
+        substitute_sliced<true>(state);
+      else
+        substitute_sliced<false>(state);
+      diffuse_sliced(state);
+    }
+
+    add_sliced_round_key(state, round_key[rounds - 1]);
+    substitute_sliced<false>(state);
+    add_sliced_round_key(state, round_key[rounds]);
+    slice_store(state, output);
+    ctl::detail::secure_zero(state, sizeof(state));
+  }
+#endif
+
+#if !defined(CTL_ARIA_VECTOR_MSA)
   /**
    * @brief Transforms one block without the state ever leaving a register
    *
@@ -1194,6 +1599,7 @@ private:
 
     simd::store(state, output);
   }
+#endif
 #endif
 
   /**

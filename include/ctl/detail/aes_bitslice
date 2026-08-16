@@ -1,0 +1,648 @@
+/**
+ * @file aes_bitslice
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief AES without tables, four blocks at a time
+ *
+ * The table driven AES indexes memory with a value that depends on the key.
+ * Which cache lines that touches is visible to anything else running on the
+ * machine, and recovering a key from that has been demonstrated more than once.
+ * This path indexes nothing. Every step is a shift, an and, or an exclusive or
+ * on whole words, so the instruction trace and the memory trace are the same
+ * for every key and every block.
+ *
+ * Four blocks are held across eight 64 bit words. Word p holds bit p of every
+ * byte: bit 16*b + j of word p is bit p of byte j of block b. A round then
+ * works on all sixty four bytes at once, which is what pays for a substitution
+ * that has become a hundred and fifty gates instead of a table lookup.
+ *
+ * The S-box is an inversion in GF(2^8) followed by an affine map. Inversion is
+ * expensive in the field FIPS 197 names and cheap in a tower of small
+ * extensions, so the circuit changes basis into
+ *
+ *   GF(2^2) = GF(2)[u]/(u^2 + u + 1)
+ *   GF(2^4) = GF(2^2)[v]/(v^2 + v + u)
+ *   GF(2^8) = GF(2^4)[w]/(w^2 + w + l),  l = u*v + 1
+ *
+ * inverts there, and changes back with the affine map folded in. The two basis
+ * changes are 8x8 matrices over GF(2); they were found by searching every
+ * isomorphism between the two fields for the one of least weight, and both
+ * S-boxes were then checked against FIPS 197 for all 256 inputs.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+#include <ctl/detail/config>
+#include <ctl/detail/memory>
+
+namespace ctl {
+namespace detail {
+namespace bitslice {
+
+/**
+ * @brief How many blocks one pass transforms
+ */
+constexpr size_t lanes = 4;
+
+/**
+ * @brief A group of blocks, one bit of every byte per word
+ */
+typedef uint64_t state[8];
+
+/**
+ * @brief Repeats a sixteen bit pattern once per block
+ */
+constexpr uint64_t lane_pattern(uint32_t bits) {
+  return static_cast<uint64_t>(bits) * 0x0001000100010001ull;
+}
+
+/**
+ * @brief Transposes the 8x8 bit matrix held in a word
+ *
+ * Byte i of the argument becomes bit i of every byte of the result: byte p of
+ * the result holds bit p of each of the eight input bytes. Hacker's Delight
+ * section 7.3 gives the three step form used here, which is its own inverse.
+ */
+CTL_FORCEINLINE uint64_t transpose_bits(uint64_t x) {
+  x = (x & 0xaa55aa55aa55aa55ull) | ((x & 0x00aa00aa00aa00aaull) << 7) |
+      ((x >> 7) & 0x00aa00aa00aa00aaull);
+  x = (x & 0xcccc3333cccc3333ull) | ((x & 0x0000cccc0000ccccull) << 14) |
+      ((x >> 14) & 0x0000cccc0000ccccull);
+  x = (x & 0xf0f0f0f00f0f0f0full) | ((x & 0x00000000f0f0f0f0ull) << 28) |
+      ((x >> 28) & 0x00000000f0f0f0f0ull);
+  return x;
+}
+
+/**
+ * @brief Gathers eight bytes into a word, first byte lowest
+ *
+ * Written out rather than loaded, so that the transpose above sees the same
+ * arrangement whichever way round the target stores its words.
+ */
+CTL_FORCEINLINE uint64_t gather(const uint8_t *at) {
+  uint64_t w = 0;
+  for (unsigned i = 0; i < 8; ++i)
+    w |= static_cast<uint64_t>(at[i]) << (8 * i);
+  return w;
+}
+
+/**
+ * @brief Writes a word back out as eight bytes, lowest byte first
+ */
+CTL_FORCEINLINE void scatter(uint64_t w, uint8_t *at) {
+  for (unsigned i = 0; i < 8; ++i)
+    at[i] = static_cast<uint8_t>(w >> (8 * i));
+}
+
+/**
+ * @brief Reads up to four blocks into the sliced form
+ *
+ * Lanes that no block was given for stay zero and are not written back, so a
+ * caller with one block to transform pays for four and gets the right answer
+ * for its one.
+ */
+inline void load(const uint8_t *input, size_t count, state &s) {
+  for (unsigned p = 0; p < 8; ++p)
+    s[p] = 0;
+  for (size_t b = 0; b < count; ++b)
+    for (unsigned h = 0; h < 2; ++h) {
+      const uint64_t t = transpose_bits(gather(input + 16 * b + 8 * h));
+      for (unsigned p = 0; p < 8; ++p)
+        s[p] |= ((t >> (8 * p)) & 0xffull) << (16 * b + 8 * h);
+    }
+}
+
+/**
+ * @brief Writes the sliced form back out as blocks
+ */
+inline void store(const state &s, size_t count, uint8_t *output) {
+  for (size_t b = 0; b < count; ++b)
+    for (unsigned h = 0; h < 2; ++h) {
+      uint64_t t = 0;
+      for (unsigned p = 0; p < 8; ++p)
+        t |= ((s[p] >> (16 * b + 8 * h)) & 0xffull) << (8 * p);
+      scatter(transpose_bits(t), output + 16 * b + 8 * h);
+    }
+}
+
+/**
+ * @brief Puts one round key into the sliced form, the same in every lane
+ */
+inline void slice_round_key(const uint8_t *key, state &s) {
+  const uint64_t low = transpose_bits(gather(key));
+  const uint64_t high = transpose_bits(gather(key + 8));
+  for (unsigned p = 0; p < 8; ++p)
+    s[p] = lane_pattern(static_cast<uint32_t>(((low >> (8 * p)) & 0xffull) |
+                                              (((high >> (8 * p)) & 0xffull)
+                                               << 8)));
+}
+
+/**
+ * @brief Adds a round key (AddRoundKey, section 5.1.4 of FIPS 197)
+ */
+CTL_FORCEINLINE void add_round_key(state &s, const state &key) {
+  for (unsigned p = 0; p < 8; ++p)
+    s[p] ^= key[p];
+}
+
+// ------------------------------------------------------------- the S-box
+//
+// An element of GF(2^2) is a pair of bits, hi*u + lo. An element of GF(2^4) is
+// a pair of those, hi*v + lo, and an element of GF(2^8) a pair of those,
+// hi*w + lo. Each bit is a whole word here, so every one of these operates on
+// all sixty four bytes at once.
+
+/**
+ * @brief An element of GF(2^2), one bit per word
+ */
+struct pair {
+  uint64_t hi;
+  uint64_t lo;
+};
+
+CTL_FORCEINLINE pair add2(pair a, pair b) {
+  return pair{a.hi ^ b.hi, a.lo ^ b.lo};
+}
+
+/**
+ * @brief Multiplies in GF(2^2), by Karatsuba so that three ands suffice
+ */
+CTL_FORCEINLINE pair mul2(pair a, pair b) {
+  const uint64_t p = a.lo & b.lo;
+  const uint64_t q = a.hi & b.hi;
+  const uint64_t t = (a.lo ^ a.hi) & (b.lo ^ b.hi);
+  return pair{t ^ p, q ^ p};
+}
+
+/**
+ * @brief Squares in GF(2^2), which is also the inverse there since x^3 = 1
+ */
+CTL_FORCEINLINE pair square2(pair a) { return pair{a.hi, a.lo ^ a.hi}; }
+
+/**
+ * @brief Multiplies by u
+ */
+CTL_FORCEINLINE pair scale2(pair a) { return pair{a.lo ^ a.hi, a.hi}; }
+
+/**
+ * @brief An element of GF(2^4)
+ */
+struct quad {
+  pair hi;
+  pair lo;
+};
+
+CTL_FORCEINLINE quad add4(quad a, quad b) {
+  return quad{add2(a.hi, b.hi), add2(a.lo, b.lo)};
+}
+
+CTL_FORCEINLINE quad mul4(quad a, quad b) {
+  const pair p = mul2(a.lo, b.lo);
+  const pair q = mul2(a.hi, b.hi);
+  const pair t = mul2(add2(a.lo, a.hi), add2(b.lo, b.hi));
+  return quad{add2(t, p), add2(scale2(q), p)};
+}
+
+CTL_FORCEINLINE quad square4(quad a) {
+  const pair h = square2(a.hi);
+  return quad{h, add2(scale2(h), square2(a.lo))};
+}
+
+/**
+ * @brief Multiplies by l, the constant term of the GF(2^8) polynomial
+ */
+CTL_FORCEINLINE quad scale4(quad a) {
+  const pair s = add2(a.hi, a.lo);
+  return quad{add2(scale2(s), a.hi), add2(scale2(scale2(a.hi)), a.lo)};
+}
+
+/**
+ * @brief Inverts in GF(2^4)
+ *
+ * For a = a1*v + a0 the inverse is (a1/d)*v + ((a1+a0)/d) with
+ * d = u*a1^2 + a1*a0 + a0^2, and dividing by d in GF(2^2) is squaring.
+ */
+CTL_FORCEINLINE quad invert4(quad a) {
+  const pair d =
+      add2(add2(scale2(square2(a.hi)), mul2(a.hi, a.lo)), square2(a.lo));
+  const pair di = square2(d);
+  return quad{mul2(a.hi, di), mul2(add2(a.hi, a.lo), di)};
+}
+
+/**
+ * @brief An element of GF(2^8)
+ */
+struct octet {
+  quad hi;
+  quad lo;
+};
+
+/**
+ * @brief Inverts in GF(2^8), the expensive half of the S-box
+ *
+ * The same shape one level up: for x = a*w + b the inverse is (a/d)*w +
+ * ((a+b)/d) with d = l*a^2 + a*b + b^2, written as l*a^2 + b*(a+b) so that the
+ * sum a+b is computed once and used twice.
+ */
+CTL_FORCEINLINE octet invert8(octet x) {
+  const quad t = add4(x.hi, x.lo);
+  const quad d = add4(scale4(square4(x.hi)), mul4(x.lo, t));
+  const quad di = invert4(d);
+  return octet{mul4(x.hi, di), mul4(t, di)};
+}
+
+CTL_FORCEINLINE octet to_octet(const state &s) {
+  return octet{quad{pair{s[7], s[6]}, pair{s[5], s[4]}},
+               quad{pair{s[3], s[2]}, pair{s[1], s[0]}}};
+}
+
+CTL_FORCEINLINE void from_octet(octet v, state &s) {
+  s[7] = v.hi.hi.hi;
+  s[6] = v.hi.hi.lo;
+  s[5] = v.hi.lo.hi;
+  s[4] = v.hi.lo.lo;
+  s[3] = v.lo.hi.hi;
+  s[2] = v.lo.hi.lo;
+  s[1] = v.lo.lo.hi;
+  s[0] = v.lo.lo.lo;
+}
+
+/**
+ * @brief The tower-field inversion circuit over an arbitrary bitwise word
+ *
+ * AES uses uint64_t planes above. ARIA's MSA path uses the same circuit with
+ * one vector register per plane, so the operations are parameterized without
+ * changing the field construction.
+ */
+template <class _Operations> struct tower_inverter {
+  using word = typename _Operations::type;
+
+  struct pair {
+    word hi, lo;
+  };
+  struct quad {
+    pair hi, lo;
+  };
+  struct octet {
+    quad hi, lo;
+  };
+
+  static CTL_FORCEINLINE word add(word a, word b) {
+    return _Operations::bit_xor(a, b);
+  }
+
+  static CTL_FORCEINLINE word multiply(word a, word b) {
+    return _Operations::bit_and(a, b);
+  }
+
+  static CTL_FORCEINLINE pair add2(pair a, pair b) {
+    return pair{add(a.hi, b.hi), add(a.lo, b.lo)};
+  }
+
+  static CTL_FORCEINLINE pair multiply2(pair a, pair b) {
+    const word low = multiply(a.lo, b.lo);
+    const word high = multiply(a.hi, b.hi);
+    const word mixed =
+        multiply(add(a.lo, a.hi), add(b.lo, b.hi));
+    return pair{add(mixed, low), add(high, low)};
+  }
+
+  static CTL_FORCEINLINE pair square2(pair a) {
+    return pair{a.hi, add(a.lo, a.hi)};
+  }
+
+  static CTL_FORCEINLINE pair scale2(pair a) {
+    return pair{add(a.lo, a.hi), a.hi};
+  }
+
+  static CTL_FORCEINLINE quad add4(quad a, quad b) {
+    return quad{add2(a.hi, b.hi), add2(a.lo, b.lo)};
+  }
+
+  static CTL_FORCEINLINE quad multiply4(quad a, quad b) {
+    const pair low = multiply2(a.lo, b.lo);
+    const pair high = multiply2(a.hi, b.hi);
+    const pair mixed =
+        multiply2(add2(a.lo, a.hi), add2(b.lo, b.hi));
+    return quad{add2(mixed, low), add2(scale2(high), low)};
+  }
+
+  static CTL_FORCEINLINE quad square4(quad a) {
+    const pair high = square2(a.hi);
+    return quad{high, add2(scale2(high), square2(a.lo))};
+  }
+
+  static CTL_FORCEINLINE quad scale4(quad a) {
+    const pair sum = add2(a.hi, a.lo);
+    return quad{add2(scale2(sum), a.hi),
+                add2(scale2(scale2(a.hi)), a.lo)};
+  }
+
+  static CTL_FORCEINLINE quad invert4(quad a) {
+    const pair denominator =
+        add2(add2(scale2(square2(a.hi)), multiply2(a.hi, a.lo)),
+             square2(a.lo));
+    const pair inverse = square2(denominator);
+    return quad{multiply2(a.hi, inverse),
+                multiply2(add2(a.hi, a.lo), inverse)};
+  }
+
+  static CTL_FORCEINLINE octet invert8(octet value) {
+    const quad sum = add4(value.hi, value.lo);
+    const quad denominator =
+        add4(scale4(square4(value.hi)), multiply4(value.lo, sum));
+    const quad inverse = invert4(denominator);
+    return octet{multiply4(value.hi, inverse), multiply4(sum, inverse)};
+  }
+
+  static CTL_FORCEINLINE void apply(word (&state)[8]) {
+    const octet value =
+        invert8(octet{quad{pair{state[7], state[6]},
+                           pair{state[5], state[4]}},
+                      quad{pair{state[3], state[2]},
+                           pair{state[1], state[0]}}});
+    state[7] = value.hi.hi.hi;
+    state[6] = value.hi.hi.lo;
+    state[5] = value.hi.lo.hi;
+    state[4] = value.hi.lo.lo;
+    state[3] = value.lo.hi.hi;
+    state[2] = value.lo.hi.lo;
+    state[1] = value.lo.lo.hi;
+    state[0] = value.lo.lo.lo;
+  }
+};
+
+// The four basis changes below are generated, not written. Each output bit is
+// the exclusive or of a fixed set of input bits, and the complement stands for
+// the constant that the affine map adds.
+
+/**
+ * @brief Changes basis from the field FIPS 197 names into the tower
+ */
+CTL_FORCEINLINE void to_tower(state &p) {
+  const uint64_t x0 = p[0], x1 = p[1], x2 = p[2], x3 = p[3];
+  const uint64_t x4 = p[4], x5 = p[5], x6 = p[6], x7 = p[7];
+  p[0] = x0 ^ x1 ^ x2 ^ x3 ^ x7;
+  p[1] = x1 ^ x3;
+  p[2] = x3 ^ x4 ^ x6;
+  p[3] = x1 ^ x2 ^ x6 ^ x7;
+  p[4] = x2 ^ x3 ^ x4 ^ x6 ^ x7;
+  p[5] = x1 ^ x4 ^ x6 ^ x7;
+  p[6] = x1 ^ x2 ^ x3 ^ x4 ^ x5 ^ x6;
+  p[7] = x5 ^ x7;
+}
+
+/**
+ * @brief Changes basis back with the S-box affine map folded in
+ */
+CTL_FORCEINLINE void from_tower_affine(state &p) {
+  const uint64_t x0 = p[0], x1 = p[1], x2 = p[2], x3 = p[3];
+  const uint64_t x4 = p[4], x5 = p[5], x6 = p[6], x7 = p[7];
+  p[0] = ~(x0 ^ x6);
+  p[1] = ~(x0 ^ x1 ^ x3 ^ x7);
+  p[2] = x0 ^ x1 ^ x2 ^ x3 ^ x4;
+  p[3] = x0;
+  p[4] = x0 ^ x2 ^ x3 ^ x4 ^ x5;
+  p[5] = ~(x2 ^ x3 ^ x7);
+  p[6] = ~(x4 ^ x7);
+  p[7] = x2 ^ x7;
+}
+
+/**
+ * @brief Undoes the affine map and changes basis into the tower
+ */
+CTL_FORCEINLINE void to_tower_inverse_affine(state &p) {
+  const uint64_t x0 = p[0], x1 = p[1], x2 = p[2], x3 = p[3];
+  const uint64_t x4 = p[4], x5 = p[5], x6 = p[6], x7 = p[7];
+  p[0] = x3;
+  p[1] = x2 ^ x3 ^ x5 ^ x6;
+  p[2] = x1 ^ x2 ^ x6;
+  p[3] = ~(x5 ^ x7);
+  p[4] = ~(x1 ^ x2 ^ x7);
+  p[5] = x3 ^ x4 ^ x5 ^ x6;
+  p[6] = ~(x0 ^ x3);
+  p[7] = x1 ^ x2 ^ x6 ^ x7;
+}
+
+/**
+ * @brief Changes basis from the tower back into the field FIPS 197 names
+ */
+CTL_FORCEINLINE void from_tower(state &p) {
+  const uint64_t x0 = p[0], x1 = p[1], x2 = p[2], x3 = p[3];
+  const uint64_t x4 = p[4], x5 = p[5], x6 = p[6], x7 = p[7];
+  p[0] = x0 ^ x1 ^ x2 ^ x4;
+  p[1] = x4 ^ x6 ^ x7;
+  p[2] = x1 ^ x4 ^ x5;
+  p[3] = x1 ^ x4 ^ x6 ^ x7;
+  p[4] = x1 ^ x3 ^ x4;
+  p[5] = x1 ^ x2 ^ x5 ^ x7;
+  p[6] = x2 ^ x3 ^ x6 ^ x7;
+  p[7] = x1 ^ x2 ^ x5;
+}
+
+/**
+ * @brief Applies the S-box to every byte (SubBytes, section 5.1.1)
+ */
+CTL_FORCEINLINE void sub_bytes(state &s) {
+  to_tower(s);
+  from_octet(invert8(to_octet(s)), s);
+  from_tower_affine(s);
+}
+
+/**
+ * @brief Applies the inverse S-box to every byte (InvSubBytes, section 5.3.2)
+ */
+CTL_FORCEINLINE void inv_sub_bytes(state &s) {
+  to_tower_inverse_affine(s);
+  from_octet(invert8(to_octet(s)), s);
+  from_tower(s);
+}
+
+// ------------------------------------------------------ the linear layers
+
+/**
+ * @brief Rotates one AES row inside every block
+ *
+ * The bytes of row _Row sit at the positions congruent to _Row modulo four, and
+ * the rotation keeps them there, so the bits that would leave the block are the
+ * ones below _By and they come back at the top.
+ */
+template <unsigned _Row, unsigned _By, uint32_t _Wrapping>
+CTL_FORCEINLINE uint64_t rotate_row(uint64_t x) {
+  const uint64_t t = x & lane_pattern(0x1111u << _Row);
+  const uint64_t wrapping = t & lane_pattern(_Wrapping);
+  return ((t ^ wrapping) >> _By) | (wrapping << (16 - _By));
+}
+
+/**
+ * @brief Rotates each row by its own amount (ShiftRows, section 5.1.2)
+ */
+CTL_FORCEINLINE void shift_rows(state &s) {
+  for (unsigned p = 0; p < 8; ++p) {
+    const uint64_t x = s[p];
+    s[p] = (x & lane_pattern(0x1111u)) | rotate_row<1, 4, 0x0002u>(x) |
+           rotate_row<2, 8, 0x0044u>(x) | rotate_row<3, 12, 0x0888u>(x);
+  }
+}
+
+/**
+ * @brief Rotates each row back (InvShiftRows, section 5.3.1)
+ */
+CTL_FORCEINLINE void inv_shift_rows(state &s) {
+  for (unsigned p = 0; p < 8; ++p) {
+    const uint64_t x = s[p];
+    s[p] = (x & lane_pattern(0x1111u)) | rotate_row<1, 12, 0x0222u>(x) |
+           rotate_row<2, 8, 0x0044u>(x) | rotate_row<3, 4, 0x0008u>(x);
+  }
+}
+
+/**
+ * @brief The byte _By rows further down the same column, for every byte
+ */
+template <unsigned _By, uint32_t _Wrapping>
+CTL_FORCEINLINE uint64_t next_row(uint64_t x) {
+  const uint64_t wrapping = x & lane_pattern(_Wrapping);
+  return ((x ^ wrapping) >> _By) | (wrapping << (4 - _By));
+}
+
+/**
+ * @brief Multiplies every byte by x in GF(2^8)
+ *
+ * A left shift, and the reduction polynomial added back wherever the bit that
+ * left was set. Nothing is tested, the bit itself is the operand.
+ */
+CTL_FORCEINLINE void double_bytes(state &p) {
+  const uint64_t high = p[7];
+  p[7] = p[6];
+  p[6] = p[5];
+  p[5] = p[4];
+  p[4] = p[3] ^ high;
+  p[3] = p[2] ^ high;
+  p[2] = p[1];
+  p[1] = p[0] ^ high;
+  p[0] = high;
+}
+
+/**
+ * @brief Mixes each column (MixColumns, section 5.1.3)
+ *
+ * Row r of the result is 2*(a_r + a_{r+1}) + (a_0 + a_1 + a_2 + a_3) + a_r.
+ * The column sum is the same in all four rows, which is why it can be had by
+ * adding the difference to itself two rows down.
+ */
+CTL_FORCEINLINE void mix_columns(state &s) {
+  state difference;
+  for (unsigned p = 0; p < 8; ++p)
+    difference[p] = s[p] ^ next_row<1, 0x1111u>(s[p]);
+
+  // The column sum is the difference added to itself two rows down, since
+  // (a_r + a_{r+1}) + (a_{r+2} + a_{r+3}) is the whole column whichever row it
+  // is read from.
+  for (unsigned p = 0; p < 8; ++p)
+    s[p] ^= difference[p] ^ next_row<2, 0x3333u>(difference[p]);
+
+  // And the doubling, written out rather than run through double_bytes so that
+  // the difference is not copied into a third set of words the machine has no
+  // registers for.
+  const uint64_t leaving = difference[7];
+  s[0] ^= leaving;
+  s[1] ^= difference[0] ^ leaving;
+  s[2] ^= difference[1];
+  s[3] ^= difference[2] ^ leaving;
+  s[4] ^= difference[3] ^ leaving;
+  s[5] ^= difference[4];
+  s[6] ^= difference[5];
+  s[7] ^= difference[6];
+}
+
+/**
+ * @brief Mixes each column back (InvMixColumns, section 5.3.3)
+ *
+ * The inverse matrix is the forward one times 4x^2 + 5, so applying that first
+ * and then the forward layer saves writing the inverse out. Multiplying a
+ * column by 4x^2 + 5 is a_r + 4*(a_r + a_{r+2}).
+ */
+CTL_FORCEINLINE void inv_mix_columns(state &s) {
+  state t;
+  for (unsigned p = 0; p < 8; ++p)
+    t[p] = s[p] ^ next_row<2, 0x3333u>(s[p]);
+  double_bytes(t);
+  double_bytes(t);
+  for (unsigned p = 0; p < 8; ++p)
+    s[p] ^= t[p];
+  mix_columns(s);
+}
+
+// ------------------------------------------------------------ the cipher
+
+/**
+ * @brief Encrypts up to four blocks (section 5.1 of FIPS 197)
+ *
+ * @param round_key the round keys in sliced form, rounds + 1 of them
+ * @param rounds how many rounds this key size calls for
+ * @param input the blocks to encrypt
+ * @param count how many blocks there are, at most lanes
+ * @param output where the results go, may be the same buffer as input
+ */
+inline void encrypt(const state *round_key, size_t rounds,
+                    const uint8_t *input, size_t count, uint8_t *output) {
+  state s;
+  load(input, count, s);
+
+  add_round_key(s, round_key[0]);
+  for (size_t r = 1; r < rounds; ++r) {
+    sub_bytes(s);
+    shift_rows(s);
+    mix_columns(s);
+    add_round_key(s, round_key[r]);
+  }
+  sub_bytes(s);
+  shift_rows(s);
+  add_round_key(s, round_key[rounds]);
+
+  store(s, count, output);
+  ctl::detail::secure_zero(s, sizeof(s));
+}
+
+/**
+ * @brief Decrypts up to four blocks (section 5.3 of FIPS 197)
+ *
+ * The straightforward inverse cipher rather than the equivalent one the table
+ * path uses, because here there is nothing to gain by moving InvMixColumns onto
+ * the round keys.
+ *
+ * @param round_key the encryption round keys in sliced form
+ * @param rounds how many rounds this key size calls for
+ * @param input the blocks to decrypt
+ * @param count how many blocks there are, at most lanes
+ * @param output where the results go, may be the same buffer as input
+ */
+inline void decrypt(const state *round_key, size_t rounds,
+                    const uint8_t *input, size_t count, uint8_t *output) {
+  state s;
+  load(input, count, s);
+
+  add_round_key(s, round_key[rounds]);
+  for (size_t r = rounds; r-- > 1;) {
+    inv_shift_rows(s);
+    inv_sub_bytes(s);
+    add_round_key(s, round_key[r]);
+    inv_mix_columns(s);
+  }
+  inv_shift_rows(s);
+  inv_sub_bytes(s);
+  add_round_key(s, round_key[0]);
+
+  store(s, count, output);
+  ctl::detail::secure_zero(s, sizeof(s));
+}
+
+} // namespace bitslice
+} // namespace detail
+} // namespace ctl

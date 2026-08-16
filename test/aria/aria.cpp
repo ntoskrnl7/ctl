@@ -121,6 +121,40 @@ template <class Cipher> void check_paths_agree() {
   }
 }
 
+template <class Cipher> void check_batch_path_agrees() {
+  std::vector<uint8_t> key(Cipher::key_size);
+  const size_t blocks = Cipher::preferred_batch + 3;
+  std::vector<uint8_t> input(blocks * Cipher::block_size);
+  std::vector<uint8_t> by_dispatch(input.size());
+  std::vector<uint8_t> by_software(input.size());
+
+  for (size_t i = 0; i < key.size(); ++i)
+    key[i] = static_cast<uint8_t>(0x71 + i * 11);
+
+  Cipher cipher(key);
+  uint32_t state = 0xd1b54a35u;
+  for (size_t trial = 0; trial < 64; ++trial) {
+    for (size_t i = 0; i < input.size(); ++i) {
+      state = state * 1664525u + 1013904223u;
+      input[i] = static_cast<uint8_t>(state >> 24);
+    }
+
+    cipher.encrypt_blocks(input, by_dispatch);
+    for (size_t i = 0; i < blocks; ++i)
+      cipher.encrypt_block_reference(
+          ctl::bytes(input).subview(i * Cipher::block_size,
+                                    Cipher::block_size),
+          ctl::writable_bytes(by_software)
+              .subview(i * Cipher::block_size, Cipher::block_size));
+    ASSERT_EQ(test::to_hex(by_software), test::to_hex(by_dispatch))
+        << "batch encrypt mismatch at trial " << trial;
+
+    cipher.decrypt_blocks(by_dispatch, by_dispatch);
+    ASSERT_EQ(test::to_hex(input), test::to_hex(by_dispatch))
+        << "batch decrypt mismatch at trial " << trial;
+  }
+}
+
 } // namespace
 
 // The three tests below pass whether or not the vector path is reached, because
@@ -135,13 +169,19 @@ TEST(aria, the_vector_path_is_actually_reached) {
             cipher.accelerated());
 #elif defined(CTL_HAS_ARM_HW_ACCEL)
   EXPECT_EQ(ctl::detail::cpu::has_arm_aes(), cipher.accelerated());
+#elif defined(__mips_msa) && !defined(CTL_NO_HW_ACCEL)
+  EXPECT_TRUE(cipher.accelerated());
 #else
   EXPECT_FALSE(cipher.accelerated());
 #endif
 
-  // Unlike AES, the vector path holds one block per register with nothing to
-  // interleave, so it asks for no batches whether or not it is reached.
+  // MSA slices eight blocks across eight registers. x86 and ARM keep one block
+  // in one register and do not ask the modes for staging batches.
+#if defined(__mips_msa) && !defined(CTL_NO_HW_ACCEL)
+  EXPECT_TRUE(cipher.prefers_batching());
+#else
   EXPECT_FALSE(cipher.prefers_batching());
+#endif
 }
 
 TEST(aria, vector_path_agrees_with_software_128) {
@@ -154,6 +194,12 @@ TEST(aria, vector_path_agrees_with_software_192) {
 
 TEST(aria, vector_path_agrees_with_software_256) {
   check_paths_agree<aria<256>>();
+}
+
+TEST(aria, batch_path_agrees_with_software) {
+  check_batch_path_agrees<aria<128>>();
+  check_batch_path_agrees<aria<192>>();
+  check_batch_path_agrees<aria<256>>();
 }
 
 TEST(aria, rejects_key_of_the_wrong_length) {

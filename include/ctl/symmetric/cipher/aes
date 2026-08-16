@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include <ctl/bytes>
+#include <ctl/detail/aes_bitslice>
 #include <ctl/detail/config>
 #include <ctl/detail/cpu>
 #include <ctl/detail/endian>
@@ -29,7 +30,14 @@
 #include <ctl/detail/memory>
 #include <ctl/detail/sbox>
 
-#if defined(CTL_AES_HAS_HARDWARE)
+/**
+ * Whether there is a hardware path at all, whichever architecture provides it
+ */
+#if defined(CTL_HAS_X86_HW_ACCEL) || defined(CTL_HAS_ARM_HW_ACCEL)
+#define CTL_AES_HAS_HARDWARE 1
+#endif
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
@@ -37,13 +45,6 @@
 #endif
 #elif defined(CTL_HAS_ARM_HW_ACCEL)
 #include <arm_neon.h>
-#endif
-
-/**
- * Whether there is a hardware path at all, whichever architecture provides it
- */
-#if defined(CTL_HAS_X86_HW_ACCEL) || defined(CTL_HAS_ARM_HW_ACCEL)
-#define CTL_AES_HAS_HARDWARE 1
 #endif
 
 namespace ctl {
@@ -247,6 +248,9 @@ public:
   ~aes() {
     ctl::detail::secure_zero(ek_, sizeof(ek_));
     ctl::detail::secure_zero(dk_, sizeof(dk_));
+#if defined(CTL_AES_CONSTANT_TIME)
+    ctl::detail::secure_zero(sliced_, sizeof(sliced_));
+#endif
 #if defined(CTL_AES_HAS_HARDWARE)
     ctl::detail::secure_zero(ek_bytes_, sizeof(ek_bytes_));
     ctl::detail::secure_zero(dk_bytes_, sizeof(dk_bytes_));
@@ -291,6 +295,13 @@ public:
       for (size_t c = 0; c < 4; ++c)
         dk_[4 * r + c] = inv_mix_column(dk_[4 * r + c]);
 
+#if defined(CTL_AES_CONSTANT_TIME)
+    // The table free path wants the same round keys in its own arrangement,
+    // and where it is the path being dispatched to they are worth keeping.
+    // Where it is not, nothing here builds them; see groups_constant_time.
+    build_sliced_keys(sliced_);
+#endif
+
 #if defined(CTL_AES_HAS_HARDWARE)
     // The hardware path loads round keys in byte order, so a separate copy is
     // prepared. The decryption round keys of the equivalent inverse cipher
@@ -331,7 +342,76 @@ public:
       return;
     }
 #endif
-    encrypt_block_reference(input, output);
+    software_block<true>(input, output);
+  }
+
+  /**
+   * @brief Encrypts one block without touching a table
+   *
+   * Every step is a shift, an and, or an exclusive or on whole words, so which
+   * memory is touched does not depend on the key or on the block. The table
+   * path is faster and this one does not leak through the cache; which of the
+   * two encrypt_block reaches is decided by CTL_AES_CONSTANT_TIME at compile
+   * time.
+   *
+   * One block is the worst case for it, since it transforms four at a time and
+   * three lanes go to waste. Modes that hand over batches do not pay that.
+   *
+   * @param input the block to encrypt
+   * @param output where the result goes, may be the same buffer as input
+   */
+  void encrypt_block_constant_time(block_view input,
+                                   writable_block_view output) const {
+    groups_constant_time<true>(input.data(), 1, output.data());
+  }
+
+  /**
+   * @brief Decrypts one block without touching a table
+   *
+   * @param input the block to decrypt
+   * @param output where the result goes, may be the same buffer as input
+   */
+  void decrypt_block_constant_time(block_view input,
+                                   writable_block_view output) const {
+    groups_constant_time<false>(input.data(), 1, output.data());
+  }
+
+  /**
+   * @brief Encrypts several blocks without touching a table
+   *
+   * This is where the table free path costs least, since four blocks share one
+   * pass. Available whether or not CTL_AES_CONSTANT_TIME selected it, for a
+   * caller that wants it for one buffer rather than for the whole build.
+   *
+   * @param input the blocks to encrypt, a whole number of them
+   * @param output where the results go, at least as long as input and may be
+   * the same buffer
+   * @exception std::invalid_argument if input is not a whole number of blocks,
+   * or if output is shorter than input
+   */
+  void encrypt_blocks_constant_time(ctl::bytes input,
+                                    ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::aes::encrypt_blocks_constant_time", input,
+        output, block_size);
+    groups_constant_time<true>(input.data(), count, output.data());
+  }
+
+  /**
+   * @brief Decrypts several blocks without touching a table
+   *
+   * @param input the blocks to decrypt, a whole number of them
+   * @param output where the results go, at least as long as input and may be
+   * the same buffer
+   * @exception std::invalid_argument if input is not a whole number of blocks,
+   * or if output is shorter than input
+   */
+  void decrypt_blocks_constant_time(ctl::bytes input,
+                                    ctl::writable_bytes output) const {
+    const size_t count = ctl::detail::require_whole_blocks(
+        "ctl::symmetric::cipher::aes::decrypt_blocks_constant_time", input,
+        output, block_size);
+    groups_constant_time<false>(input.data(), count, output.data());
   }
 
   /**
@@ -397,7 +477,7 @@ public:
       return;
     }
 #endif
-    decrypt_block_reference(input, output);
+    software_block<false>(input, output);
   }
 
   /**
@@ -418,13 +498,32 @@ public:
   }
 
   /**
+   * @brief Whether the table free path is the one encrypt_block reaches
+   *
+   * Fixed when the library is built rather than decided per processor, since
+   * nothing about a processor says whether its owner minds a cache timing
+   * channel.
+   */
+  static constexpr bool constant_time() {
+#if defined(CTL_AES_CONSTANT_TIME)
+    return true;
+#else
+    return false;
+#endif
+  }
+
+  /**
    * @brief Whether passing blocks in batches is worthwhile
    *
-   * On the hardware path several blocks can be interleaved, which pays off. On
-   * the software path it only adds the cost of moving data through a staging
-   * buffer. Modes of operation consult this to choose their path.
+   * On the hardware path several blocks can be interleaved, which pays off, and
+   * the table free path transforms four blocks in the same pass whether or not
+   * four were asked for. On the table path batching only adds the cost of
+   * moving data through a staging buffer. Modes of operation consult this to
+   * choose their path.
    */
   bool prefers_batching() const {
+    if (constant_time())
+      return true;
 #if defined(CTL_AES_HAS_HARDWARE)
     return hardware_;
 #else
@@ -467,9 +566,7 @@ public:
       return;
     }
 #endif
-    for (size_t i = 0; i < count; ++i)
-      encrypt_block_reference(block_view(in + i * block_size),
-                             writable_block_view(out + i * block_size));
+    software_blocks<true>(in, count, out);
   }
 
   /**
@@ -497,9 +594,7 @@ public:
       return;
     }
 #endif
-    for (size_t i = 0; i < count; ++i)
-      decrypt_block_reference(block_view(in + i * block_size),
-                             writable_block_view(out + i * block_size));
+    software_blocks<false>(in, count, out);
   }
 
   /**
@@ -538,9 +633,7 @@ public:
       return;
     }
 #endif
-    for (size_t i = 0; i < preferred_batch; ++i)
-      block_masked<true>(in + i * block_size, m + i * block_size,
-                         out + i * block_size);
+    batch_masked_software<true>(in, m, out);
   }
 
   /**
@@ -563,9 +656,7 @@ public:
       return;
     }
 #endif
-    for (size_t i = 0; i < preferred_batch; ++i)
-      block_masked<false>(in + i * block_size, m + i * block_size,
-                          out + i * block_size);
+    batch_masked_software<false>(in, m, out);
   }
 
   /**
@@ -591,9 +682,10 @@ public:
       return;
     }
 #endif
-    for (size_t i = 0; i < preferred_batch; ++i)
-      block_then_xor(in + i * block_size, op + i * block_size,
-                     out + i * block_size);
+    uint8_t staged[batch_bytes];
+    software_blocks<true>(in, preferred_batch, staged);
+    ctl::detail::xor_bytes(staged, op, out, batch_bytes);
+    ctl::detail::secure_zero(staged, sizeof(staged));
   }
 
   /**
@@ -709,11 +801,30 @@ private:
    * @brief Applies the S-box to each byte of a word (SubWord in FIPS 197)
    */
   static uint32_t sub_word(uint32_t w) {
+#if defined(CTL_AES_CONSTANT_TIME)
+    // The key schedule substitutes as well, and a table here would give away
+    // the key just as surely as one in the rounds. The same circuit takes four
+    // bytes through with sixty lanes idle, which costs nothing worth measuring
+    // once per key.
+    uint8_t block[block_size] = {0};
+    ctl::detail::store_be32(w, block);
+
+    ctl::detail::bitslice::state s;
+    ctl::detail::bitslice::load(block, 1, s);
+    ctl::detail::bitslice::sub_bytes(s);
+    ctl::detail::bitslice::store(s, 1, block);
+
+    const uint32_t result = ctl::detail::load_be32(block);
+    ctl::detail::secure_zero(block, sizeof(block));
+    ctl::detail::secure_zero(s, sizeof(s));
+    return result;
+#else
     const uint8_t *sbox = ctl::detail::aes_sbox.forward;
     return (static_cast<uint32_t>(sbox[b0(w)]) << 24) |
            (static_cast<uint32_t>(sbox[b1(w)]) << 16) |
            (static_cast<uint32_t>(sbox[b2(w)]) << 8) |
            static_cast<uint32_t>(sbox[b3(w)]);
+#endif
   }
 
   /**
@@ -743,31 +854,127 @@ private:
   }
 
   /**
-   * @brief Transforms one block with a mask applied on both sides
+   * @brief Transforms any number of blocks on the software path this build has
+   *
+   * The one place that decides which of the two software paths exists. Deciding
+   * it here, and with the preprocessor rather than with a condition an
+   * optimizer is expected to fold away, is what keeps a build that asked for
+   * the table free path from naming the table path anywhere, so its tables are
+   * not linked in at all whatever the optimization level. Deciding it at each
+   * of the seven call sites instead left them in an unoptimized build, which is
+   * where this stood until the binary was looked at.
    *
    * @tparam _Encrypt true to encrypt, false to decrypt
    */
   template <bool _Encrypt>
-  void block_masked(const uint8_t *input, const uint8_t *mask,
-                    uint8_t *output) const {
-    uint8_t buffer[block_size];
-    ctl::detail::xor_block<block_size>(input, mask, buffer);
-    if constexpr (_Encrypt)
-      encrypt_block(buffer, buffer);
-    else
-      decrypt_block(buffer, buffer);
-    ctl::detail::xor_block<block_size>(buffer, mask, output);
+  void software_blocks(const uint8_t *input, size_t count,
+                       uint8_t *output) const {
+#if defined(CTL_AES_CONSTANT_TIME)
+    groups_constant_time<_Encrypt>(input, count, output);
+#else
+    for (size_t i = 0; i < count; ++i) {
+      const block_view in(input + i * block_size);
+      const writable_block_view out(output + i * block_size);
+      if constexpr (_Encrypt)
+        encrypt_block_reference(in, out);
+      else
+        decrypt_block_reference(in, out);
+    }
+#endif
   }
 
   /**
-   * @brief Encrypts one block and exclusive ors the result with a buffer
+   * @brief Transforms one block on the software path this build has
    */
-  void block_then_xor(const uint8_t *input, const uint8_t *operand,
-                      uint8_t *output) const {
-    uint8_t buffer[block_size];
-    encrypt_block(block_view(input), buffer);
-    ctl::detail::xor_block<block_size>(buffer, operand, output);
+  template <bool _Encrypt>
+  void software_block(block_view input, writable_block_view output) const {
+    software_blocks<_Encrypt>(input.data(), 1, output.data());
   }
+
+  /**
+   * @brief Transforms any number of blocks on the table free path
+   *
+   * Four at a time, and whatever is left over in a last pass with the unused
+   * lanes idle.
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   */
+  template <bool _Encrypt>
+  void groups_constant_time(const uint8_t *input, size_t count,
+                            uint8_t *output) const {
+#if defined(CTL_AES_CONSTANT_TIME)
+    run_groups<_Encrypt>(sliced_, input, count, output);
+#else
+    // Where the build did not ask for this path, its round keys are not kept
+    // in the object, since that is a kilobyte and a fifth of a key setup for
+    // something that is never dispatched to. They are built here instead,
+    // once per call rather than once per group of four, which a buffer of any
+    // length pays back and a single block does not.
+    ctl::detail::bitslice::state sliced[rounds + 1];
+    build_sliced_keys(sliced);
+    run_groups<_Encrypt>(sliced, input, count, output);
+    ctl::detail::secure_zero(sliced, sizeof(sliced));
+#endif
+  }
+
+  /**
+   * @brief Transforms any number of blocks against round keys already sliced
+   */
+  template <bool _Encrypt>
+  void run_groups(const ctl::detail::bitslice::state *round_key,
+                  const uint8_t *input, size_t count, uint8_t *output) const {
+    constexpr size_t lanes = ctl::detail::bitslice::lanes;
+    for (size_t i = 0; i < count; i += lanes) {
+      const size_t take = (count - i < lanes) ? count - i : lanes;
+      if constexpr (_Encrypt)
+        ctl::detail::bitslice::encrypt(round_key, rounds,
+                                       input + i * block_size, take,
+                                       output + i * block_size);
+      else
+        ctl::detail::bitslice::decrypt(round_key, rounds,
+                                       input + i * block_size, take,
+                                       output + i * block_size);
+    }
+  }
+
+  /**
+   * @brief Puts the encryption round keys into the form the sliced path wants
+   *
+   * Only the encryption ones, since that path runs the plain inverse cipher
+   * rather than the equivalent one and has nothing to gain by moving
+   * InvMixColumns onto its keys.
+   */
+  void
+  build_sliced_keys(ctl::detail::bitslice::state (&sliced)[rounds + 1]) const {
+    uint8_t bytes[block_size];
+    for (size_t r = 0; r <= rounds; ++r) {
+      for (size_t c = 0; c < 4; ++c)
+        ctl::detail::store_be32(ek_[4 * r + c], bytes + 4 * c);
+      ctl::detail::bitslice::slice_round_key(bytes, sliced[r]);
+    }
+    ctl::detail::secure_zero(bytes, sizeof(bytes));
+  }
+
+  /**
+   * @brief One batch with a mask applied on both sides, on the software path
+   *
+   * The mask goes on before the batch is transformed and comes off after, so
+   * the staging buffer is touched twice rather than once per block. The table
+   * path answers no to prefers_batching and so is not normally handed a batch
+   * at all, but the entry point is public and has to work either way.
+   *
+   * @tparam _Encrypt true to encrypt, false to decrypt
+   */
+  template <bool _Encrypt>
+  void batch_masked_software(const uint8_t *input, const uint8_t *mask,
+                             uint8_t *output) const {
+    uint8_t staged[batch_bytes];
+    ctl::detail::xor_bytes(input, mask, staged, batch_bytes);
+    software_blocks<_Encrypt>(staged, preferred_batch, staged);
+    ctl::detail::xor_bytes(staged, mask, output, batch_bytes);
+    ctl::detail::secure_zero(staged, sizeof(staged));
+  }
+
 
 #if defined(CTL_AES_HAS_HARDWARE)
   /**
@@ -1163,6 +1370,17 @@ private:
    * @brief Round keys for decryption, for the equivalent inverse cipher
    */
   uint32_t dk_[round_key_words];
+
+#if defined(CTL_AES_CONSTANT_TIME)
+  /**
+   * @brief Encryption round keys in sliced form, for the table free path
+   *
+   * Only where that path is the one being dispatched to. A build that did not
+   * ask for it pays neither the kilobyte nor the key setup, and reaches the
+   * path, if it asks for it by name, through round keys built on the stack.
+   */
+  ctl::detail::bitslice::state sliced_[rounds + 1];
+#endif
 
 #if defined(CTL_AES_HAS_HARDWARE)
   /**

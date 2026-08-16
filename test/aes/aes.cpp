@@ -132,6 +132,70 @@ template <class Cipher> void check_paths_agree() {
   }
 }
 
+// The table free path is compiled in every configuration, whether or not it is
+// the one encrypt_block reaches, so that it is checked everywhere rather than
+// only in the build that selects it.
+template <class Cipher> void check_constant_time_agrees() {
+  std::vector<uint8_t> key(Cipher::key_size);
+  for (size_t i = 0; i < key.size(); ++i)
+    key[i] = static_cast<uint8_t>(0x31 + i * 5);
+
+  Cipher cipher(key);
+
+  std::vector<uint8_t> block(Cipher::block_size);
+  std::vector<uint8_t> sliced(Cipher::block_size);
+  std::vector<uint8_t> tabled(Cipher::block_size);
+
+  uint32_t state = 0x2468ace0u;
+  for (size_t round = 0; round < 512; ++round) {
+    for (size_t i = 0; i < block.size(); ++i) {
+      state = state * 1664525u + 1013904223u;
+      block[i] = static_cast<uint8_t>(state >> 24);
+    }
+
+    cipher.encrypt_block_constant_time(block, sliced);
+    cipher.encrypt_block_reference(block, tabled);
+    ASSERT_EQ(test::to_hex(tabled), test::to_hex(sliced))
+        << "encrypt mismatch at round " << round;
+
+    cipher.decrypt_block_constant_time(sliced, sliced);
+    ASSERT_EQ(test::to_hex(block), test::to_hex(sliced))
+        << "roundtrip mismatch at round " << round;
+  }
+}
+
+// Four blocks share one pass, and the fourth lane has to be as right as the
+// first. A group that is not full has to be right as well, since that is what
+// the end of a buffer looks like.
+template <class Cipher> void check_constant_time_groups() {
+  std::vector<uint8_t> key(Cipher::key_size, 0x5c);
+  Cipher cipher(key);
+
+  for (size_t count = 1; count <= 9; ++count) {
+    std::vector<uint8_t> input(count * Cipher::block_size);
+    for (size_t i = 0; i < input.size(); ++i)
+      input[i] = static_cast<uint8_t>(i * 31 + count);
+
+    std::vector<uint8_t> together(input.size());
+    cipher.encrypt_blocks_constant_time(input, together);
+
+    std::vector<uint8_t> one_at_a_time(input.size());
+    for (size_t i = 0; i < count; ++i)
+      cipher.encrypt_block_reference(
+          typename Cipher::block_view(input.data() + i * Cipher::block_size),
+          typename Cipher::writable_block_view(one_at_a_time.data() +
+                                               i * Cipher::block_size));
+
+    ASSERT_EQ(test::to_hex(one_at_a_time), test::to_hex(together))
+        << "with " << count << " blocks";
+
+    std::vector<uint8_t> back(input.size());
+    cipher.decrypt_blocks_constant_time(together, back);
+    ASSERT_EQ(test::to_hex(input), test::to_hex(back))
+        << "with " << count << " blocks";
+  }
+}
+
 } // namespace
 
 // The test above passes whether or not the hardware path is reached, because
@@ -152,8 +216,34 @@ TEST(aes, the_hardware_path_is_actually_reached) {
 #endif
 
   // And what asks for batches has to follow it, since that is what the parallel
-  // modes look at.
-  EXPECT_EQ(cipher.accelerated(), cipher.prefers_batching());
+  // modes look at. The table free path transforms four blocks per pass, so it
+  // wants batches whether or not there is hardware.
+  EXPECT_EQ(cipher.accelerated() || aes<128>::constant_time(),
+            cipher.prefers_batching());
+
+#if defined(CTL_AES_CONSTANT_TIME)
+  EXPECT_TRUE(aes<128>::constant_time());
+#else
+  EXPECT_FALSE(aes<128>::constant_time());
+#endif
+}
+
+TEST(aes, constant_time_path_agrees_with_tables_128) {
+  check_constant_time_agrees<aes<128>>();
+}
+
+TEST(aes, constant_time_path_agrees_with_tables_192) {
+  check_constant_time_agrees<aes<192>>();
+}
+
+TEST(aes, constant_time_path_agrees_with_tables_256) {
+  check_constant_time_agrees<aes<256>>();
+}
+
+TEST(aes, constant_time_groups_of_four_are_right_at_every_length) {
+  check_constant_time_groups<aes<128>>();
+  check_constant_time_groups<aes<192>>();
+  check_constant_time_groups<aes<256>>();
 }
 
 TEST(aes, hardware_path_agrees_with_software_128) {

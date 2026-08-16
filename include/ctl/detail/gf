@@ -37,6 +37,12 @@ inline constexpr uint16_t polynomial = 0x11b;
  * @return a * x
  */
 constexpr uint8_t xtime(uint8_t a) {
+  // Written as a conditional and left that way. It looks like a branch on a
+  // bit of the operand, which would be worth removing, and it is not one: the
+  // compilers here turn it into an arithmetic shift right by seven and an and,
+  // which is the mask a branchless version would build. Writing that mask out
+  // by hand needs a negate the shift does not, and measured eight percent
+  // slower on a key setup, so the plain form is what stays.
   return static_cast<uint8_t>((a << 1) ^
                               ((a & 0x80) ? (polynomial & 0xff) : 0x00));
 }

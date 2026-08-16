@@ -227,13 +227,15 @@ Chosen at run time through CPUID, so one binary runs anywhere.
   inverse cipher keys on both but reads them in opposite directions.
 - **PCLMULQDQ** for the GHASH of GCM, folding four blocks into a single
   reduction.
-- **AES-NI and SSSE3 for ARIA**, which has no instruction of its own. Its SB1 is
-  the AES S-box and its SB3 is the AES inverse S-box, so the AES round
-  instructions provide two of the four; the other two follow from an affine
-  relation recovered from the tables and checked at compile time. The diffusion
-  layer becomes seven byte shuffles. The state then stays in one register for
-  the whole block instead of being written out and read back every round, which
-  is where the time was going.
+- **The AES instructions and a sixteen byte table lookup for ARIA**, which has
+  no instruction of its own. Its SB1 is the AES S-box and its SB3 is the AES
+  inverse S-box, so the AES round instructions provide two of the four; the
+  other two follow from an affine relation recovered from the tables and checked
+  at compile time. The diffusion layer becomes seven byte shuffles. The state
+  then stays in one register for the whole block instead of being written out
+  and read back every round, which is where the time was going. x86 spells the
+  lookup `pshufb` and ARM spells it `tbl`, and the round is written once for
+  both.
 - **SSE2 and AVX2 on x86, NEON on ARM, MSA on MIPS, for LEA**, which needs no
   instruction set of its own at all. A round is four 32 bit words put through
   addition, exclusive or and rotation, and none of those look outside their own
@@ -254,6 +256,73 @@ Chosen at run time through CPUID, so one binary runs anywhere.
 Define `CTL_NO_HW_ACCEL` to leave all of it out. The published vectors pass
 either way, and every cipher with two paths has a test that runs the same inputs
 through both and compares.
+
+## AES without tables
+
+The table driven AES indexes memory with a value that depends on the key. Which
+cache lines that touches is visible to anything else on the machine, and
+recovering a key from that has been demonstrated more than once. Define
+`CTL_AES_CONSTANT_TIME` and AES indexes nothing: every step is a shift, an and,
+or an exclusive or on whole words, and the memory trace is the same for every
+key and every block. The key schedule substitutes through the same circuit, so
+it does not give the key away either.
+
+Four blocks are held across eight 64 bit words, one bit of every byte per word,
+and a round works on all sixty four bytes at once. The S-box becomes a circuit
+rather than a lookup: an inversion in GF(2^8) is expensive in the field FIPS 197
+names and cheap in a tower of GF(2^2) inside GF(2^4) inside GF(2^8), so the
+state changes basis into the tower, inverts, and changes back with the affine
+map folded in. The two basis changes are 8x8 matrices over GF(2), found by
+searching every isomorphism between the two fields for the one of least weight;
+both S-boxes were then checked against FIPS 197 for all 256 inputs before any of
+it was written in C++.
+
+What it costs, same machine and buffer as the table above, with `CTL_NO_HW_ACCEL`
+so that the two software paths are what is being compared.
+
+| | Tables | Table free |
+| --- | --- | --- |
+| ECB, four blocks per pass | 551 MB/s | 166 |
+| CTR | 391 | 145 |
+| GCM | 85 | 59 |
+| CBC encrypt, one block at a time | 399 | 46 |
+
+Three to four times the cost where blocks can go through together, and about ten
+where they cannot. CBC encryption chains, so it hands over one block at a time
+and three of the four lanes are idle; a mode that can run blocks in parallel does
+not pay that. GCM moves least because in software the tag, not the cipher, is
+most of the work.
+
+That the tables are gone is checked rather than asserted, and checking it found
+something. A program that uses AES through a mode and never names the reference
+path, built both ways, comes out 2,048 bytes smaller with the macro defined and
+holds neither round table nor either S-box. But that only held with optimization
+on: which of the two software paths runs was decided at each of seven call
+sites, and where the decision was an ordinary condition on a compile time
+constant, the branch never taken still named the table path, so an unoptimized
+build linked all eight and a half kilobytes of tables it could not reach. One
+function decides now, and the tables are absent at `/O2` and at `/Od` alike.
+There is nothing left to index.
+
+Worth saying plainly: on a processor with no AES instructions, LEA is table free
+by construction and four times faster than this. Where the cipher is negotiable,
+that is the better answer, and this path is for where it is not — a format or a
+protocol that names AES, on a processor that has no instruction for it.
+
+The circuit is compiled in every build whether or not `CTL_AES_CONSTANT_TIME`
+selects it, and `encrypt_block_constant_time`, `encrypt_blocks_constant_time`
+and their decrypting counterparts are always callable, so a caller can ask for
+it on one buffer rather than for the whole build. The tests compare it against
+the table path on every configuration for that reason.
+
+A build that does not select it pays nothing for it, which took a second
+attempt to get right. Its round keys want a different arrangement from the
+table path's, and keeping them in the cipher whether or not anything reached
+them doubled the object and cost a fifth of a key setup. They are kept only
+where the macro selects the path; where it does not, the entry points above
+build them on the stack, once per call rather than once per group of four, so
+a buffer of any length pays that back and only a single block does not. The
+object is the size it was and a key setup is as quick as it was.
 
 ## Measured throughput
 
@@ -353,22 +422,28 @@ handling and the vector paths are covered rather than assumed.
 
 | | How | Result |
 | --- | --- | --- |
-| x86-64, AES-NI and AVX2 | on the machine | 112 tests |
-| x86-64, `CTL_NO_HW_ACCEL` | on the machine | 112 tests |
-| ARM64, cryptographic instructions and NEON | cross built, run under qemu | 112 tests |
-| ARM 32 bit, NEON | cross built, run under qemu | 112 tests |
-| MIPS64 little endian, MSA | cross built, run under qemu | 112 tests |
+| x86-64, AES-NI and AVX2 | on the machine | 119 tests |
+| x86-64, `CTL_NO_HW_ACCEL` | on the machine | 119 tests |
+| x86-64, `CTL_AES_CONSTANT_TIME` | on the machine | 119 tests |
+| x86-64, both of those together | on the machine | 119 tests |
+| ARM64, cryptographic instructions and NEON | cross built, run under qemu | 119 tests |
+| ARM64, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 119 tests |
+| ARM 32 bit, NEON | cross built, run under qemu | 119 tests |
+| MIPS64 little endian, MSA | cross built, run under qemu | 119 tests |
 | MIPS64 big endian, MSA | not supported, see below | |
-| MIPS64 little endian, no MSA | cross built, run under qemu | 112 tests |
-| MIPS64 big endian | cross built, run under qemu | 112 tests |
-| MIPS32r2, no SIMD of any kind | cross built, run under qemu | 112 tests |
+| MIPS64 little endian, no MSA | cross built, run under qemu | 119 tests |
+| MIPS64 little endian, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 119 tests |
+| MIPS64 big endian | cross built, run under qemu | 119 tests |
+| MIPS32r2, no SIMD of any kind | cross built, run under qemu | 119 tests |
 
 The MIPS32r2 row is the oldest thing here: a single core with no MSA, since
 that needs release 5, and no cryptographic instructions, since MIPS has none at
 any release. Nothing is accelerated there and everything still works, which is
 the point of the row. What that target does have is a rotate instruction, which
 is the one thing LEA asks of a processor, and no need for the eight and a half
-kilobytes of table AES carries.
+kilobytes of table AES carries. The table free AES runs there too, on a
+processor whose registers are half the width its words want, which is the worst
+case that path has.
 
 MSA is not tied to a byte order and big endian MIPS can have it. Not supporting
 it there is this library's limit rather than the hardware's. Opening the gate
@@ -409,16 +484,11 @@ Written from the specifications and checked against their published vectors. It
 has not been independently audited, and where an audited implementation is a
 requirement, use one.
 
-Two properties are worth knowing before picking a build.
-
-The software AES path is table driven. That is the usual construction and is
-what the published vectors verify, but table lookups indexed by key dependent
-data can leak through cache timing. The AES-NI path does not have that property.
-Where an attacker can measure timing on the same machine and acceleration is not
-available, this matters. ARIA is table driven in the same way on its software
-path. LEA is not, and cannot be: it has no table, so there is no lookup to
-index, on any path. That is worth knowing where a build has to run without
-AES-NI and timing is part of the threat model.
+ARIA is table driven on its software path, and so is AES unless the table free
+path below is selected. Table lookups indexed by key dependent data can leak
+through cache timing; the AES-NI path, the ARM path and the table free path do
+not have that property, and neither does LEA on any path, since it has no table
+to index.
 
 GHASH is either the carry-less instruction or a bit at a time, and never a
 table, for the same reason: a GHASH table is built from the hash subkey and
