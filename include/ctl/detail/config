@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file config
  * @author jung-kwang lee (ntoskrnl7@gmail.com)
  * @brief Compiler and architecture detection
@@ -80,6 +80,28 @@
 #define CTL_TARGET_ARM_CRYPTO __attribute__((target("+crypto")))
 #else
 #define CTL_TARGET_ARM_CRYPTO
+#endif
+
+/**
+ * The attribute GHASH needs, which is whichever of the two above provides the
+ * polynomial multiply on this target
+ */
+#if defined(CTL_HAS_X86_HW_ACCEL)
+#define CTL_GHASH_TARGET CTL_TARGET_PCLMUL
+#else
+#define CTL_GHASH_TARGET CTL_TARGET_ARM_CRYPTO
+#endif
+
+/**
+ * The attribute the ARIA vector path needs
+ *
+ * It borrows the AES round instruction for two of its four S-boxes, so it wants
+ * whichever of the two above provides that.
+ */
+#if defined(CTL_HAS_X86_HW_ACCEL)
+#define CTL_ARIA_TARGET CTL_TARGET_AESNI
+#else
+#define CTL_ARIA_TARGET CTL_TARGET_ARM_CRYPTO
 #endif
 
 /**

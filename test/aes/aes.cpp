@@ -11,6 +11,7 @@
 #include <array>
 
 #include <ctl/bytes>
+#include <ctl/detail/cpu>
 #include <ctl/symmetric/cipher/aes>
 
 #include "../vectors.h"
@@ -132,6 +133,28 @@ template <class Cipher> void check_paths_agree() {
 }
 
 } // namespace
+
+// The test above passes whether or not the hardware path is reached, because
+// where it is not the table driven path answers for it and answers correctly.
+// This is the one that notices. It has caught a macro defined in terms of
+// itself, which compiled the round instructions out of the build entirely and
+// left every other test green.
+TEST(aes, the_hardware_path_is_actually_reached) {
+  const std::vector<uint8_t> key(aes<128>::key_size);
+  aes<128> cipher(key);
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  EXPECT_EQ(ctl::detail::cpu::has_aes(), cipher.accelerated());
+#elif defined(CTL_HAS_ARM_HW_ACCEL)
+  EXPECT_EQ(ctl::detail::cpu::has_arm_aes(), cipher.accelerated());
+#else
+  EXPECT_FALSE(cipher.accelerated());
+#endif
+
+  // And what asks for batches has to follow it, since that is what the parallel
+  // modes look at.
+  EXPECT_EQ(cipher.accelerated(), cipher.prefers_batching());
+}
 
 TEST(aes, hardware_path_agrees_with_software_128) {
   check_paths_agree<aes<128>>();

@@ -43,6 +43,21 @@
 #else
 #include <immintrin.h>
 #endif
+#elif defined(CTL_HAS_ARM_HW_ACCEL)
+#include <arm_neon.h>
+#endif
+
+/**
+ * Whether the vector path is compiled in
+ *
+ * It asks two things of a processor: the AES round instruction, which stands in
+ * for two of the four S-boxes, and a full sixteen byte table lookup, which
+ * covers the other two and the diffusion layer as well. x86 has them as AES-NI
+ * and SSSE3, ARMv8 as the cryptographic extension and NEON. Both are still
+ * decided at run time, since the AES part is optional on either.
+ */
+#if defined(CTL_HAS_X86_HW_ACCEL) || defined(CTL_HAS_ARM_HW_ACCEL)
+#define CTL_ARIA_HAS_VECTOR 1
 #endif
 
 namespace ctl {
@@ -540,6 +555,10 @@ public:
     // The vector path needs the AES instructions for two of the four S-boxes
     // and the byte shuffle for the other two and for the diffusion layer.
     simd_ = ctl::detail::cpu::has_aes() && ctl::detail::cpu::has_byte_shuffle();
+#elif defined(CTL_ARIA_HAS_VECTOR)
+    // On ARM64 the shuffle is part of NEON, which is not optional, so only the
+    // AES instructions are left to ask about.
+    simd_ = ctl::detail::cpu::has_arm_aes();
 #endif
 
     // KL is the leading 128 bits and KR is the remainder, right padded with
@@ -634,17 +653,35 @@ public:
   }
 
   /**
+   * @brief Whether the vector path of the processor is being used
+   *
+   * Only so that a test can tell the difference. A vector path that is compiled
+   * out or never dispatched to passes every known answer, because the table
+   * driven path answers for it and answers correctly, and nothing else would
+   * notice. That has happened here before, from a macro that ended up defined
+   * in terms of itself.
+   */
+  bool accelerated() const {
+#if defined(CTL_ARIA_HAS_VECTOR)
+    return simd_;
+#else
+    return false;
+#endif
+  }
+
+  /**
    * @brief Whether passing blocks in batches is worthwhile
    *
-   * ARIA has no hardware path, so batching gains nothing and only adds the
-   * cost of moving data through the staging buffers of the mode of operation.
+   * The vector path holds one block in one register and has nothing spare to
+   * interleave a second into, so batching gains nothing and only adds the cost
+   * of moving data through the staging buffers of the mode of operation.
    */
   bool prefers_batching() const { return false; }
 
   /**
    * @brief Encrypts several mutually independent blocks
    *
-   * ARIA has no hardware path, so this simply iterates. The interface is kept
+   * Batching buys ARIA nothing, so this simply iterates. The interface is kept
    * in line so that a mode of operation works with any block cipher through
    * the same code.
    *
@@ -688,9 +725,9 @@ public:
    * @brief Encrypts several blocks with a per block mask applied on both sides
    *
    * Computes output[i] = E(input[i] ^ mask[i]) ^ mask[i], which is what
-   * tweakable modes such as XTS need. ARIA has no hardware path, so this simply
-   * iterates; the interface exists so that a mode works with any block cipher
-   * through the same code.
+   * tweakable modes such as XTS need. Batching buys ARIA nothing, so this
+   * simply iterates; the interface exists so that a mode works with any block
+   * cipher through the same code.
    *
    * Exactly one batch, whose length is part of the argument types, matching the
    * shape AES uses so that a mode reaches either cipher through the same code.
@@ -906,7 +943,7 @@ private:
    */
   void crypt(const uint8_t (&round_key)[round_key_count][16],
              const uint8_t *input, uint8_t *output) const {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_ARIA_HAS_VECTOR)
     if (simd_) {
       crypt_vector(round_key, input, output);
       return;
@@ -941,12 +978,113 @@ private:
     ctl::detail::secure_zero(state, sizeof(state));
   }
 
+#if defined(CTL_ARIA_HAS_VECTOR)
+  /**
+   * @brief The sixteen byte operations the vector round is built from
+   *
+   * Two of them are the whole point. The AES round instruction applied with a
+   * zero key is the AES S-box over all sixteen bytes, which is ARIA's SB1, and
+   * its inverse is SB3. A sixteen byte table lookup then covers a nibble at a
+   * time of the affine map that turns those into SB2 and SB4, and covers the
+   * diffusion layer as well. x86 spells the lookup pshufb and ARM spells it
+   * tbl, and neither is asked here for an index past the end, since every index
+   * used is a byte position.
+   */
+  struct simd {
 #if defined(CTL_HAS_X86_HW_ACCEL)
+    typedef __m128i type;
+
+    CTL_TARGET_AESNI static CTL_FORCEINLINE type splat(uint8_t v) {
+      return _mm_set1_epi8(static_cast<char>(v));
+    }
+    CTL_TARGET_AESNI static CTL_FORCEINLINE type load(const uint8_t *at) {
+      return _mm_loadu_si128(reinterpret_cast<const __m128i *>(at));
+    }
+    CTL_TARGET_AESNI static CTL_FORCEINLINE void store(type v, uint8_t *at) {
+      _mm_storeu_si128(reinterpret_cast<__m128i *>(at), v);
+    }
+    CTL_TARGET_AESNI static CTL_FORCEINLINE type bit_and(type a, type b) {
+      return _mm_and_si128(a, b);
+    }
+    CTL_TARGET_AESNI static CTL_FORCEINLINE type bit_or(type a, type b) {
+      return _mm_or_si128(a, b);
+    }
+    CTL_TARGET_AESNI static CTL_FORCEINLINE type bit_xor(type a, type b) {
+      return _mm_xor_si128(a, b);
+    }
+    CTL_TARGET_AESNI static CTL_FORCEINLINE type shuffle(type table,
+                                                         type index) {
+      return _mm_shuffle_epi8(table, index);
+    }
+    CTL_TARGET_AESNI static CTL_FORCEINLINE type shift_nibble_down(type v) {
+      return _mm_srli_epi16(v, 4);
+    }
+
+    // The last round instruction shifts the rows and then substitutes, and the
+    // shift is undone by the caller, so with a zero key only the substitution
+    // is left.
+    CTL_TARGET_AESNI static CTL_FORCEINLINE type substitute_bytes(type v) {
+      return _mm_aesenclast_si128(v, _mm_setzero_si128());
+    }
+    CTL_TARGET_AESNI static CTL_FORCEINLINE type
+    substitute_bytes_inverse(type v) {
+      return _mm_aesdeclast_si128(v, _mm_setzero_si128());
+    }
+#else
+    typedef uint8x16_t type;
+
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type splat(uint8_t v) {
+      return vdupq_n_u8(v);
+    }
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type load(const uint8_t *at) {
+      return vld1q_u8(at);
+    }
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE void store(type v,
+                                                            uint8_t *at) {
+      vst1q_u8(at, v);
+    }
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type bit_and(type a, type b) {
+      return vandq_u8(a, b);
+    }
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type bit_or(type a, type b) {
+      return vorrq_u8(a, b);
+    }
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type bit_xor(type a, type b) {
+      return veorq_u8(a, b);
+    }
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type shuffle(type table,
+                                                              type index) {
+      return vqtbl1q_u8(table, index);
+    }
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type
+    shift_nibble_down(type v) {
+      return vreinterpretq_u8_u16(vshrq_n_u16(vreinterpretq_u16_u8(v), 4));
+    }
+
+    // AESE adds the key, shifts the rows and substitutes, in that order. The
+    // key is zero and the shift is undone by the caller, just as on x86, so
+    // again only the substitution is left.
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type substitute_bytes(type v) {
+      return vaeseq_u8(v, vdupq_n_u8(0));
+    }
+    CTL_TARGET_ARM_CRYPTO static CTL_FORCEINLINE type
+    substitute_bytes_inverse(type v) {
+      return vaesdq_u8(v, vdupq_n_u8(0));
+    }
+#endif
+  };
+
+  /**
+   * @brief A whole block held in one vector register
+   */
+  typedef typename simd::type vector;
+
   /**
    * @brief Loads a sixteen byte constant
    */
-  CTL_TARGET_AESNI static __m128i constant(const aria_detail::byte_vector &v) {
-    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(v.byte));
+  CTL_ARIA_TARGET static CTL_FORCEINLINE vector
+  constant(const aria_detail::byte_vector &v) {
+    return simd::load(v.byte);
   }
 
   /**
@@ -956,10 +1094,9 @@ private:
    * it. That instruction also shifts the rows, which is undone beforehand so
    * that only the substitution remains.
    */
-  CTL_TARGET_AESNI static __m128i substitute_1(__m128i x) {
-    return _mm_aesenclast_si128(
-        _mm_shuffle_epi8(x, constant(aria_detail::undo_shift_vector)),
-        _mm_setzero_si128());
+  CTL_ARIA_TARGET static vector substitute_1(vector x) {
+    return simd::substitute_bytes(
+        simd::shuffle(x, constant(aria_detail::undo_shift_vector)));
   }
 
   /**
@@ -968,10 +1105,9 @@ private:
    * SB3 is the inverse of SB1 and so is the AES inverse S-box, which the last
    * round instruction of AES decryption performs.
    */
-  CTL_TARGET_AESNI static __m128i substitute_3(__m128i x) {
-    return _mm_aesdeclast_si128(
-        _mm_shuffle_epi8(x, constant(aria_detail::redo_shift_vector)),
-        _mm_setzero_si128());
+  CTL_ARIA_TARGET static vector substitute_3(vector x) {
+    return simd::substitute_bytes_inverse(
+        simd::shuffle(x, constant(aria_detail::redo_shift_vector)));
   }
 
   /**
@@ -980,32 +1116,28 @@ private:
    * The linear part splits across the two nibbles of a byte, so one shuffle
    * over a sixteen entry table handles each half.
    */
-  CTL_TARGET_AESNI static __m128i
-  affine(__m128i x, const aria_detail::nibble_tables &tables) {
-    const __m128i mask = _mm_set1_epi8(0x0f);
-    const __m128i low = _mm_loadu_si128(
-        reinterpret_cast<const __m128i *>(tables.low));
-    const __m128i high = _mm_loadu_si128(
-        reinterpret_cast<const __m128i *>(tables.high));
-    return _mm_xor_si128(
-        _mm_xor_si128(
-            _mm_shuffle_epi8(low, _mm_and_si128(x, mask)),
-            _mm_shuffle_epi8(high,
-                             _mm_and_si128(_mm_srli_epi16(x, 4), mask))),
-        _mm_set1_epi8(static_cast<char>(tables.constant)));
+  CTL_ARIA_TARGET static vector
+  affine(vector x, const aria_detail::nibble_tables &tables) {
+    const vector mask = simd::splat(0x0f);
+    const vector low = simd::load(tables.low);
+    const vector high = simd::load(tables.high);
+    return simd::bit_xor(
+        simd::bit_xor(
+            simd::shuffle(low, simd::bit_and(x, mask)),
+            simd::shuffle(high,
+                          simd::bit_and(simd::shift_nibble_down(x), mask))),
+        simd::splat(tables.constant));
   }
 
   /**
    * @brief Selects from four results by byte position
    */
-  CTL_TARGET_AESNI static __m128i pick(__m128i a, __m128i b, __m128i c,
-                                       __m128i d) {
-    return _mm_or_si128(
-        _mm_or_si128(
-            _mm_and_si128(a, constant(aria_detail::selector[0])),
-            _mm_and_si128(b, constant(aria_detail::selector[1]))),
-        _mm_or_si128(_mm_and_si128(c, constant(aria_detail::selector[2])),
-                     _mm_and_si128(d, constant(aria_detail::selector[3]))));
+  CTL_ARIA_TARGET static vector pick(vector a, vector b, vector c, vector d) {
+    return simd::bit_or(
+        simd::bit_or(simd::bit_and(a, constant(aria_detail::selector[0])),
+                     simd::bit_and(b, constant(aria_detail::selector[1]))),
+        simd::bit_or(simd::bit_and(c, constant(aria_detail::selector[2])),
+                     simd::bit_and(d, constant(aria_detail::selector[3]))));
   }
 
   /**
@@ -1014,11 +1146,11 @@ private:
    * SB2 is the affine map applied to SB1, and SB4 is SB3 applied after the
    * inverse of that map, so the two AES instructions cover all four S-boxes.
    */
-  template <bool _Type1> CTL_TARGET_AESNI static __m128i substitute(__m128i x) {
-    const __m128i s1 = substitute_1(x);
-    const __m128i s2 = affine(s1, aria_detail::sb2_tables);
-    const __m128i s3 = substitute_3(x);
-    const __m128i s4 = substitute_3(affine(x, aria_detail::sb4_tables));
+  template <bool _Type1> CTL_ARIA_TARGET static vector substitute(vector x) {
+    const vector s1 = substitute_1(x);
+    const vector s2 = affine(s1, aria_detail::sb2_tables);
+    const vector s3 = substitute_3(x);
+    const vector s4 = substitute_3(affine(x, aria_detail::sb4_tables));
     if constexpr (_Type1)
       return pick(s1, s2, s3, s4);
     else
@@ -1028,15 +1160,12 @@ private:
   /**
    * @brief The diffusion layer as seven shuffles added together
    */
-  CTL_TARGET_AESNI static __m128i diffuse_vector(__m128i x) {
-    __m128i result = _mm_shuffle_epi8(
-        x, _mm_loadu_si128(reinterpret_cast<const __m128i *>(
-               aria_detail::diffusion_shuffles[0])));
+  CTL_ARIA_TARGET static vector diffuse_vector(vector x) {
+    vector result =
+        simd::shuffle(x, simd::load(aria_detail::diffusion_shuffles[0]));
     for (size_t k = 1; k < 7; ++k)
-      result = _mm_xor_si128(
-          result, _mm_shuffle_epi8(
-                      x, _mm_loadu_si128(reinterpret_cast<const __m128i *>(
-                             aria_detail::diffusion_shuffles[k]))));
+      result = simd::bit_xor(
+          result, simd::shuffle(x, simd::load(aria_detail::diffusion_shuffles[k])));
     return result;
   }
 
@@ -1048,29 +1177,22 @@ private:
    * round. Here it stays in one vector register from the first round to the
    * last.
    */
-  CTL_TARGET_AESNI void
+  CTL_ARIA_TARGET void
   crypt_vector(const uint8_t (&round_key)[round_key_count][16],
                const uint8_t *input, uint8_t *output) const {
-    __m128i state =
-        _mm_loadu_si128(reinterpret_cast<const __m128i *>(input));
+    vector state = simd::load(input);
 
     for (size_t round = 1; round < rounds; ++round) {
-      state = _mm_xor_si128(state,
-                            _mm_loadu_si128(reinterpret_cast<const __m128i *>(
-                                round_key[round - 1])));
+      state = simd::bit_xor(state, simd::load(round_key[round - 1]));
       state = (round & 1) ? substitute<true>(state) : substitute<false>(state);
       state = diffuse_vector(state);
     }
 
-    state = _mm_xor_si128(state,
-                          _mm_loadu_si128(reinterpret_cast<const __m128i *>(
-                              round_key[rounds - 1])));
+    state = simd::bit_xor(state, simd::load(round_key[rounds - 1]));
     state = substitute<false>(state);
-    state = _mm_xor_si128(state,
-                          _mm_loadu_si128(reinterpret_cast<const __m128i *>(
-                              round_key[rounds])));
+    state = simd::bit_xor(state, simd::load(round_key[rounds]));
 
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(output), state);
+    simd::store(state, output);
   }
 #endif
 
@@ -1084,7 +1206,7 @@ private:
    */
   uint8_t dk_[round_key_count][16];
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_ARIA_HAS_VECTOR)
   /**
    * @brief Whether the vector path is used, determined once when the key is set
    */

@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <ctl/bytes>
+#include <ctl/detail/cpu>
 #include <ctl/symmetric/cipher/aria>
 
 #include "../vectors.h"
@@ -121,6 +122,27 @@ template <class Cipher> void check_paths_agree() {
 }
 
 } // namespace
+
+// The three tests below pass whether or not the vector path is reached, because
+// where it is not the table driven path answers for it and answers correctly.
+// This is the one that notices.
+TEST(aria, the_vector_path_is_actually_reached) {
+  const std::vector<uint8_t> key(aria<128>::key_size);
+  aria<128> cipher(key);
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  EXPECT_EQ(ctl::detail::cpu::has_aes() && ctl::detail::cpu::has_byte_shuffle(),
+            cipher.accelerated());
+#elif defined(CTL_HAS_ARM_HW_ACCEL)
+  EXPECT_EQ(ctl::detail::cpu::has_arm_aes(), cipher.accelerated());
+#else
+  EXPECT_FALSE(cipher.accelerated());
+#endif
+
+  // Unlike AES, the vector path holds one block per register with nothing to
+  // interleave, so it asks for no batches whether or not it is reached.
+  EXPECT_FALSE(cipher.prefers_batching());
+}
 
 TEST(aria, vector_path_agrees_with_software_128) {
   check_paths_agree<aria<128>>();

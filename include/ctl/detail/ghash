@@ -32,12 +32,25 @@
 #include <ctl/detail/endian>
 #include <ctl/detail/memory>
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_GHASH_HAS_MULTIPLY)
 #if defined(_MSC_VER)
 #include <intrin.h>
 #else
 #include <immintrin.h>
 #endif
+#elif defined(CTL_HAS_ARM_HW_ACCEL)
+#include <arm_neon.h>
+#endif
+
+/**
+ * Whether a polynomial multiply instruction is available on this target
+ *
+ * PCLMULQDQ on x86 and PMULL on ARM. They compute the same thing, so what
+ * differs below is only the spelling and the way a 128 bit value is taken
+ * apart.
+ */
+#if defined(CTL_HAS_X86_HW_ACCEL) || defined(CTL_HAS_ARM_HW_ACCEL)
+#define CTL_GHASH_HAS_MULTIPLY 1
 #endif
 
 namespace ctl {
@@ -70,7 +83,7 @@ public:
 
   ghash() : hh_(0), hl_(0), yh_(0), yl_(0), pending_(0) {
     memset(buffer_, 0, sizeof(buffer_));
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_GHASH_HAS_MULTIPLY)
     hardware_ = false;
     memset(power_h_, 0, sizeof(power_h_));
     memset(power_l_, 0, sizeof(power_l_));
@@ -79,7 +92,7 @@ public:
 
   ~ghash() {
     ctl::detail::secure_zero(buffer_, sizeof(buffer_));
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_GHASH_HAS_MULTIPLY)
     ctl::detail::secure_zero(power_h_, sizeof(power_h_));
     ctl::detail::secure_zero(power_l_, sizeof(power_l_));
 #endif
@@ -99,9 +112,13 @@ public:
     hh_ = ctl::detail::load_be64(h);
     hl_ = ctl::detail::load_be64(h + 8);
 
+#if defined(CTL_GHASH_HAS_MULTIPLY)
 #if defined(CTL_HAS_X86_HW_ACCEL)
     hardware_ = ctl::detail::cpu::has_carryless_multiply() &&
                 ctl::detail::cpu::has_byte_shuffle();
+#else
+    hardware_ = ctl::detail::cpu::has_arm_polynomial_multiply();
+#endif
     if (hardware_) {
       // Powers of the subkey, used to fold several blocks into one reduction.
       power_h_[0] = hh_;
@@ -113,6 +130,21 @@ public:
 #endif
 
     reset();
+  }
+
+  /**
+   * @brief Whether the polynomial multiply instruction is being used
+   *
+   * Only so that a test can tell the difference. A path that is compiled in
+   * and never reached passes every known answer, because the bit at a time
+   * path answers for it and answers correctly, so nothing else would notice.
+   */
+  bool accelerated() const {
+#if defined(CTL_GHASH_HAS_MULTIPLY)
+    return hardware_;
+#else
+    return false;
+#endif
   }
 
   /**
@@ -144,7 +176,7 @@ public:
       pending_ = 0;
     }
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_GHASH_HAS_MULTIPLY)
     if (hardware_) {
       const size_t whole = size / block_size;
       if (whole != 0) {
@@ -206,7 +238,7 @@ private:
    * @brief Multiplies the accumulator by the subkey in GF(2^128)
    */
   void multiply() {
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_GHASH_HAS_MULTIPLY)
     if (hardware_) {
       multiply_carryless();
       return;
@@ -215,20 +247,164 @@ private:
     multiply_bitwise();
   }
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_GHASH_HAS_MULTIPLY)
   /**
-   * @brief Packs a big endian pair into the form the multiply instruction wants
+   * @brief The polynomial multiply and the few operations around it
    *
-   * The value a big endian load produces is already the right representation:
-   * GCM numbers bits from the most significant end, so putting the first eight
-   * bytes in the high lane and the last eight in the low lane places the
-   * coefficient of x^0 at bit 127, which is the reversed form the instruction
-   * operates on.
+   * PCLMULQDQ on x86 and PMULL on ARM compute the same thing. What differs is
+   * the spelling, how a 128 bit value is taken apart, and that x86 needs a
+   * shuffle mask to reverse a block where ARM has an instruction that reverses
+   * without one. Everything below this is written once.
    */
-  CTL_TARGET_PCLMUL static __m128i to_vector(uint64_t high, uint64_t low) {
-    return _mm_set_epi64x(static_cast<long long>(high),
-                          static_cast<long long>(low));
-  }
+  struct wide {
+#if defined(CTL_HAS_X86_HW_ACCEL)
+    typedef __m128i type;
+
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type zero() {
+      return _mm_setzero_si128();
+    }
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type bitxor(type a, type b) {
+      return _mm_xor_si128(a, b);
+    }
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type bitor_(type a, type b) {
+      return _mm_or_si128(a, b);
+    }
+    template <int _N>
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type shift_left_bytes(type v) {
+      return _mm_slli_si128(v, _N);
+    }
+    template <int _N>
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type shift_right_bytes(type v) {
+      return _mm_srli_si128(v, _N);
+    }
+    template <int _N>
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type shift_left_words(type v) {
+      return _mm_slli_epi32(v, _N);
+    }
+    template <int _N>
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type shift_right_words(type v) {
+      return _mm_srli_epi32(v, _N);
+    }
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type make(uint64_t high,
+                                                       uint64_t low) {
+      return _mm_set_epi64x(static_cast<long long>(high),
+                            static_cast<long long>(low));
+    }
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE uint64_t low_half(type v) {
+      return static_cast<uint64_t>(_mm_cvtsi128_si64(v));
+    }
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE uint64_t high_half(type v) {
+      return static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_srli_si128(v, 8)));
+    }
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type multiply_low(type a,
+                                                               type b) {
+      return _mm_clmulepi64_si128(a, b, 0x00);
+    }
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type multiply_high(type a,
+                                                                type b) {
+      return _mm_clmulepi64_si128(a, b, 0x11);
+    }
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type multiply_cross(type a,
+                                                                 type b) {
+      return _mm_xor_si128(_mm_clmulepi64_si128(a, b, 0x10),
+                           _mm_clmulepi64_si128(a, b, 0x01));
+    }
+    // One shuffle turns a natural load into the reversed order the multiply
+    // wants. Assembling the two halves through general registers instead costs
+    // two byte reversals and two moves across register files, per block.
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type reverse_mask() {
+      return _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    }
+    static CTL_TARGET_PCLMUL CTL_FORCEINLINE type
+    load_reversed(const uint8_t *block, type mask) {
+      return _mm_shuffle_epi8(
+          _mm_loadu_si128(reinterpret_cast<const __m128i *>(block)), mask);
+    }
+
+#else
+    typedef uint8x16_t type;
+
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type zero() {
+      return vdupq_n_u8(0);
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type bitxor(type a, type b) {
+      return veorq_u8(a, b);
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type bitor_(type a, type b) {
+      return vorrq_u8(a, b);
+    }
+    // vext takes sixteen bytes from the concatenation of two registers, which
+    // covers both directions of a whole register shift once the other operand
+    // is zero.
+    template <int _N>
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type shift_left_bytes(type v) {
+      return vextq_u8(zero(), v, 16 - _N);
+    }
+    template <int _N>
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type
+    shift_right_bytes(type v) {
+      return vextq_u8(v, zero(), _N);
+    }
+    template <int _N>
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type shift_left_words(type v) {
+      return vreinterpretq_u8_u32(vshlq_n_u32(vreinterpretq_u32_u8(v), _N));
+    }
+    template <int _N>
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type
+    shift_right_words(type v) {
+      return vreinterpretq_u8_u32(vshrq_n_u32(vreinterpretq_u32_u8(v), _N));
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type make(uint64_t high,
+                                                           uint64_t low) {
+      uint64x2_t both = vdupq_n_u64(low);
+      both = vsetq_lane_u64(high, both, 1);
+      return vreinterpretq_u8_u64(both);
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE uint64_t low_half(type v) {
+      return vgetq_lane_u64(vreinterpretq_u64_u8(v), 0);
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE uint64_t high_half(type v) {
+      return vgetq_lane_u64(vreinterpretq_u64_u8(v), 1);
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE poly64_t part(type v,
+                                                               int which) {
+      return static_cast<poly64_t>(
+          which == 0 ? low_half(v) : high_half(v));
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type multiply_low(type a,
+                                                                   type b) {
+      return vreinterpretq_u8_p128(vmull_p64(part(a, 0), part(b, 0)));
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type multiply_high(type a,
+                                                                    type b) {
+      return vreinterpretq_u8_p128(
+          vmull_high_p64(vreinterpretq_p64_u8(a), vreinterpretq_p64_u8(b)));
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type multiply_cross(type a,
+                                                                     type b) {
+      return veorq_u8(
+          vreinterpretq_u8_p128(vmull_p64(part(a, 0), part(b, 1))),
+          vreinterpretq_u8_p128(vmull_p64(part(a, 1), part(b, 0))));
+    }
+    // No mask is needed here, since reversing the bytes of a register is two
+    // instructions on their own. The argument is kept so that the code below
+    // reads the same on both.
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type reverse_mask() {
+      return zero();
+    }
+    static CTL_TARGET_ARM_CRYPTO CTL_FORCEINLINE type
+    load_reversed(const uint8_t *block, type) {
+      const type natural = vld1q_u8(block);
+      const type within = vrev64q_u8(natural);
+      return vextq_u8(within, within, 8);
+    }
+#endif
+  };
+
+  /**
+   * @brief A 128 bit value in whichever register file provides the multiply
+   */
+  typedef typename wide::type vector;
 
   /**
    * @brief Carry-less multiply of two 128 bit values into a 256 bit product
@@ -236,14 +412,13 @@ private:
    * Schoolbook, with the two cross terms folded together. No reduction is done
    * here, which is what lets several products be summed before reducing once.
    */
-  CTL_TARGET_PCLMUL static void clmul_256(__m128i a, __m128i b, __m128i &low,
-                                          __m128i &high) {
-    const __m128i l = _mm_clmulepi64_si128(a, b, 0x00);
-    const __m128i h = _mm_clmulepi64_si128(a, b, 0x11);
-    const __m128i m = _mm_xor_si128(_mm_clmulepi64_si128(a, b, 0x10),
-                                    _mm_clmulepi64_si128(a, b, 0x01));
-    low = _mm_xor_si128(l, _mm_slli_si128(m, 8));
-    high = _mm_xor_si128(h, _mm_srli_si128(m, 8));
+  static CTL_GHASH_TARGET void multiply_256(vector a, vector b, vector &low,
+                                            vector &high) {
+    const vector l = wide::multiply_low(a, b);
+    const vector h = wide::multiply_high(a, b);
+    const vector m = wide::multiply_cross(a, b);
+    low = wide::bitxor(l, wide::template shift_left_bytes<8>(m));
+    high = wide::bitxor(h, wide::template shift_right_bytes<8>(m));
   }
 
   /**
@@ -256,83 +431,65 @@ private:
    * What follows folds the top half back in using the reversed form of the
    * field polynomial.
    */
-  CTL_TARGET_PCLMUL static __m128i reduce(__m128i low, __m128i high) {
-    const __m128i carry_low = _mm_srli_epi32(low, 31);
-    const __m128i carry_high = _mm_srli_epi32(high, 31);
-    low = _mm_slli_epi32(low, 1);
-    high = _mm_slli_epi32(high, 1);
+  static CTL_GHASH_TARGET vector reduce(vector low, vector high) {
+    const vector carry_low = wide::template shift_right_words<31>(low);
+    const vector carry_high = wide::template shift_right_words<31>(high);
+    low = wide::template shift_left_words<1>(low);
+    high = wide::template shift_left_words<1>(high);
 
-    const __m128i spill = _mm_srli_si128(carry_low, 12);
-    low = _mm_or_si128(low, _mm_slli_si128(carry_low, 4));
-    high = _mm_or_si128(high, _mm_slli_si128(carry_high, 4));
-    high = _mm_or_si128(high, spill);
+    const vector spill = wide::template shift_right_bytes<12>(carry_low);
+    low = wide::bitor_(low, wide::template shift_left_bytes<4>(carry_low));
+    high = wide::bitor_(high, wide::template shift_left_bytes<4>(carry_high));
+    high = wide::bitor_(high, spill);
 
-    const __m128i fold = _mm_xor_si128(
-        _mm_xor_si128(_mm_slli_epi32(low, 31), _mm_slli_epi32(low, 30)),
-        _mm_slli_epi32(low, 25));
-    const __m128i carried = _mm_srli_si128(fold, 4);
-    low = _mm_xor_si128(low, _mm_slli_si128(fold, 12));
+    const vector fold = wide::bitxor(
+        wide::bitxor(wide::template shift_left_words<31>(low),
+                     wide::template shift_left_words<30>(low)),
+        wide::template shift_left_words<25>(low));
+    const vector carried = wide::template shift_right_bytes<4>(fold);
+    low = wide::bitxor(low, wide::template shift_left_bytes<12>(fold));
 
-    __m128i tail = _mm_xor_si128(
-        _mm_xor_si128(_mm_srli_epi32(low, 1), _mm_srli_epi32(low, 2)),
-        _mm_srli_epi32(low, 7));
-    tail = _mm_xor_si128(tail, carried);
-    low = _mm_xor_si128(low, tail);
-    return _mm_xor_si128(high, low);
+    vector tail = wide::bitxor(
+        wide::bitxor(wide::template shift_right_words<1>(low),
+                     wide::template shift_right_words<2>(low)),
+        wide::template shift_right_words<7>(low));
+    tail = wide::bitxor(tail, carried);
+    low = wide::bitxor(low, tail);
+    return wide::bitxor(high, low);
   }
 
   /**
    * @brief Stores a field element back into the accumulator
    */
-  CTL_TARGET_PCLMUL void store_accumulator(__m128i value) {
-    yl_ = static_cast<uint64_t>(_mm_cvtsi128_si64(value));
-    yh_ = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_srli_si128(value, 8)));
+  CTL_GHASH_TARGET void store_accumulator(vector value) {
+    yl_ = wide::low_half(value);
+    yh_ = wide::high_half(value);
   }
 
   /**
-   * @brief Multiplies two field elements with the carry-less instruction
+   * @brief Multiplies two field elements with the polynomial multiply
    *
    * Used when preparing the powers of the subkey.
    */
-  CTL_TARGET_PCLMUL static void multiply_pair(uint64_t ah, uint64_t al,
-                                              uint64_t bh, uint64_t bl,
-                                              uint64_t &zh, uint64_t &zl) {
-    __m128i low;
-    __m128i high;
-    clmul_256(to_vector(ah, al), to_vector(bh, bl), low, high);
-    const __m128i result = reduce(low, high);
-    zl = static_cast<uint64_t>(_mm_cvtsi128_si64(result));
-    zh = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_srli_si128(result, 8)));
+  static CTL_GHASH_TARGET void multiply_pair(uint64_t ah, uint64_t al,
+                                             uint64_t bh, uint64_t bl,
+                                             uint64_t &zh, uint64_t &zl) {
+    vector low;
+    vector high;
+    multiply_256(wide::make(ah, al), wide::make(bh, bl), low, high);
+    const vector result = reduce(low, high);
+    zl = wide::low_half(result);
+    zh = wide::high_half(result);
   }
 
   /**
-   * @brief Multiplies using the carry-less multiply instruction
+   * @brief Multiplies using the polynomial multiply instruction
    */
-  CTL_TARGET_PCLMUL void multiply_carryless() {
-    __m128i low;
-    __m128i high;
-    clmul_256(to_vector(yh_, yl_), to_vector(hh_, hl_), low, high);
+  CTL_GHASH_TARGET void multiply_carryless() {
+    vector low;
+    vector high;
+    multiply_256(wide::make(yh_, yl_), wide::make(hh_, hl_), low, high);
     store_accumulator(reduce(low, high));
-  }
-
-  /**
-   * @brief The shuffle that reverses the sixteen bytes of a block
-   */
-  CTL_TARGET_PCLMUL static __m128i byte_reverse_mask() {
-    return _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-  }
-
-  /**
-   * @brief Loads one block straight into the form the multiply wants
-   *
-   * A shuffle turns the natural load into the reversed order in one
-   * instruction. Assembling the two halves through general registers instead
-   * costs two byte reversals and two moves across register files, per block.
-   */
-  CTL_TARGET_PCLMUL static __m128i load_block(const uint8_t *block,
-                                              __m128i reverse) {
-    return _mm_shuffle_epi8(
-        _mm_loadu_si128(reinterpret_cast<const __m128i *>(block)), reverse);
   }
 
   /**
@@ -352,29 +509,29 @@ private:
    * @param data whole blocks
    * @param blocks how many
    */
-  CTL_TARGET_PCLMUL void absorb_blocks(const uint8_t *data, size_t blocks) {
-    const __m128i reverse = byte_reverse_mask();
-    __m128i powers[aggregate];
+  CTL_GHASH_TARGET void absorb_blocks(const uint8_t *data, size_t blocks) {
+    const vector reverse = wide::reverse_mask();
+    vector powers[aggregate];
     for (size_t i = 0; i < aggregate; ++i)
-      powers[i] = to_vector(power_h_[i], power_l_[i]);
+      powers[i] = wide::make(power_h_[i], power_l_[i]);
 
-    __m128i y = to_vector(yh_, yl_);
+    vector y = wide::make(yh_, yl_);
 
     while (blocks >= aggregate) {
-      __m128i low = _mm_setzero_si128();
-      __m128i high = _mm_setzero_si128();
+      vector low = wide::zero();
+      vector high = wide::zero();
 
       for (size_t i = 0; i < aggregate; ++i) {
-        __m128i x = load_block(data + i * block_size, reverse);
+        vector x = wide::load_reversed(data + i * block_size, reverse);
         if (i == 0)
-          x = _mm_xor_si128(x, y);
+          x = wide::bitxor(x, y);
 
         // The first block takes the highest power, the last takes H itself.
-        __m128i l;
-        __m128i h;
-        clmul_256(x, powers[aggregate - 1 - i], l, h);
-        low = _mm_xor_si128(low, l);
-        high = _mm_xor_si128(high, h);
+        vector l;
+        vector h;
+        multiply_256(x, powers[aggregate - 1 - i], l, h);
+        low = wide::bitxor(low, l);
+        high = wide::bitxor(high, h);
       }
 
       y = reduce(low, high);
@@ -383,10 +540,10 @@ private:
     }
 
     while (blocks != 0) {
-      __m128i low;
-      __m128i high;
-      clmul_256(_mm_xor_si128(y, load_block(data, reverse)), powers[0], low,
-                high);
+      vector low;
+      vector high;
+      multiply_256(wide::bitxor(y, wide::load_reversed(data, reverse)),
+                   powers[0], low, high);
       y = reduce(low, high);
       data += block_size;
       --blocks;
@@ -464,7 +621,7 @@ private:
   uint8_t buffer_[block_size];
   size_t pending_;
 
-#if defined(CTL_HAS_X86_HW_ACCEL)
+#if defined(CTL_GHASH_HAS_MULTIPLY)
   /**
    * @brief H, H^2 and so on up to H^aggregate
    */

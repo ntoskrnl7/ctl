@@ -42,7 +42,7 @@
 /**
  * Whether there is a hardware path at all, whichever architecture provides it
  */
-#if defined(CTL_AES_HAS_HARDWARE) || defined(CTL_HAS_ARM_HW_ACCEL)
+#if defined(CTL_HAS_X86_HW_ACCEL) || defined(CTL_HAS_ARM_HW_ACCEL)
 #define CTL_AES_HAS_HARDWARE 1
 #endif
 
@@ -398,6 +398,23 @@ public:
     }
 #endif
     decrypt_block_reference(input, output);
+  }
+
+  /**
+   * @brief Whether the round instructions of the processor are being used
+   *
+   * Only so that a test can tell the difference. A hardware path that is
+   * compiled out or never dispatched to passes every known answer, because the
+   * table driven path answers for it and answers correctly, and nothing else
+   * would notice. That has happened twice here, both times from a macro that
+   * ended up defined in terms of itself.
+   */
+  bool accelerated() const {
+#if defined(CTL_AES_HAS_HARDWARE)
+    return hardware_;
+#else
+    return false;
+#endif
   }
 
   /**

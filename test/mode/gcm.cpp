@@ -16,6 +16,8 @@
 #include <utility>
 
 #include <ctl/bytes>
+#include <ctl/detail/cpu>
+#include <ctl/detail/ghash>
 #include <ctl/symmetric/cipher/aes>
 #include <ctl/symmetric/cipher/lea>
 #include <ctl/symmetric/mode/gcm>
@@ -132,6 +134,28 @@ TEST(gcm, case16_aes256_with_aad) {
                            "8cb08e48590dbb3da7b08b1056828838"
                            "c5f61e6393ba7a0abcc9f662",
                            "76fc6ece0f4e1768cddf8853bb2d551b");
+}
+
+// The polynomial multiply, PCLMULQDQ on x86 and PMULL on ARM, is what makes
+// GHASH quick. A path that is compiled in and never dispatched to passes every
+// vector above, because the bit at a time path answers for it correctly, so
+// this is the only test that would notice. It exists because exactly that
+// happened once already, to the vector path of LEA.
+TEST(gcm, the_polynomial_multiply_is_actually_reached) {
+  const std::vector<uint8_t> subkey(16, 0x42);
+  ctl::detail::ghash hash;
+  hash.set_key(subkey.data());
+
+#if defined(CTL_HAS_X86_HW_ACCEL)
+  EXPECT_EQ(ctl::detail::cpu::has_carryless_multiply() &&
+                ctl::detail::cpu::has_byte_shuffle(),
+            hash.accelerated());
+#elif defined(CTL_HAS_ARM_HW_ACCEL)
+  EXPECT_EQ(ctl::detail::cpu::has_arm_polynomial_multiply(),
+            hash.accelerated());
+#else
+  EXPECT_FALSE(hash.accelerated());
+#endif
 }
 
 TEST(gcm, constants) {
