@@ -82,26 +82,33 @@ Entropy cannot be computed. It has to be observed from the machine, so
 `getrandom` on Linux, `getentropy` on Apple and BSD. Nothing is implemented
 there because there is nothing there to implement.
 
-The generator is an algorithm, it is specified, and it is in
-`ctl/random/ctr_drbg`: the CTR_DRBG of SP 800-90A, on whichever block cipher it
-is given, checked against the CAVP vectors. That is what a validated deployment
-has to use, since what a validation scheme approves is a named generator with
-known answers behind it rather than whatever the host happened to do.
+The deterministic generators are algorithms and therefore live here:
+CTR_DRBG with and without `Block_Cipher_df`, HMAC_DRBG and Hash_DRBG. The AES
+and SHA-2 profiles are checked against NIST CAVP vectors covering optional
+personalization, additional input and reseeding as well as the simple path.
+The distinction matters in a validated deployment: a named mechanism with
+known answers can be assessed, while an opaque host facility cannot be claimed
+as that mechanism merely because it returns random-looking bytes.
 
 ```cpp
-uint8_t seed[ctl::ctr_drbg<cipher::aes<256>>::seed_size];
-ctl::random_bytes(seed);
-
-ctl::ctr_drbg<cipher::aes<256>> random(seed);
+using drbg_t = ctl::hmac_drbg<ctl::hash::sha256>;
+ctl::rbg<drbg_t> random;
 mode::gcm<cipher::aes<256>>::tag_t tag;
 uint8_t iv[12];
 random.generate(iv);
 ```
 
-The derivation function is not implemented, so a seed is exactly `seed_size`
-bytes and has to be full entropy, which is what the system source gives. Nothing
-reseeds on its own and the state does not survive `fork`, so a process that
-forks should seed the child again.
+The high-level `rbg` owns a system entropy provider and one DRBG. It seeds on
+construction, automatically reseeds before its configured request limit and
+reseeds after a detectable process fork. Direct mechanism types remain
+available where deterministic inputs or an externally validated entropy source
+are required. The no-derivation CTR form still deliberately requires exactly
+`seed_size` full-entropy bytes; its name is `ctr_drbg_no_df` so that constraint
+cannot be missed.
+
+These are correctness and lifecycle claims, not throughput claims. No random
+generator number is published because system-call cost, reseed policy, AES/SHA
+acceleration and request size would have to be measured and reported together.
 
 ---
 

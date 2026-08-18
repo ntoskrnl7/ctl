@@ -9,7 +9,20 @@ Headers carry no extension, in the same style as `ext`.
 ```cpp
 #include <ctl/bytes>                    // bytes, writable_bytes
 #include <ctl/random/system>            // random_bytes, from the system
-#include <ctl/random/ctr_drbg>          // ctr_drbg<Cipher>, SP 800-90A
+#include <ctl/random/ctr_drbg>           // AES CTR_DRBG with derivation
+#include <ctl/random/ctr_drbg_no_df>     // explicit no-derivation variant
+#include <ctl/random/hmac_drbg>          // HMAC_DRBG<Sha2>
+#include <ctl/random/hash_drbg>          // Hash_DRBG<Sha2>
+#include <ctl/random/rbg>                // system-seeded/reseeded owner
+#include <ctl/hash/fixed>               // fixed_hash, compute<Hash>
+#include <ctl/hash/sha2>                // hash::sha224 ... sha512_256
+#include <ctl/hash/sha3>                // hash::sha3_224 ... sha3_512
+#include <ctl/hash/xof>                 // xof, is_xof, expand<Xof>
+#include <ctl/hash/shake>               // hash::shake128, shake256
+#include <ctl/hash/blake2>              // hash::blake2s<Bits>, blake2b<Bits>
+#include <ctl/mac/hmac>                 // mac::hmac<Hash>
+#include <ctl/kdf/hkdf>                 // kdf::hkdf<Hash>, RFC 5869
+#include <ctl/kdf/pbkdf2>               // kdf::pbkdf2<Hash>, RFC 8018
 #include <ctl/symmetric/cipher/aes>     // cipher::aes<128|192|256>
 #include <ctl/symmetric/cipher/aria>    // cipher::aria<128|192|256>
 #include <ctl/symmetric/cipher/lea>     // cipher::lea<128|192|256>
@@ -74,6 +87,130 @@ Transforms accept disjoint input and output or an exact in-place operation.
 Shifted overlap, such as writing at `input + 1`, is rejected before anything is
 written; these APIs do not provide direction-dependent `memmove` semantics.
 
+## Fixed-output hashes, HMAC and key derivation
+
+All six SHA-2 functions in FIPS 180-4 and all four fixed-output SHA-3 functions
+in FIPS 202 are available. BLAKE2s and BLAKE2b take their byte-aligned digest
+size in bits as a template argument; the named aliases cover the standard
+128/160/224/256-bit BLAKE2s and 160/256/384/512-bit BLAKE2b sets. Every one is
+available as a one-shot or streaming operation. A streaming context has one
+owner, `finish` consumes it, and `reset` explicitly begins a new digest. State
+owned by the context is erased on finish, reset, move and destruction.
+
+Every fixed-output hash has the same compile-time contract: `block_size`,
+`digest_size`, digest storage and views, and `reset`, `update` and `finish`.
+`is_fixed_hash_v<Hash>` checks that shape, and generic code uses `compute`.
+Algorithms keep their static `hash` convenience function, so existing and
+generic spellings are both available.
+
+```cpp
+ctl::hash::sha256::digest_t digest;
+ctl::hash::sha256::hash(message, digest);
+
+static_assert(ctl::hash::is_fixed_hash_v<ctl::hash::sha256>);
+ctl::hash::compute<ctl::hash::sha256>(message, digest);
+
+ctl::hash::sha512 stream;
+stream.update(first);
+stream.update(second);
+ctl::hash::sha512::digest_t streamed_digest;
+stream.finish(streamed_digest);
+
+ctl::hash::blake2b<256>::digest_t blake_digest;
+ctl::hash::blake2b<256>::hash(message, blake_digest);
+```
+
+### Extendable-output functions
+
+SHAKE128 and SHAKE256 have no fixed `digest_size`. They satisfy the separate
+`is_xof_v<Xof>` contract: absorb with `update`, call `finish` once to apply the
+SHAKE domain suffix and enter the output phase, then call `squeeze` as often as
+needed. Successive calls continue one output stream rather than restarting it;
+only `reset` begins a new invocation. `expand` is the one-shot spelling.
+
+```cpp
+std::vector<uint8_t> output(96);
+ctl::hash::shake256::expand(message, output);
+
+static_assert(ctl::hash::is_xof_v<ctl::hash::shake256>);
+ctl::hash::shake256 stream;
+stream.update(first);
+stream.update(second);
+stream.finish();
+stream.squeeze(ctl::writable_bytes(output).first(32));
+stream.squeeze(ctl::writable_bytes(output).subview(32, 64));
+```
+
+SHAKE output has the prefix property: requesting 32 bytes and 64 bytes from the
+same input produces outputs where the former is the prefix of the latter. The
+requested length is not encoded into SHAKE. A protocol using one input for
+different purposes must therefore provide explicit domain separation rather
+than treating output lengths as separate domains. The API is byte-oriented, so
+it does not represent FIPS 202 inputs or outputs whose bit length is not a
+multiple of eight.
+
+RFC 7693's built-in keyed BLAKE2 mode remains reserved for a future MAC
+interface; the default-constructible BLAKE2 hash types are deliberately
+unkeyed.
+
+HMAC is generic over the hash and exposes only a full-length tag. Verification
+uses a content-independent comparison. A protocol that standardizes a shorter
+tag can truncate at that protocol boundary; this interface does not silently
+choose one. HMAC-BLAKE2 is the generic HMAC construction and is not RFC 7693's
+native keyed BLAKE2 mode. Likewise, a protocol has to define identifiers and
+parameters before using a SHA-3 or BLAKE2 HMAC/KDF combination; generic template
+compatibility by itself is not an interoperability profile.
+
+```cpp
+using hmac_t = ctl::mac::hmac<ctl::hash::sha256>;
+hmac_t::tag_t tag;
+hmac_t::authenticate(key, message, tag);
+
+if (!hmac_t::verify(key, received_message, tag)) {
+  // Reject before using received_message as authenticated data.
+}
+```
+
+The streaming HMAC form also consumes the current message at `finish`.
+`reset()` begins another message under the same key, while `set_key()` replaces
+the key. The context does not retain the caller's buffer, but it necessarily
+keeps an equivalent key-derived outer pad until rekeying or destruction and
+therefore has to be protected like the key itself.
+
+HKDF follows RFC 5869's extract and expand split. Usually the combined form is
+the right one; `info` should name the protocol, purpose and context so derived
+keys for different uses are separated.
+
+```cpp
+std::vector<uint8_t> session_key(32);
+ctl::kdf::hkdf<ctl::hash::sha256>::derive(
+    salt, shared_secret, protocol_context, session_key);
+```
+
+An empty salt has the RFC's defined zero-salt meaning. Output is capped at
+`255 * HashLen` and must be disjoint from salt, input key material and info.
+HKDF extracts entropy already present in key material; it is not a substitute
+for password stretching.
+
+PBKDF2-HMAC accepts the password as octets and gives no character encoding an
+implicit meaning. Its work factor is mandatory and has no library default.
+
+```cpp
+std::vector<uint8_t> password_key(32);
+ctl::kdf::pbkdf2<ctl::hash::sha256>::derive(
+    password_bytes, per_password_salt, deployment_iterations, password_key);
+```
+
+Choose and periodically review `deployment_iterations` by benchmarking the
+actual deployment and following its current security profile. The 80,000
+iteration value in the RFC 7914 test is a known answer, not a recommendation.
+RFC 8018's positive iteration and output-length requirements are enforced;
+salt quality and an adequate work factor remain application policy. KDF output
+must be disjoint from password and salt. All intermediate PRKs, HMAC pads and
+PBKDF2 `U` values owned by the library are erased on success and exception, but
+the caller remains responsible for erasing its password and derived-key
+buffers.
+
 ## A block cipher on its own
 
 ```cpp
@@ -98,26 +235,63 @@ calls therefore have to be allocated together; the library does not retain a
 history of them. This is the uniqueness requirement in
 [SP 800-38A appendix B](https://nvlpubs.nist.gov/nistpubs/legacy/sp/nistspecialpublication800-38a.pdf).
 
-## Entropy and CTR_DRBG
+## Entropy, DRBGs and the owned RBG
 
-`ctl::random_bytes` fills a buffer from the operating system. `ctr_drbg` turns a
-full-entropy seed into repeated bounded requests using the no-derivation-
-function construction from SP 800-90A.
+`ctl::random_bytes` fills a buffer directly from the operating system. It is
+the normal choice when an application just needs a key or nonce. The three
+SP 800-90A generator families are separate deterministic state machines:
+
+- `ctr_drbg<aes<Bits>>` conditions separate entropy, nonce and optional
+  personalization strings with `Block_Cipher_df`; this is the recommended CTR
+  form and therefore owns the unqualified name.
+- `ctr_drbg_no_df<aes<Bits>>` takes exactly `seed_size` full-entropy bytes and
+  is reserved for callers whose upstream design already supplies that exact
+  seed contract.
+- `hmac_drbg<Sha2>` and `hash_drbg<Sha2>` implement their named SHA-2 based
+  mechanisms. Only the SHA-2 types approved by SP 800-90A Rev. 1 are accepted;
+  generic compatibility with SHA-3 or BLAKE2 is deliberately not presented as
+  an approved DRBG profile.
+
+The high-level form owns both the DRBG and its system entropy source. It seeds
+on construction, automatically reseeds before the selected request interval,
+and on Unix-like systems detects a changed process ID and reseeds before the
+child can generate. It accepts the three conditioned forms (`ctr_drbg`,
+`hmac_drbg` and `hash_drbg`); the deliberately different no-DF seed contract
+is not hidden behind this wrapper.
 
 ```cpp
-using drbg_t = ctl::ctr_drbg<cipher::aes<256>>;
-uint8_t seed[drbg_t::seed_size];
-ctl::random_bytes(seed);
+using drbg_t = ctl::hmac_drbg<ctl::hash::sha256>;
+ctl::rbg<drbg_t> random;
 
-drbg_t generator(seed);
-generator.generate(out);
+random.generate(out);
+random.generate_fresh(session_key); // reseed immediately before this request
 ```
 
-A generator cannot be copied: copying its key and counter would create two
-objects that emit the same stream. It can be moved, which transfers the state
-and erases the source. The moved-from object refuses generation and reseeding
-until `instantiate` gives it a fresh seed. It also must be reseeded in the child
-after a process fork, and concurrent access requires external synchronization.
+For deterministic testing or a protocol that supplies its own entropy and
+nonce, instantiate the mechanism directly:
+
+```cpp
+uint8_t entropy[ctl::ctr_drbg<cipher::aes<256>>::entropy_size];
+uint8_t nonce[ctl::ctr_drbg<cipher::aes<256>>::nonce_size];
+ctl::random_bytes(entropy);
+ctl::random_bytes(nonce);
+
+ctl::ctr_drbg<cipher::aes<256>> generator(entropy, nonce, context);
+generator.generate(out, additional_input);
+```
+
+All generators cap one request at 2^19 bits and refuse to pass the SP 800-90A
+2^48-request reseed limit. Entropy and nonce arguments enforce their minimum
+lengths, but a byte count cannot prove that input really contains the claimed
+entropy. Additional input must be disjoint from output. DRBG and RBG objects
+cannot be copied; moving transfers and erases the one state. Direct DRBG use
+still requires explicit reseeding after `fork`; the `rbg` wrapper performs the
+process-ID check where that facility exists. None is safe for concurrent calls
+without external synchronization.
+
+`rbg` is a policy wrapper, not a claim that the opaque output of a host API has
+itself received SP 800-90B validation. A FIPS or SP 800-90C deployment must
+still validate its complete entropy-source and module boundary.
 
 ## XTS, for storage
 

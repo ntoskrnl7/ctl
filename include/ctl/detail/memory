@@ -38,6 +38,33 @@ inline void secure_zero(void *buffer, size_t size) {
 }
 
 /**
+ * @brief Fixed-size scratch storage that is securely erased on every exit
+ *
+ * Cryptographic intermediates must also be erased when an exception unwinds
+ * the stack. This small internal owner makes that property automatic and is
+ * deliberately neither copyable nor movable, so a secret cannot acquire an
+ * unnoticed second lifetime.
+ */
+template <size_t _Size> class secret_buffer {
+public:
+  secret_buffer() { memset(data_, 0, sizeof(data_)); }
+  secret_buffer(const secret_buffer &) = delete;
+  secret_buffer &operator=(const secret_buffer &) = delete;
+  ~secret_buffer() { secure_zero(data_, sizeof(data_)); }
+
+  uint8_t *data() noexcept { return data_; }
+  const uint8_t *data() const noexcept { return data_; }
+  static constexpr size_t size() noexcept { return _Size; }
+
+  uint8_t &operator[](size_t index) noexcept { return data_[index]; }
+  uint8_t operator[](size_t index) const noexcept { return data_[index]; }
+
+private:
+  static_assert(_Size != 0, "secret_buffer must own at least one byte");
+  uint8_t data_[_Size];
+};
+
+/**
  * @brief Compares two buffers in constant time
  *
  * There is no early return on the first difference, so the running time does

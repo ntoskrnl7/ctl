@@ -1,0 +1,378 @@
+/**
+ * @file random/ctr_drbg_no_df
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief CTR_DRBG, the counter mode deterministic generator (NIST SP 800-90A)
+ *
+ * Random bytes come from two things that are easy to confuse, and this file is
+ * one of them.
+ *
+ * The first is entropy, which cannot be computed. It has to be observed from
+ * the machine, and only the operating system is in a position to do that, which
+ * is why ctl/random/system asks it rather than implementing anything.
+ *
+ * The second is the generator: given a seed, produce a stream that cannot be
+ * distinguished from random or run backwards to recover the seed. That is an
+ * algorithm, it is specified, and it is implemented here rather than deferred,
+ * for the same reason every other algorithm in this library is.
+ *
+ * This is the AES CTR_DRBG of SP 800-90A section 10.2 without its derivation
+ * function. The seed has to be exactly seed_size bytes and has to contain that
+ * much entropy. That is the shape the published vectors labelled "no df" test.
+ * A successful operating-system call supplies cryptographic random bytes, but
+ * this header cannot certify the host as a validated entropy source.
+ *
+ * What this does not do is decide when to reseed for you, and it does not
+ * survive fork. Both are said again where they matter below.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ *
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <type_traits>
+
+#include <ctl/bytes>
+#include <ctl/detail/memory>
+#include <ctl/symmetric/cipher/aes>
+
+namespace ctl {
+
+/**
+ * @brief CTR_DRBG (NIST SP 800-90A section 10.2)
+ *
+ * @tparam _Cipher one of the CTL AES-128, AES-192 or AES-256 types
+ */
+template <class _Cipher> class ctr_drbg_no_df {
+public:
+  /**
+   * @brief The block cipher type
+   */
+  typedef _Cipher cipher_type;
+
+  /**
+   * @brief Block size in bytes
+   */
+  static constexpr size_t block_size = cipher_type::block_size;
+
+  static_assert(block_size == 16,
+                "CTR_DRBG is used here only with 128 bit block ciphers.");
+  static_assert(
+      std::is_same<cipher_type, ctl::symmetric::cipher::aes<128>>::value ||
+          std::is_same<cipher_type,
+                       ctl::symmetric::cipher::aes<192>>::value ||
+          std::is_same<cipher_type,
+                       ctl::symmetric::cipher::aes<256>>::value,
+      "The current SP 800-90A CTR_DRBG profile accepts CTL AES only.");
+
+  /**
+   * @brief Key size in bytes
+   */
+  static constexpr size_t key_size = cipher_type::key_size;
+
+  /**
+   * @brief Seed size in bytes, which the specification calls seedlen
+   *
+   * The key and the counter together, since a seed has to set both.
+   */
+  static constexpr size_t seed_size = key_size + block_size;
+
+  /**
+   * @brief The most bytes one call may produce
+   *
+   * SP 800-90A limits a single request to 2^19 bits.
+   */
+  static constexpr size_t max_per_request = (1u << 19) / 8;
+
+  /**
+   * @brief How many requests may be served before reseeding
+   *
+   * The specification allows up to 2^48 for this mechanism. Nothing here
+   * reseeds on its own, so this is the point at which generate refuses rather
+   * than a point at which it quietly carries on.
+   */
+  static constexpr uint64_t reseed_interval = 1ull << 48;
+
+  /**
+   * @brief A seed handed over for reading
+   */
+  typedef ctl::fixed_bytes<seed_size> seed_view;
+
+  /**
+   * @brief Creates a generator from a seed
+   *
+   * @param seed seed_size bytes of full entropy, from ctl::random_bytes or
+   * another source that provides it
+   * @param personalization anything that distinguishes this generator from
+   * another seeded at the same moment, at most seed_size bytes; may be empty
+   * @exception std::invalid_argument if personalization is longer than
+   * seed_size
+   */
+  explicit ctr_drbg_no_df(seed_view seed,
+                          ctl::bytes personalization = ctl::bytes())
+      : ready_(false) {
+    instantiate(seed, personalization);
+  }
+
+  /**
+   * @brief State cannot be cloned
+   *
+   * Two copies would emit the same stream until one was reseeded. Moving is a
+   * transfer instead: the source is erased and refuses generation afterwards.
+   */
+  ctr_drbg_no_df(const ctr_drbg_no_df &) = delete;
+  ctr_drbg_no_df &operator=(const ctr_drbg_no_df &) = delete;
+
+  ctr_drbg_no_df(ctr_drbg_no_df &&other) noexcept : ready_(false) {
+    take(other);
+  }
+
+  ctr_drbg_no_df &operator=(ctr_drbg_no_df &&other) noexcept {
+    if (this != &other) {
+      erase();
+      take(other);
+    }
+    return *this;
+  }
+
+  /**
+   * @brief Erases the state on destruction
+   */
+  ~ctr_drbg_no_df() { erase(); }
+
+  /**
+   * @brief Seeds the generator, discarding whatever it held
+   *
+   * Section 10.2.1.3.1. The personalization string is combined with the seed
+   * rather than hashed into it, since without the derivation function there is
+   * nothing to hash with.
+   *
+   * @param seed seed_size bytes of full entropy
+   * @param personalization at most seed_size bytes, may be empty
+   * @exception std::invalid_argument if personalization is longer than
+   * seed_size
+   */
+  void instantiate(seed_view seed,
+                   ctl::bytes personalization = ctl::bytes()) {
+    uint8_t material[seed_size];
+    combine(seed, personalization, material,
+            "ctl::ctr_drbg_no_df::instantiate");
+
+    memset(key_, 0, sizeof(key_));
+    memset(v_, 0, sizeof(v_));
+    update(material);
+    counter_ = 1;
+    ready_ = true;
+
+    ctl::detail::secure_zero(material, sizeof(material));
+  }
+
+  /**
+   * @brief Seeds the generator again, carrying its current state forward
+   *
+   * Section 10.2.1.4.1. Unlike instantiate, what the generator already held
+   * takes part, so a reseed cannot make it worse than it was even if the new
+   * seed turns out to be poor.
+   *
+   * @param seed seed_size bytes of full entropy
+   * @param additional anything else to mix in, at most seed_size bytes
+   * @exception std::invalid_argument if additional is longer than seed_size
+   * @exception std::logic_error if this object's state was moved away
+   */
+  void reseed(seed_view seed, ctl::bytes additional = ctl::bytes()) {
+    require_ready("ctl::ctr_drbg_no_df::reseed");
+    uint8_t material[seed_size];
+    combine(seed, additional, material, "ctl::ctr_drbg_no_df::reseed");
+    update(material);
+    counter_ = 1;
+    ctl::detail::secure_zero(material, sizeof(material));
+  }
+
+  /**
+   * @brief Produces random bytes
+   *
+   * Section 10.2.1.5.1. The state is advanced afterwards, so what was produced
+   * cannot be recovered from what the generator holds now, which is the
+   * property that makes this worth using rather than simply encrypting a
+   * counter.
+   *
+   * @param output where the bytes go, at most max_per_request of them
+   * @param additional anything to mix in first, at most seed_size bytes
+   * @exception std::length_error if more than max_per_request is asked for, or
+   * if the generator has served reseed_interval requests without being reseeded
+   * @exception std::invalid_argument if additional is longer than seed_size
+   * @exception std::logic_error if this object's state was moved away
+   */
+  void generate(ctl::writable_bytes output,
+                ctl::bytes additional = ctl::bytes()) {
+    require_ready("ctl::ctr_drbg_no_df::generate");
+    if (output.size() > max_per_request)
+      throw std::length_error(
+          "ctl::ctr_drbg_no_df::generate : one request may produce at most " +
+          std::to_string(max_per_request) + " bytes.");
+    if (counter_ > reseed_interval)
+      throw std::length_error("ctl::ctr_drbg_no_df::generate : the generator has "
+                              "served as many requests as it may before being "
+                              "reseeded.");
+    ctl::detail::require_disjoint(
+        "ctl::ctr_drbg_no_df::generate", "additional input",
+        additional.data(), additional.size(), "output", output.data(),
+        output.size());
+
+    uint8_t material[seed_size];
+    const bool mixed = !additional.empty();
+    if (mixed) {
+      pad(additional, material, "ctl::ctr_drbg_no_df::generate");
+      update(material);
+    }
+
+    // The key does not change while the request is served, so the cipher is
+    // built once.
+    cipher_type cipher{typename cipher_type::key_view(key_)};
+    size_t filled = 0;
+    while (filled < output.size()) {
+      increment();
+      uint8_t block[block_size];
+      cipher.encrypt_block(v_, block);
+      const size_t take = output.size() - filled < block_size
+                              ? output.size() - filled
+                              : block_size;
+      memcpy(output.data() + filled, block, take);
+      filled += take;
+      ctl::detail::secure_zero(block, sizeof(block));
+    }
+
+    // Advancing the state after the output is what stops the output being
+    // recoverable from it.
+    update(mixed ? material : nullptr);
+    ++counter_;
+
+    ctl::detail::secure_zero(material, sizeof(material));
+  }
+
+  /**
+   * @brief How many requests have been served since the last seeding
+   *
+   * @exception std::logic_error if this object's state was moved away
+   */
+  uint64_t requests_served() const {
+    require_ready("ctl::ctr_drbg_no_df::requests_served");
+    return counter_ - 1;
+  }
+
+private:
+  /**
+   * @brief Erases the current state and marks the object unusable
+   */
+  void erase() {
+    ctl::detail::secure_zero(key_, sizeof(key_));
+    ctl::detail::secure_zero(v_, sizeof(v_));
+    counter_ = 0;
+    ready_ = false;
+  }
+
+  /**
+   * @brief Refuses use of an object whose state has been moved away
+   */
+  void require_ready(const char *where) const {
+    if (!ready_)
+      throw std::logic_error(std::string(where) +
+                             " : this generator's state has been moved away. "
+                             "Instantiate it with a fresh seed before use.");
+  }
+
+  /**
+   * @brief Transfers the state and erases the source
+   */
+  void take(ctr_drbg_no_df &other) noexcept {
+    memcpy(key_, other.key_, sizeof(key_));
+    memcpy(v_, other.v_, sizeof(v_));
+    counter_ = other.counter_;
+    ready_ = other.ready_;
+    other.erase();
+  }
+
+  /**
+   * @brief Advances the counter, which is one big endian integer
+   */
+  void increment() {
+    unsigned carry = 1;
+    for (size_t i = sizeof(v_); i != 0; --i) {
+      const unsigned sum = static_cast<unsigned>(v_[i - 1]) + carry;
+      v_[i - 1] = static_cast<uint8_t>(sum);
+      carry = sum >> 8;
+    }
+  }
+
+  /**
+   * @brief CTR_DRBG_Update, section 10.2.1.2
+   *
+   * Produces seed_size bytes from the current key and counter, combines them
+   * with what was provided, and makes that the new key and counter. Every
+   * operation that changes the state goes through this and nothing else does.
+   *
+   * @param provided seed_size bytes to combine in, or null for none, which is
+   * the same as combining in zeroes
+   */
+  void update(const uint8_t *provided) {
+    uint8_t temp[seed_size];
+    {
+      cipher_type cipher{typename cipher_type::key_view(key_)};
+      size_t filled = 0;
+      while (filled < seed_size) {
+        increment();
+        uint8_t block[block_size];
+        cipher.encrypt_block(v_, block);
+        const size_t take = seed_size - filled < block_size ? seed_size - filled
+                                                            : block_size;
+        memcpy(temp + filled, block, take);
+        filled += take;
+        ctl::detail::secure_zero(block, sizeof(block));
+      }
+    }
+
+    if (provided != nullptr)
+      for (size_t i = 0; i < seed_size; ++i)
+        temp[i] = static_cast<uint8_t>(temp[i] ^ provided[i]);
+
+    memcpy(key_, temp, key_size);
+    memcpy(v_, temp + key_size, block_size);
+    ctl::detail::secure_zero(temp, sizeof(temp));
+  }
+
+  /**
+   * @brief Writes something shorter than a seed into a seed sized buffer
+   */
+  static void pad(ctl::bytes value, uint8_t *into, const char *where) {
+    if (value.size() > seed_size)
+      throw std::invalid_argument(
+          std::string(where) +
+          " : this may be at most " + std::to_string(seed_size) +
+          " bytes, and " + std::to_string(value.size()) + " were given.");
+    memset(into, 0, seed_size);
+    if (!value.empty())
+      memcpy(into, value.data(), value.size());
+  }
+
+  /**
+   * @brief Combines a seed with a shorter string, as the specification does
+   */
+  static void combine(seed_view seed, ctl::bytes extra, uint8_t *into,
+                      const char *where) {
+    pad(extra, into, where);
+    for (size_t i = 0; i < seed_size; ++i)
+      into[i] = static_cast<uint8_t>(into[i] ^ seed.data()[i]);
+  }
+
+  uint8_t key_[key_size];
+  uint8_t v_[block_size];
+  uint64_t counter_;
+  bool ready_;
+};
+
+} // namespace ctl

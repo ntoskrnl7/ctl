@@ -1,0 +1,135 @@
+/**
+ * @file random/detail/common
+ * @brief Shared rules and arithmetic for SP 800-90A generators
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+
+#include <ctl/bytes>
+#include <ctl/hash/sha2>
+
+namespace ctl {
+namespace random_detail {
+
+static constexpr size_t max_per_request = (1u << 19) / 8;
+static constexpr uint64_t reseed_interval = 1ull << 48;
+
+// SP 800-90A caps each input string at 2^35 bits. The algorithms describe
+// those lengths as 32 bit byte counts, so the largest representable byte
+// string is 2^32 - 1 bytes.
+static constexpr uint64_t max_input_size =
+    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+
+inline void require_input(ctl::bytes input, size_t minimum,
+                          const char *where, const char *name) {
+  if (input.size() < minimum)
+    throw std::invalid_argument(
+        std::string(where) + " : " + name + " requires at least " +
+        std::to_string(minimum) + " bytes, but " +
+        std::to_string(input.size()) + " were given.");
+  if (static_cast<uint64_t>(input.size()) > max_input_size)
+    throw std::length_error(std::string(where) + " : " + name +
+                            " exceeds the SP 800-90A input limit.");
+}
+
+inline void require_optional_input(ctl::bytes input, const char *where,
+                                   const char *name) {
+  require_input(input, 0, where, name);
+}
+
+inline void require_request(size_t size, uint64_t counter,
+                            const char *where) {
+  if (size > max_per_request)
+    throw std::length_error(
+        std::string(where) + " : one request may produce at most " +
+        std::to_string(max_per_request) + " bytes.");
+  if (counter > reseed_interval)
+    throw std::length_error(std::string(where) +
+                            " : the generator must be reseeded before "
+                            "another request.");
+}
+
+inline void require_ready(bool ready, const char *where) {
+  if (!ready)
+    throw std::logic_error(
+        std::string(where) +
+        " : this generator's state has been moved away. Instantiate it "
+        "with fresh entropy before use.");
+}
+
+inline void increment_be(uint8_t *value, size_t size) noexcept {
+  unsigned carry = 1;
+  for (size_t i = size; i != 0; --i) {
+    const unsigned sum = static_cast<unsigned>(value[i - 1]) + carry;
+    value[i - 1] = static_cast<uint8_t>(sum);
+    carry = sum >> 8;
+  }
+}
+
+// Adds an unsigned big-endian value to a wider big-endian destination,
+// discarding overflow as the DRBG specifications require.
+inline void add_be(uint8_t *destination, size_t destination_size,
+                   const uint8_t *addend, size_t addend_size) noexcept {
+  size_t di = destination_size;
+  size_t ai = addend_size;
+  unsigned carry = 0;
+  while (di != 0) {
+    const unsigned rhs = ai != 0 ? addend[--ai] : 0u;
+    const unsigned sum = static_cast<unsigned>(destination[--di]) + rhs + carry;
+    destination[di] = static_cast<uint8_t>(sum);
+    carry = sum >> 8;
+  }
+}
+
+inline void add_counter_be(uint8_t *destination, size_t destination_size,
+                           uint64_t counter) noexcept {
+  uint8_t encoded[8];
+  for (size_t i = 0; i < sizeof(encoded); ++i) {
+    encoded[sizeof(encoded) - 1 - i] = static_cast<uint8_t>(counter);
+    counter >>= 8;
+  }
+  add_be(destination, destination_size, encoded, sizeof(encoded));
+}
+
+template <class _Hash> struct hash_traits {
+  static constexpr bool approved = false;
+  static constexpr size_t security_strength = 0;
+  static constexpr size_t hash_drbg_seed_size = 0;
+};
+
+#define CTL_DRBG_SHA2_TRAITS(_Type, _Strength, _SeedSize)                    \
+  template <> struct hash_traits<ctl::hash::_Type> {                         \
+    static constexpr bool approved = true;                                  \
+    static constexpr size_t security_strength = (_Strength);                \
+    static constexpr size_t hash_drbg_seed_size = (_SeedSize);               \
+  }
+
+CTL_DRBG_SHA2_TRAITS(sha224, 192, 55);
+CTL_DRBG_SHA2_TRAITS(sha256, 256, 55);
+CTL_DRBG_SHA2_TRAITS(sha384, 256, 111);
+CTL_DRBG_SHA2_TRAITS(sha512, 256, 111);
+// Table 2 assigns the truncated SHA-512 functions 440-bit Hash_DRBG seeds;
+// seedlen follows the named function, not its internal 1024-bit block family.
+CTL_DRBG_SHA2_TRAITS(sha512_224, 192, 55);
+CTL_DRBG_SHA2_TRAITS(sha512_256, 256, 55);
+
+#undef CTL_DRBG_SHA2_TRAITS
+
+template <class _Hash> struct approved_hash {
+  static_assert(hash_traits<_Hash>::approved,
+                "SP 800-90A Rev. 1 DRBGs in CTL accept only the approved "
+                "SHA-2 hash types from ctl/hash/sha2.");
+  static constexpr size_t security_strength =
+      hash_traits<_Hash>::security_strength;
+  static constexpr size_t entropy_size = security_strength / 8;
+  static constexpr size_t nonce_size = security_strength / 16;
+};
+
+} // namespace random_detail
+} // namespace ctl

@@ -1,0 +1,160 @@
+/**
+ * @file fixed
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief Common interface for fixed-output byte hashes
+ *
+ * A fixed-output hash supplies a default-constructed streaming context,
+ * block_size, digest_size, digest storage and views, and the reset, update and
+ * finish operations. The interface is structural: a hash implemented outside
+ * CTL may satisfy it without inheriting from fixed_hash. The base is provided
+ * to keep CTL's own types and their one-shot hash operation uniform.
+ *
+ * Extendable-output functions have a different lifecycle after absorbing
+ * input and deliberately do not satisfy this interface. They belong behind a
+ * separate XOF interface rather than making the fixed digest contract depend
+ * on an output length chosen at run time.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+#include <utility>
+
+#include <ctl/bytes>
+
+namespace ctl {
+namespace hash {
+
+/**
+ * @brief Reusable public surface for a fixed-output hash
+ *
+ * @tparam _Derived the streaming hash context that implements update and
+ * finish
+ * @tparam _BlockSize the hash input block size in bytes
+ * @tparam _DigestSize the digest size in bytes
+ *
+ * This is static polymorphism only. It adds no state, virtual table or
+ * per-block dispatch. Inheriting from it is optional; is_fixed_hash checks the
+ * public shape instead of ancestry.
+ */
+template <class _Derived, size_t _BlockSize, size_t _DigestSize>
+class fixed_hash {
+  static_assert(_BlockSize != 0, "A hash block cannot be empty.");
+  static_assert(_DigestSize != 0, "A hash digest cannot be empty.");
+
+public:
+  static constexpr size_t block_size = _BlockSize;
+  static constexpr size_t digest_size = _DigestSize;
+
+  typedef uint8_t digest_t[digest_size];
+  typedef ctl::fixed_bytes<digest_size> digest_view;
+  typedef ctl::writable_fixed_bytes<digest_size> writable_digest_view;
+
+  /**
+   * @brief Hashes one complete byte string
+   */
+  static void hash(ctl::bytes input, writable_digest_view output) {
+    _Derived context;
+    context.update(input);
+    context.finish(output);
+  }
+
+protected:
+  fixed_hash() = default;
+  ~fixed_hash() = default;
+};
+
+namespace detail {
+
+template <class...> using void_t = void;
+
+template <class _Hash, class = void>
+struct has_fixed_hash_shape : std::false_type {};
+
+template <class _Hash>
+struct has_fixed_hash_shape<
+    _Hash,
+    void_t<typename _Hash::digest_t, typename _Hash::digest_view,
+           typename _Hash::writable_digest_view, decltype(_Hash::block_size),
+           decltype(_Hash::digest_size),
+           std::integral_constant<size_t, _Hash::block_size>,
+           std::integral_constant<size_t, _Hash::digest_size>,
+           decltype(std::declval<_Hash &>().reset()),
+           decltype(std::declval<_Hash &>().update(std::declval<ctl::bytes>())),
+           decltype(std::declval<_Hash &>().finish(
+               std::declval<typename _Hash::writable_digest_view>()))>>
+    : std::integral_constant<
+          bool,
+          std::is_default_constructible<_Hash>::value &&
+              std::is_move_constructible<_Hash>::value &&
+              std::is_move_assignable<_Hash>::value &&
+              std::is_same<typename std::remove_cv<
+                               decltype(_Hash::block_size)>::type,
+                           size_t>::value &&
+              std::is_same<typename std::remove_cv<
+                               decltype(_Hash::digest_size)>::type,
+                           size_t>::value &&
+              _Hash::block_size != 0 && _Hash::digest_size != 0 &&
+              std::is_array<typename _Hash::digest_t>::value &&
+              std::is_same<typename std::remove_extent<
+                               typename _Hash::digest_t>::type,
+                           uint8_t>::value &&
+              std::extent<typename _Hash::digest_t>::value ==
+                  _Hash::digest_size &&
+              std::is_same<typename _Hash::digest_view,
+                           ctl::fixed_bytes<std::extent<
+                               typename _Hash::digest_t>::value>>::value &&
+              std::is_same<typename _Hash::writable_digest_view,
+                           ctl::writable_fixed_bytes<
+                               std::extent<typename _Hash::digest_t>::value>>::
+                  value &&
+              std::is_same<decltype(std::declval<_Hash &>().reset()),
+                           void>::value &&
+              std::is_same<decltype(std::declval<_Hash &>().update(
+                               std::declval<ctl::bytes>())),
+                           void>::value &&
+              std::is_same<
+                  decltype(std::declval<_Hash &>().finish(
+                      std::declval<typename _Hash::writable_digest_view>())),
+                  void>::value> {};
+
+} // namespace detail
+
+/**
+ * @brief Whether a type satisfies the fixed-output hash contract
+ *
+ * Inheritance from fixed_hash is not required. The type must expose the size
+ * and exact digest storage and view members described above, be default
+ * constructible and movable, and provide void reset(), update(ctl::bytes) and
+ * finish(writable_digest_view). Sizes must be nonzero size_t constant
+ * expressions. These checks keep generic MAC and KDF code from trusting a
+ * digest buffer whose declared storage is smaller than digest_size.
+ */
+template <class _Hash>
+struct is_fixed_hash : detail::has_fixed_hash_shape<_Hash> {};
+
+template <class _Hash>
+inline constexpr bool is_fixed_hash_v = is_fixed_hash<_Hash>::value;
+
+/**
+ * @brief Hashes one complete byte string through the common contract
+ *
+ * This is the generic spelling for code parameterized on a hash. Individual
+ * CTL algorithms retain Hash::hash(input, output) for their existing callers.
+ */
+template <class _Hash>
+void compute(ctl::bytes input, typename _Hash::writable_digest_view output) {
+  static_assert(is_fixed_hash<_Hash>::value,
+                "Hash does not satisfy the CTL fixed-output hash interface.");
+  _Hash context;
+  context.update(input);
+  context.finish(output);
+}
+
+} // namespace hash
+} // namespace ctl

@@ -1,0 +1,243 @@
+/**
+ * @file random/hash_drbg
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief Hash_DRBG (NIST SP 800-90A section 10.1.1)
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <utility>
+
+#include <ctl/bytes>
+#include <ctl/detail/memory>
+#include <ctl/hash/fixed>
+#include <ctl/random/detail/common>
+
+namespace ctl {
+
+template <class _Hash> class hash_drbg {
+  typedef ctl::random_detail::approved_hash<_Hash> approved;
+
+public:
+  typedef _Hash hash_type;
+
+  static constexpr size_t output_size = hash_type::digest_size;
+  static constexpr size_t seed_size =
+      ctl::random_detail::hash_traits<hash_type>::hash_drbg_seed_size;
+  static constexpr size_t security_strength = approved::security_strength;
+  static constexpr size_t entropy_size = approved::entropy_size;
+  static constexpr size_t nonce_size = approved::nonce_size;
+  static constexpr size_t max_per_request =
+      ctl::random_detail::max_per_request;
+  static constexpr uint64_t reseed_interval =
+      ctl::random_detail::reseed_interval;
+
+  explicit hash_drbg(ctl::bytes entropy, ctl::bytes nonce,
+                     ctl::bytes personalization = ctl::bytes())
+      : counter_(0), ready_(false) {
+    instantiate(entropy, nonce, personalization);
+  }
+
+  hash_drbg(const hash_drbg &) = delete;
+  hash_drbg &operator=(const hash_drbg &) = delete;
+
+  hash_drbg(hash_drbg &&other) noexcept : counter_(0), ready_(false) {
+    take(other);
+  }
+
+  hash_drbg &operator=(hash_drbg &&other) noexcept {
+    if (this != &other) {
+      erase();
+      take(other);
+    }
+    return *this;
+  }
+
+  ~hash_drbg() { erase(); }
+
+  void instantiate(ctl::bytes entropy, ctl::bytes nonce,
+                   ctl::bytes personalization = ctl::bytes()) {
+    validate_seed_inputs(entropy, nonce, personalization,
+                         "ctl::hash_drbg::instantiate");
+    ctl::detail::secret_buffer<seed_size> next_v;
+    ctl::detail::secret_buffer<seed_size> next_c;
+    hash_df(input_parts(entropy, nonce, personalization), next_v.data());
+    const uint8_t zero = 0x00;
+    hash_df(input_parts(ctl::bytes(&zero, 1),
+                        ctl::bytes(next_v.data(), seed_size)),
+            next_c.data());
+
+    memcpy(v_, next_v.data(), sizeof(v_));
+    memcpy(c_, next_c.data(), sizeof(c_));
+    counter_ = 1;
+    ready_ = true;
+  }
+
+  void reseed(ctl::bytes entropy,
+              ctl::bytes additional = ctl::bytes()) {
+    ctl::random_detail::require_ready(ready_, "ctl::hash_drbg::reseed");
+    ctl::random_detail::require_input(entropy, entropy_size,
+                                      "ctl::hash_drbg::reseed", "entropy");
+    ctl::random_detail::require_optional_input(
+        additional, "ctl::hash_drbg::reseed", "additional input");
+
+    const uint8_t one = 0x01;
+    ctl::detail::secret_buffer<seed_size> next_v;
+    ctl::detail::secret_buffer<seed_size> next_c;
+    hash_df(input_parts(ctl::bytes(&one, 1), ctl::bytes(v_, sizeof(v_)),
+                        entropy, additional),
+            next_v.data());
+    const uint8_t zero = 0x00;
+    hash_df(input_parts(ctl::bytes(&zero, 1),
+                        ctl::bytes(next_v.data(), seed_size)),
+            next_c.data());
+    memcpy(v_, next_v.data(), sizeof(v_));
+    memcpy(c_, next_c.data(), sizeof(c_));
+    counter_ = 1;
+  }
+
+  void generate(ctl::writable_bytes output,
+                ctl::bytes additional = ctl::bytes()) {
+    ctl::random_detail::require_ready(ready_, "ctl::hash_drbg::generate");
+    ctl::random_detail::require_request(output.size(), counter_,
+                                        "ctl::hash_drbg::generate");
+    ctl::random_detail::require_optional_input(
+        additional, "ctl::hash_drbg::generate", "additional input");
+    ctl::detail::require_disjoint(
+        "ctl::hash_drbg::generate", "additional input", additional.data(),
+        additional.size(), "output", output.data(), output.size());
+
+    if (!additional.empty()) {
+      const uint8_t two = 0x02;
+      ctl::detail::secret_buffer<output_size> w;
+      digest(input_parts(ctl::bytes(&two, 1), ctl::bytes(v_, sizeof(v_)),
+                         additional),
+             w.data());
+      ctl::random_detail::add_be(v_, sizeof(v_), w.data(), output_size);
+    }
+
+    hashgen(output);
+
+    const uint8_t three = 0x03;
+    ctl::detail::secret_buffer<output_size> h;
+    digest(input_parts(ctl::bytes(&three, 1), ctl::bytes(v_, sizeof(v_))),
+           h.data());
+    ctl::random_detail::add_be(v_, sizeof(v_), h.data(), output_size);
+    ctl::random_detail::add_be(v_, sizeof(v_), c_, sizeof(c_));
+    ctl::random_detail::add_counter_be(v_, sizeof(v_), counter_);
+    ++counter_;
+  }
+
+  uint64_t requests_served() const {
+    ctl::random_detail::require_ready(ready_,
+                                      "ctl::hash_drbg::requests_served");
+    return counter_ - 1;
+  }
+
+private:
+  struct input_parts {
+    ctl::bytes first;
+    ctl::bytes second;
+    ctl::bytes third;
+    ctl::bytes fourth;
+
+    explicit input_parts(ctl::bytes a, ctl::bytes b = ctl::bytes(),
+                         ctl::bytes c = ctl::bytes(),
+                         ctl::bytes d = ctl::bytes())
+        : first(a), second(b), third(c), fourth(d) {}
+
+    void feed(hash_type &hash) const {
+      if (!first.empty())
+        hash.update(first);
+      if (!second.empty())
+        hash.update(second);
+      if (!third.empty())
+        hash.update(third);
+      if (!fourth.empty())
+        hash.update(fourth);
+    }
+  };
+
+  static void validate_seed_inputs(ctl::bytes entropy, ctl::bytes nonce,
+                                   ctl::bytes personalization,
+                                   const char *where) {
+    ctl::random_detail::require_input(entropy, entropy_size, where, "entropy");
+    ctl::random_detail::require_input(nonce, nonce_size, where, "nonce");
+    ctl::random_detail::require_optional_input(personalization, where,
+                                               "personalization string");
+  }
+
+  static void digest(const input_parts &input, uint8_t *output) {
+    hash_type hash;
+    input.feed(hash);
+    typename hash_type::writable_digest_view view(output);
+    hash.finish(view);
+  }
+
+  static void hash_df(const input_parts &input, uint8_t *output) {
+    const uint32_t requested_bits = static_cast<uint32_t>(seed_size * 8u);
+    const uint8_t encoded[4] = {
+        static_cast<uint8_t>(requested_bits >> 24),
+        static_cast<uint8_t>(requested_bits >> 16),
+        static_cast<uint8_t>(requested_bits >> 8),
+        static_cast<uint8_t>(requested_bits)};
+
+    size_t filled = 0;
+    uint8_t counter = 1;
+    while (filled < seed_size) {
+      ctl::detail::secret_buffer<output_size> block;
+      hash_type hash;
+      hash.update(ctl::bytes(&counter, 1));
+      hash.update(encoded);
+      input.feed(hash);
+      typename hash_type::writable_digest_view view(block.data());
+      hash.finish(view);
+      const size_t take = seed_size - filled < output_size
+                              ? seed_size - filled
+                              : output_size;
+      memcpy(output + filled, block.data(), take);
+      filled += take;
+      ++counter;
+    }
+  }
+
+  void hashgen(ctl::writable_bytes output) const {
+    ctl::detail::secret_buffer<seed_size> data;
+    memcpy(data.data(), v_, sizeof(v_));
+    size_t filled = 0;
+    while (filled < output.size()) {
+      ctl::detail::secret_buffer<output_size> block;
+      digest(input_parts(ctl::bytes(data.data(), seed_size)), block.data());
+      const size_t take = output.size() - filled < output_size
+                              ? output.size() - filled
+                              : output_size;
+      memcpy(output.data() + filled, block.data(), take);
+      filled += take;
+      ctl::random_detail::increment_be(data.data(), seed_size);
+    }
+  }
+
+  void take(hash_drbg &other) noexcept {
+    memcpy(v_, other.v_, sizeof(v_));
+    memcpy(c_, other.c_, sizeof(c_));
+    counter_ = other.counter_;
+    ready_ = other.ready_;
+    other.erase();
+  }
+
+  void erase() noexcept {
+    ctl::detail::secure_zero(v_, sizeof(v_));
+    ctl::detail::secure_zero(c_, sizeof(c_));
+    counter_ = 0;
+    ready_ = false;
+  }
+
+  uint8_t v_[seed_size];
+  uint8_t c_[seed_size];
+  uint64_t counter_;
+  bool ready_;
+};
+
+} // namespace ctl

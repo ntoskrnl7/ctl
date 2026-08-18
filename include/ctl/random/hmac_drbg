@@ -1,0 +1,222 @@
+/**
+ * @file random/hmac_drbg
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief HMAC_DRBG (NIST SP 800-90A section 10.1.2)
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <utility>
+
+#include <ctl/bytes>
+#include <ctl/detail/memory>
+#include <ctl/mac/hmac>
+#include <ctl/random/detail/common>
+
+namespace ctl {
+
+template <class _Hash> class hmac_drbg {
+  typedef ctl::random_detail::approved_hash<_Hash> approved;
+
+public:
+  typedef _Hash hash_type;
+  typedef ctl::mac::hmac<hash_type> hmac_type;
+
+  static constexpr size_t output_size = hash_type::digest_size;
+  static constexpr size_t security_strength = approved::security_strength;
+  static constexpr size_t entropy_size = approved::entropy_size;
+  static constexpr size_t nonce_size = approved::nonce_size;
+  static constexpr size_t max_per_request =
+      ctl::random_detail::max_per_request;
+  static constexpr uint64_t reseed_interval =
+      ctl::random_detail::reseed_interval;
+
+  explicit hmac_drbg(ctl::bytes entropy, ctl::bytes nonce,
+                     ctl::bytes personalization = ctl::bytes())
+      : counter_(0), ready_(false) {
+    instantiate(entropy, nonce, personalization);
+  }
+
+  hmac_drbg(const hmac_drbg &) = delete;
+  hmac_drbg &operator=(const hmac_drbg &) = delete;
+
+  hmac_drbg(hmac_drbg &&other) noexcept : counter_(0), ready_(false) {
+    take(other);
+  }
+
+  hmac_drbg &operator=(hmac_drbg &&other) noexcept {
+    if (this != &other) {
+      erase();
+      take(other);
+    }
+    return *this;
+  }
+
+  ~hmac_drbg() { erase(); }
+
+  void instantiate(ctl::bytes entropy, ctl::bytes nonce,
+                   ctl::bytes personalization = ctl::bytes()) {
+    validate_seed_inputs(entropy, nonce, personalization,
+                         "ctl::hmac_drbg::instantiate");
+    erase();
+    memset(key_, 0x00, sizeof(key_));
+    memset(v_, 0x01, sizeof(v_));
+    try {
+      update_state(input_parts(entropy, nonce, personalization));
+      counter_ = 1;
+      ready_ = true;
+    } catch (...) {
+      erase();
+      throw;
+    }
+  }
+
+  void reseed(ctl::bytes entropy,
+              ctl::bytes additional = ctl::bytes()) {
+    ctl::random_detail::require_ready(ready_, "ctl::hmac_drbg::reseed");
+    ctl::random_detail::require_input(entropy, entropy_size,
+                                      "ctl::hmac_drbg::reseed", "entropy");
+    ctl::random_detail::require_optional_input(
+        additional, "ctl::hmac_drbg::reseed", "additional input");
+    update_state(input_parts(entropy, additional));
+    counter_ = 1;
+  }
+
+  void generate(ctl::writable_bytes output,
+                ctl::bytes additional = ctl::bytes()) {
+    ctl::random_detail::require_ready(ready_, "ctl::hmac_drbg::generate");
+    ctl::random_detail::require_request(output.size(), counter_,
+                                        "ctl::hmac_drbg::generate");
+    ctl::random_detail::require_optional_input(
+        additional, "ctl::hmac_drbg::generate", "additional input");
+    ctl::detail::require_disjoint(
+        "ctl::hmac_drbg::generate", "additional input", additional.data(),
+        additional.size(), "output", output.data(), output.size());
+
+    const input_parts provided(additional);
+    if (!additional.empty())
+      update_state(provided);
+
+    size_t filled = 0;
+    while (filled < output.size()) {
+      ctl::detail::secret_buffer<output_size> next;
+      authenticate(key_, input_parts(v_), next.data());
+      memcpy(v_, next.data(), sizeof(v_));
+      const size_t take = output.size() - filled < output_size
+                              ? output.size() - filled
+                              : output_size;
+      memcpy(output.data() + filled, v_, take);
+      filled += take;
+    }
+
+    update_state(provided);
+    ++counter_;
+  }
+
+  uint64_t requests_served() const {
+    ctl::random_detail::require_ready(ready_,
+                                      "ctl::hmac_drbg::requests_served");
+    return counter_ - 1;
+  }
+
+private:
+  struct input_parts {
+    ctl::bytes first;
+    ctl::bytes second;
+    ctl::bytes third;
+
+    explicit input_parts(ctl::bytes a, ctl::bytes b = ctl::bytes(),
+                         ctl::bytes c = ctl::bytes())
+        : first(a), second(b), third(c) {}
+
+    bool empty() const noexcept {
+      return first.empty() && second.empty() && third.empty();
+    }
+
+    void feed(hmac_type &mac) const {
+      if (!first.empty())
+        mac.update(first);
+      if (!second.empty())
+        mac.update(second);
+      if (!third.empty())
+        mac.update(third);
+    }
+  };
+
+  static void validate_seed_inputs(ctl::bytes entropy, ctl::bytes nonce,
+                                   ctl::bytes personalization,
+                                   const char *where) {
+    ctl::random_detail::require_input(entropy, entropy_size, where, "entropy");
+    ctl::random_detail::require_input(nonce, nonce_size, where, "nonce");
+    ctl::random_detail::require_optional_input(personalization, where,
+                                               "personalization string");
+  }
+
+  static void authenticate(ctl::bytes key, const input_parts &input,
+                           uint8_t *output) {
+    hmac_type mac(key);
+    input.feed(mac);
+    typename hmac_type::writable_tag_view tag(output);
+    mac.finish(tag);
+  }
+
+  static void authenticate_update(ctl::bytes key, ctl::bytes v,
+                                  uint8_t separator,
+                                  const input_parts &provided,
+                                  uint8_t *output) {
+    hmac_type mac(key);
+    mac.update(v);
+    mac.update(ctl::bytes(&separator, 1));
+    provided.feed(mac);
+    typename hmac_type::writable_tag_view tag(output);
+    mac.finish(tag);
+  }
+
+  void update_state(const input_parts &provided) {
+    ctl::detail::secret_buffer<output_size> next_key;
+    ctl::detail::secret_buffer<output_size> next_v;
+    authenticate_update(key_, v_, 0x00, provided, next_key.data());
+    authenticate(ctl::bytes(next_key.data(), output_size), input_parts(v_),
+                 next_v.data());
+
+    if (!provided.empty()) {
+      ctl::detail::secret_buffer<output_size> final_key;
+      ctl::detail::secret_buffer<output_size> final_v;
+      authenticate_update(ctl::bytes(next_key.data(), output_size),
+                          ctl::bytes(next_v.data(), output_size), 0x01,
+                          provided, final_key.data());
+      authenticate(ctl::bytes(final_key.data(), output_size),
+                   input_parts(ctl::bytes(next_v.data(), output_size)),
+                   final_v.data());
+      memcpy(key_, final_key.data(), sizeof(key_));
+      memcpy(v_, final_v.data(), sizeof(v_));
+    } else {
+      memcpy(key_, next_key.data(), sizeof(key_));
+      memcpy(v_, next_v.data(), sizeof(v_));
+    }
+  }
+
+  void take(hmac_drbg &other) noexcept {
+    memcpy(key_, other.key_, sizeof(key_));
+    memcpy(v_, other.v_, sizeof(v_));
+    counter_ = other.counter_;
+    ready_ = other.ready_;
+    other.erase();
+  }
+
+  void erase() noexcept {
+    ctl::detail::secure_zero(key_, sizeof(key_));
+    ctl::detail::secure_zero(v_, sizeof(v_));
+    counter_ = 0;
+    ready_ = false;
+  }
+
+  uint8_t key_[output_size];
+  uint8_t v_[output_size];
+  uint64_t counter_;
+  bool ready_;
+};
+
+} // namespace ctl

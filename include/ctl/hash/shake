@@ -1,0 +1,100 @@
+/**
+ * @file hash/shake
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief SHAKE128 and SHAKE256 extendable-output functions from FIPS 202
+ *
+ * The interface is byte-oriented. It implements FIPS 202 inputs and outputs
+ * whose bit lengths are multiples of eight, with the SHAKE domain suffix and
+ * multi-rate padding. Output from successive squeeze calls is one continuous
+ * stream; reset is the only operation that begins another invocation.
+ */
+#pragma once
+
+#include <cstddef>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+#include <ctl/bytes>
+#include <ctl/hash/detail/keccak>
+#include <ctl/hash/xof>
+
+namespace ctl {
+namespace hash {
+namespace detail {
+
+template <size_t _SecurityStrength>
+class shake_impl
+    : public ctl::hash::xof<shake_impl<_SecurityStrength>,
+                            200 - _SecurityStrength / 4,
+                            _SecurityStrength> {
+  static_assert(_SecurityStrength == 128 || _SecurityStrength == 256,
+                "SHAKE supports 128 and 256 bit security strengths.");
+
+  typedef ctl::hash::xof<shake_impl<_SecurityStrength>,
+                         200 - _SecurityStrength / 4, _SecurityStrength>
+      base_type;
+  typedef keccak_sponge<base_type::rate> sponge_type;
+
+public:
+  using base_type::expand;
+  using base_type::rate;
+  using base_type::security_strength;
+
+  shake_impl() = default;
+
+  shake_impl(const shake_impl &) = delete;
+  shake_impl &operator=(const shake_impl &) = delete;
+
+  shake_impl(shake_impl &&other) noexcept
+      : sponge_(std::move(other.sponge_)) {}
+
+  shake_impl &operator=(shake_impl &&other) noexcept {
+    if (this != &other)
+      sponge_ = std::move(other.sponge_);
+    return *this;
+  }
+
+  void reset() noexcept { sponge_.reset(); }
+
+  void update(ctl::bytes input) {
+    require_absorbing("update");
+    sponge_.update(input);
+  }
+
+  void finish() {
+    require_absorbing("finish");
+    sponge_.finish(0x1fu);
+  }
+
+  void squeeze(ctl::writable_bytes output) {
+    if (!sponge_.squeezing())
+      throw std::logic_error(std::string(name()) +
+                             "::squeeze : finish a live absorbing context "
+                             "before requesting output.");
+    sponge_.squeeze(output);
+  }
+
+private:
+  static const char *name() noexcept {
+    return _SecurityStrength == 128 ? "ctl::hash::shake128"
+                                    : "ctl::hash::shake256";
+  }
+
+  void require_absorbing(const char *operation) const {
+    if (!sponge_.absorbing())
+      throw std::logic_error(std::string(name()) + "::" + operation +
+                             " : this context has started squeezing or was "
+                             "moved away. Reset it before absorbing again.");
+  }
+
+  sponge_type sponge_;
+};
+
+} // namespace detail
+
+using shake128 = detail::shake_impl<128>;
+using shake256 = detail::shake_impl<256>;
+
+} // namespace hash
+} // namespace ctl

@@ -1,0 +1,126 @@
+/**
+ * @file pbkdf2
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief Password-Based Key Derivation Function 2, RFC 8018
+ *
+ * The PRF is HMAC over the selected hash. The caller must state a positive
+ * iteration count explicitly; there is no weak library default. Output is
+ * limited to (2^32 - 1) * HashLen, as RFC 8018 requires, and must be disjoint
+ * from password and salt. Password-derived intermediates and unexpected
+ * partial output are securely erased.
+ *
+ * This is the mechanism, not a password-storage policy. Applications still
+ * have to select salt length and work factor for their threat model and keep
+ * that policy up to date.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+#include <ctl/bytes>
+#include <ctl/detail/endian>
+#include <ctl/detail/memory>
+#include <ctl/mac/hmac>
+
+namespace ctl {
+namespace kdf {
+
+template <class _Hash> class pbkdf2 {
+public:
+  typedef _Hash hash_type;
+  typedef ctl::mac::hmac<hash_type> hmac_type;
+
+  static constexpr size_t digest_size = hash_type::digest_size;
+  static constexpr uint64_t max_output_size =
+      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) *
+      digest_size;
+
+  /**
+   * @brief Derives a key with PBKDF2-HMAC-Hash
+   *
+   * @param password password octets; no character encoding is implied
+   * @param salt per-password salt chosen by the application
+   * @param iterations positive, application-selected work factor
+   * @param output non-empty destination for the derived key
+   */
+  static void derive(ctl::bytes password, ctl::bytes salt,
+                     uint32_t iterations, ctl::writable_bytes output) {
+    validate(password, salt, iterations, output);
+
+    ctl::detail::secret_buffer<digest_size> u;
+    ctl::detail::secret_buffer<digest_size> accumulated;
+    const size_t block_count = output.size() / digest_size +
+                               (output.size() % digest_size != 0);
+    size_t written = 0;
+
+    try {
+      hmac_type prf(password);
+      for (size_t block = 1; block <= block_count; ++block) {
+        if (block != 1)
+          prf.reset();
+
+        uint8_t encoded_block[4];
+        ctl::detail::store_be32(static_cast<uint32_t>(block), encoded_block);
+        prf.update(salt);
+        prf.update(encoded_block);
+        prf.finish(u);
+        memcpy(accumulated.data(), u.data(), digest_size);
+
+        for (uint32_t iteration = 1; iteration < iterations; ++iteration) {
+          prf.reset();
+          prf.update(ctl::bytes(u.data(), digest_size));
+          prf.finish(u);
+          ctl::detail::xor_bytes(accumulated.data(), u.data(),
+                                 accumulated.data(), digest_size);
+        }
+
+        const size_t remaining = output.size() - written;
+        const size_t taken =
+            remaining < digest_size ? remaining : digest_size;
+        memcpy(output.data() + written, accumulated.data(), taken);
+        written += taken;
+      }
+    } catch (...) {
+      ctl::detail::secure_zero(output.data(), output.size());
+      throw;
+    }
+  }
+
+private:
+  static void validate(ctl::bytes password, ctl::bytes salt,
+                       uint32_t iterations, ctl::writable_bytes output) {
+    if (iterations == 0)
+      throw std::invalid_argument(
+          "ctl::kdf::pbkdf2::derive : the iteration count must be positive.");
+    if (output.empty())
+      throw std::invalid_argument(
+          "ctl::kdf::pbkdf2::derive : RFC 8018 requires a positive derived "
+          "key length.");
+
+    const size_t block_count = output.size() / digest_size +
+                               (output.size() % digest_size != 0);
+    if (block_count > std::numeric_limits<uint32_t>::max())
+      throw std::length_error(
+          "ctl::kdf::pbkdf2::derive : RFC 8018 limits output to "
+          "(2^32 - 1) * HashLen bytes.");
+
+    ctl::detail::require_disjoint("ctl::kdf::pbkdf2::derive", "password",
+                                  password.data(), password.size(), "output",
+                                  output.data(), output.size());
+    ctl::detail::require_disjoint("ctl::kdf::pbkdf2::derive", "salt",
+                                  salt.data(), salt.size(), "output",
+                                  output.data(), output.size());
+  }
+};
+
+} // namespace kdf
+} // namespace ctl

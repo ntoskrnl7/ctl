@@ -1,0 +1,219 @@
+/**
+ * @file hmac
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief HMAC over an iterative hash, from RFC 2104
+ *
+ * The hash type satisfies the fixed-output interface in ctl/hash/fixed. The
+ * implementation accepts keys of any length: a key longer than one hash block
+ * is hashed first, and a shorter one is padded with zeroes as RFC 2104
+ * requires. Only full-length tags cross this interface. A protocol that
+ * defines truncation can truncate the completed tag explicitly at its own
+ * boundary rather than silently weakening every caller here.
+ *
+ * A live keyed context has one owner. Copying is disabled, moving transfers
+ * and erases the source, and finish consumes the current message. Reset starts
+ * another message under the same key; set_key replaces it. Every key-derived
+ * pad and intermediate digest owned here is erased when its useful lifetime
+ * ends.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+#include <ctl/bytes>
+#include <ctl/detail/memory>
+#include <ctl/hash/fixed>
+
+namespace ctl {
+namespace mac {
+
+template <class _Hash> class hmac {
+public:
+  typedef _Hash hash_type;
+
+  static_assert(ctl::hash::is_fixed_hash<hash_type>::value,
+                "HMAC requires a CTL fixed-output hash.");
+
+  static constexpr size_t block_size = hash_type::block_size;
+  static constexpr size_t tag_size = hash_type::digest_size;
+
+  static_assert(tag_size <= block_size,
+                "HMAC requires a digest no longer than its hash block.");
+
+  typedef uint8_t tag_t[tag_size];
+  typedef ctl::fixed_bytes<tag_size> tag_view;
+  typedef ctl::writable_fixed_bytes<tag_size> writable_tag_view;
+
+  explicit hmac(ctl::bytes key)
+      : inner_(), active_(false), keyed_(false) {
+    set_key(key);
+  }
+
+  hmac(const hmac &) = delete;
+  hmac &operator=(const hmac &) = delete;
+
+  hmac(hmac &&other) noexcept
+      : inner_(std::move(other.inner_)), active_(other.active_),
+        keyed_(other.keyed_) {
+    memcpy(outer_pad_, other.outer_pad_, sizeof(outer_pad_));
+    other.erase();
+  }
+
+  hmac &operator=(hmac &&other) noexcept {
+    if (this != &other) {
+      erase();
+      inner_ = std::move(other.inner_);
+      memcpy(outer_pad_, other.outer_pad_, sizeof(outer_pad_));
+      active_ = other.active_;
+      keyed_ = other.keyed_;
+      other.erase();
+    }
+    return *this;
+  }
+
+  ~hmac() { erase(); }
+
+  /**
+   * @brief Replaces the key and begins a new tag
+   */
+  void set_key(ctl::bytes key) {
+    uint8_t key_block[block_size];
+    typename hash_type::digest_t shortened = {0};
+    uint8_t inner_pad[block_size];
+    memset(key_block, 0, sizeof(key_block));
+    memset(inner_pad, 0, sizeof(inner_pad));
+
+    try {
+      if (key.size() > block_size) {
+        ctl::hash::compute<hash_type>(key, shortened);
+        memcpy(key_block, shortened, tag_size);
+      } else if (!key.empty()) {
+        memcpy(key_block, key.data(), key.size());
+      }
+
+      for (size_t i = 0; i < block_size; ++i) {
+        inner_pad[i] = static_cast<uint8_t>(key_block[i] ^ 0x36u);
+        outer_pad_[i] = static_cast<uint8_t>(key_block[i] ^ 0x5cu);
+      }
+
+      // Replacing the hash object invokes its non-elidable erase before the
+      // new key is installed. A plain reset would overwrite the old keyed
+      // state, but would not promise that the compiler retains those writes.
+      inner_ = hash_type();
+      inner_.update(inner_pad);
+      active_ = true;
+      keyed_ = true;
+    } catch (...) {
+      ctl::detail::secure_zero(shortened, sizeof(shortened));
+      ctl::detail::secure_zero(inner_pad, sizeof(inner_pad));
+      ctl::detail::secure_zero(key_block, sizeof(key_block));
+      erase();
+      throw;
+    }
+
+    ctl::detail::secure_zero(shortened, sizeof(shortened));
+    ctl::detail::secure_zero(inner_pad, sizeof(inner_pad));
+    ctl::detail::secure_zero(key_block, sizeof(key_block));
+  }
+
+  /**
+   * @brief Begins another message under the current key
+   *
+   * This is explicit: finish still makes update invalid until the caller
+   * deliberately starts a new message. It lets constructions such as PBKDF2
+   * reuse HMAC's key schedule without retaining the original password.
+   */
+  void reset() {
+    if (!keyed_)
+      throw std::logic_error(
+          "ctl::mac::hmac::reset : this HMAC context has no key because it "
+          "was moved away.");
+
+    uint8_t inner_pad[block_size];
+    for (size_t i = 0; i < block_size; ++i)
+      inner_pad[i] = static_cast<uint8_t>(outer_pad_[i] ^ 0x6au);
+    try {
+      inner_ = hash_type();
+      inner_.update(inner_pad);
+      active_ = true;
+    } catch (...) {
+      ctl::detail::secure_zero(inner_pad, sizeof(inner_pad));
+      erase();
+      throw;
+    }
+    ctl::detail::secure_zero(inner_pad, sizeof(inner_pad));
+  }
+
+  void update(ctl::bytes input) {
+    require_active("update");
+    inner_.update(input);
+  }
+
+  void finish(writable_tag_view tag) {
+    require_active("finish");
+    ctl::detail::secret_buffer<tag_size> inner_digest;
+    try {
+      inner_.finish(inner_digest);
+
+      hash_type outer;
+      outer.update(outer_pad_);
+      outer.update(inner_digest);
+      outer.finish(tag);
+    } catch (...) {
+      erase();
+      throw;
+    }
+
+    active_ = false;
+  }
+
+  static void authenticate(ctl::bytes key, ctl::bytes message,
+                           writable_tag_view tag) {
+    hmac context(key);
+    context.update(message);
+    context.finish(tag);
+  }
+
+  static bool verify(ctl::bytes key, ctl::bytes message, tag_view expected) {
+    ctl::detail::secret_buffer<tag_size> computed;
+    authenticate(key, message, computed);
+    const bool matches = ctl::detail::equal_constant_time(
+        computed.data(), expected.data(), tag_size);
+    return matches;
+  }
+
+private:
+  void require_active(const char *operation) const {
+    if (!active_)
+      throw std::logic_error(std::string("ctl::mac::hmac::") + operation +
+                             " : this HMAC context has been finished or "
+                             "moved away. Reset it or set a key before use.");
+  }
+
+  void erase() {
+    // The hash move assignment securely erases its destination before taking
+    // the fresh, unkeyed state. This also covers rekeying and moved-from HMACs,
+    // rather than delaying the inner-state erase until destruction.
+    inner_ = hash_type();
+    ctl::detail::secure_zero(outer_pad_, sizeof(outer_pad_));
+    active_ = false;
+    keyed_ = false;
+  }
+
+  hash_type inner_;
+  uint8_t outer_pad_[block_size];
+  bool active_;
+  bool keyed_;
+};
+
+} // namespace mac
+} // namespace ctl

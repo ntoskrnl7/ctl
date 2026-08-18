@@ -1,0 +1,102 @@
+/**
+ * @file hash/xof
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief Common structural interface for byte-oriented XOFs
+ *
+ * An extendable-output function absorbs a message, finishes that phase, and
+ * then yields one continuous output stream through any number of squeeze
+ * calls. It is deliberately separate from fixed_hash: an XOF has no digest
+ * size, and its output length is part of the protocol invocation rather than
+ * the C++ type.
+ */
+#pragma once
+
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+
+#include <ctl/bytes>
+
+namespace ctl {
+namespace hash {
+
+template <class _Derived, size_t _Rate, size_t _SecurityStrength> class xof {
+  static_assert(_Rate != 0, "An XOF rate cannot be empty.");
+  static_assert(_SecurityStrength != 0,
+                "An XOF security strength cannot be zero.");
+
+public:
+  static constexpr size_t rate = _Rate;
+  static constexpr size_t security_strength = _SecurityStrength;
+
+  static void expand(ctl::bytes input, ctl::writable_bytes output) {
+    _Derived context;
+    context.update(input);
+    context.finish();
+    context.squeeze(output);
+  }
+
+protected:
+  xof() = default;
+  ~xof() = default;
+};
+
+namespace detail {
+
+template <class...> using xof_void_t = void;
+
+template <class _Xof, class = void> struct has_xof_shape : std::false_type {};
+
+template <class _Xof>
+struct has_xof_shape<
+    _Xof,
+    xof_void_t<decltype(_Xof::rate), decltype(_Xof::security_strength),
+               std::integral_constant<size_t, _Xof::rate>,
+               std::integral_constant<size_t, _Xof::security_strength>,
+               decltype(std::declval<_Xof &>().reset()),
+               decltype(std::declval<_Xof &>().update(
+                   std::declval<ctl::bytes>())),
+               decltype(std::declval<_Xof &>().finish()),
+               decltype(std::declval<_Xof &>().squeeze(
+                   std::declval<ctl::writable_bytes>()))>>
+    : std::integral_constant<
+          bool,
+          std::is_default_constructible<_Xof>::value &&
+              std::is_move_constructible<_Xof>::value &&
+              std::is_move_assignable<_Xof>::value &&
+              std::is_same<typename std::remove_cv<decltype(_Xof::rate)>::type,
+                           size_t>::value &&
+              std::is_same<typename std::remove_cv<
+                               decltype(_Xof::security_strength)>::type,
+                           size_t>::value &&
+              _Xof::rate != 0 && _Xof::security_strength != 0 &&
+              std::is_same<decltype(std::declval<_Xof &>().reset()),
+                           void>::value &&
+              std::is_same<decltype(std::declval<_Xof &>().update(
+                               std::declval<ctl::bytes>())),
+                           void>::value &&
+              std::is_same<decltype(std::declval<_Xof &>().finish()),
+                           void>::value &&
+              std::is_same<decltype(std::declval<_Xof &>().squeeze(
+                               std::declval<ctl::writable_bytes>())),
+                           void>::value> {};
+
+} // namespace detail
+
+template <class _Xof> struct is_xof : detail::has_xof_shape<_Xof> {};
+
+template <class _Xof>
+inline constexpr bool is_xof_v = is_xof<_Xof>::value;
+
+template <class _Xof>
+void expand(ctl::bytes input, ctl::writable_bytes output) {
+  static_assert(is_xof<_Xof>::value,
+                "Type does not satisfy the CTL extendable-output interface.");
+  _Xof context;
+  context.update(input);
+  context.finish();
+  context.squeeze(output);
+}
+
+} // namespace hash
+} // namespace ctl

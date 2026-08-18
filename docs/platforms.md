@@ -8,19 +8,19 @@ handling and the vector paths are covered rather than assumed.
 
 | | How | Result |
 | --- | --- | --- |
-| x86-64, AES-NI and AVX2 | on the machine | 131 tests |
-| x86-64, `CTL_NO_HW_ACCEL` | on the machine | 131 tests |
-| x86-64, `CTL_AES_CONSTANT_TIME` | on the machine | 131 tests |
-| x86-64, both of those together | on the machine | 131 tests |
-| ARM64, cryptographic instructions and NEON | cross built, run under qemu | 131 tests |
-| ARM64, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 131 tests |
-| ARM 32 bit, NEON | cross built, run under qemu | 131 tests |
-| MIPS64 little endian, MSA | cross built, run under qemu | 131 tests |
-| MIPS64 big endian, MSA, `-fno-tree-vectorize` | cross built, run under qemu | 131 tests |
-| MIPS64 little endian, no MSA | cross built, run under qemu | 131 tests |
-| MIPS64 little endian, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 131 tests |
-| MIPS64 big endian | cross built, run under qemu | 131 tests |
-| MIPS32r2, no SIMD of any kind | cross built, run under qemu | 131 tests |
+| x86-64, AES-NI and AVX2 | on the machine | 196 tests |
+| x86-64, `CTL_NO_HW_ACCEL` | on the machine | 196 tests |
+| x86-64, `CTL_AES_CONSTANT_TIME` | on the machine | 196 tests |
+| x86-64, both of those together | on the machine | 196 tests |
+| ARM64, cryptographic instructions and NEON | cross built, run under qemu | 197 tests |
+| ARM64, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 197 tests |
+| ARM 32 bit, NEON | cross built, run under qemu | 197 tests |
+| MIPS64 little endian, MSA | cross built, run under qemu | 197 tests |
+| MIPS64 big endian, MSA, `-fno-tree-vectorize` | cross built, run under qemu | 197 tests |
+| MIPS64 little endian, no MSA | cross built, run under qemu | 197 tests |
+| MIPS64 little endian, `CTL_AES_CONSTANT_TIME` | cross built, run under qemu | 197 tests |
+| MIPS64 big endian | cross built, run under qemu | 197 tests |
+| MIPS32r2, no SIMD of any kind | cross built, run under qemu | 197 tests |
 
 The MIPS32r2 row is the oldest thing here: a single core with no MSA, since
 that needs release 5, and no cryptographic instructions, since MIPS has none at
@@ -77,6 +77,12 @@ The big endian row matters more than it looks. Every load and store of a word
 goes through `ctl/detail/endian`, which has a path for hosts whose byte order
 does not match the specification's, and until that row existed no test had ever
 taken it.
+
+The fixed-output hashes use those rows as an endian test too. SHA-3 maps each
+input byte to the specified little-endian Keccak lane explicitly, while BLAKE2
+loads each 32- or 64-bit message word through the little-endian helpers. The
+same official and independently generated answer tests therefore run on both
+MIPS byte orders rather than assuming that an x86 result is portable.
 
 What the emulated rows do not show is speed. They say the answers are right on
 those architectures, not how fast they arrive. In particular, QEMU's cost for

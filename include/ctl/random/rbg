@@ -1,0 +1,206 @@
+/**
+ * @file random/rbg
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief An owned DRBG fed and reseeded by an entropy provider
+ *
+ * This policy layer joins an SP 800-90A DRBG to a source such as
+ * ctl::rng. It seeds on construction, reseeds before the configured request
+ * limit, offers a fresh-entropy request, and reseeds after a detectable fork.
+ * It does not turn an operating-system API into a separately validated
+ * SP 800-90B entropy source and therefore makes no validation claim by itself.
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <utility>
+
+#include <ctl/bytes>
+#include <ctl/detail/memory>
+#include <ctl/random/detail/common>
+#include <ctl/random/system>
+
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentProcessId();
+#elif defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
+
+namespace ctl {
+namespace random_detail {
+
+inline uint64_t current_process_id() noexcept {
+#if defined(_WIN32)
+  return static_cast<uint64_t>(::GetCurrentProcessId());
+#elif defined(__unix__) || defined(__APPLE__)
+  return static_cast<uint64_t>(::getpid());
+#else
+  return 0;
+#endif
+}
+
+} // namespace random_detail
+
+template <class _Drbg, class _EntropySource = ctl::rng> class rbg {
+public:
+  typedef _Drbg drbg_type;
+  typedef _EntropySource entropy_source_type;
+
+  static constexpr size_t entropy_size = drbg_type::entropy_size;
+  static constexpr size_t nonce_size = drbg_type::nonce_size;
+  static constexpr uint64_t maximum_reseed_interval =
+      drbg_type::reseed_interval;
+
+  static_assert(entropy_size != 0 && nonce_size != 0,
+                "ctl::rbg requires a DRBG with separate entropy and nonce "
+                "inputs; ctr_drbg_no_df deliberately has a different "
+                "contract.");
+
+  explicit rbg(ctl::bytes personalization = ctl::bytes(),
+               uint64_t reseed_after = maximum_reseed_interval)
+      : rbg(entropy_source_type(), personalization, reseed_after) {}
+
+  explicit rbg(entropy_source_type source,
+               ctl::bytes personalization = ctl::bytes(),
+               uint64_t reseed_after = maximum_reseed_interval)
+      : source_(std::move(source)),
+        reseed_after_(validate_interval(reseed_after)),
+        generator_(instantiate(source_, personalization)),
+        process_id_(ctl::random_detail::current_process_id()), active_(true) {}
+
+  rbg(const rbg &) = delete;
+  rbg &operator=(const rbg &) = delete;
+
+  rbg(rbg &&other) noexcept(
+      std::is_nothrow_move_constructible<entropy_source_type>::value &&
+      std::is_nothrow_move_constructible<drbg_type>::value)
+      : source_(std::move(other.source_)),
+        reseed_after_(other.reseed_after_),
+        generator_(std::move(other.generator_)),
+        process_id_(other.process_id_), active_(other.active_) {
+    other.active_ = false;
+    other.process_id_ = 0;
+  }
+
+  rbg &operator=(rbg &&other) noexcept(
+      std::is_nothrow_move_assignable<entropy_source_type>::value &&
+      std::is_nothrow_move_assignable<drbg_type>::value) {
+    if (this != &other) {
+      source_ = std::move(other.source_);
+      reseed_after_ = other.reseed_after_;
+      generator_ = std::move(other.generator_);
+      process_id_ = other.process_id_;
+      active_ = other.active_;
+      other.active_ = false;
+      other.process_id_ = 0;
+    }
+    return *this;
+  }
+
+  /**
+   * @brief Generates one request, reseeding first when policy requires it
+   *
+   * When an automatic reseed occurs, additional input is consumed by reseed
+   * and is not supplied a second time to Generate, matching SP 800-90A's
+   * prediction-resistance flow.
+   */
+  void generate(ctl::writable_bytes output,
+                ctl::bytes additional = ctl::bytes()) {
+    require_active("ctl::rbg::generate");
+    require_request(output, additional, "ctl::rbg::generate");
+    const uint64_t now = ctl::random_detail::current_process_id();
+    const bool forked = process_id_ != 0 && now != 0 && now != process_id_;
+    if (forked || generator_.requests_served() >= reseed_after_) {
+      reseed_from_source(additional);
+      generator_.generate(output);
+    } else {
+      generator_.generate(output, additional);
+    }
+  }
+
+  /**
+   * @brief Gets fresh entropy immediately before this request
+   */
+  void generate_fresh(ctl::writable_bytes output,
+                      ctl::bytes additional = ctl::bytes()) {
+    require_active("ctl::rbg::generate_fresh");
+    require_request(output, additional, "ctl::rbg::generate_fresh");
+    reseed_from_source(additional);
+    generator_.generate(output);
+  }
+
+  /**
+   * @brief Explicitly obtains new entropy and reseeds
+   */
+  void reseed(ctl::bytes additional = ctl::bytes()) {
+    require_active("ctl::rbg::reseed");
+    ctl::random_detail::require_optional_input(
+        additional, "ctl::rbg::reseed", "additional input");
+    reseed_from_source(additional);
+  }
+
+  uint64_t requests_since_reseed() const {
+    require_active("ctl::rbg::requests_since_reseed");
+    return generator_.requests_served();
+  }
+
+  uint64_t reseed_after() const noexcept { return reseed_after_; }
+
+private:
+  static uint64_t validate_interval(uint64_t interval) {
+    if (interval == 0 || interval > maximum_reseed_interval)
+      throw std::invalid_argument(
+          "ctl::rbg : the automatic reseed interval must be between one and "
+          "the DRBG's SP 800-90A limit.");
+    return interval;
+  }
+
+  static drbg_type instantiate(entropy_source_type &source,
+                               ctl::bytes personalization) {
+    ctl::random_detail::require_optional_input(
+        personalization, "ctl::rbg::rbg", "personalization string");
+    ctl::detail::secret_buffer<entropy_size> entropy;
+    ctl::detail::secret_buffer<nonce_size> nonce;
+    source.fill(ctl::writable_bytes(entropy.data(), entropy.size()));
+    source.fill(ctl::writable_bytes(nonce.data(), nonce.size()));
+    return drbg_type(ctl::bytes(entropy.data(), entropy.size()),
+                     ctl::bytes(nonce.data(), nonce.size()), personalization);
+  }
+
+  void reseed_from_source(ctl::bytes additional) {
+    ctl::detail::secret_buffer<entropy_size> entropy;
+    source_.fill(ctl::writable_bytes(entropy.data(), entropy.size()));
+    generator_.reseed(ctl::bytes(entropy.data(), entropy.size()), additional);
+    process_id_ = ctl::random_detail::current_process_id();
+  }
+
+  void require_active(const char *where) const {
+    if (!active_)
+      throw std::logic_error(std::string(where) +
+                             " : this RBG has been moved away.");
+  }
+
+  static void require_request(ctl::writable_bytes output,
+                              ctl::bytes additional, const char *where) {
+    if (output.size() > drbg_type::max_per_request)
+      throw std::length_error(
+          std::string(where) + " : one request may produce at most " +
+          std::to_string(drbg_type::max_per_request) + " bytes.");
+    ctl::random_detail::require_optional_input(additional, where,
+                                               "additional input");
+    ctl::detail::require_disjoint(where, "additional input", additional.data(),
+                                  additional.size(), "output", output.data(),
+                                  output.size());
+  }
+
+  entropy_source_type source_;
+  uint64_t reseed_after_;
+  drbg_type generator_;
+  uint64_t process_id_;
+  bool active_;
+};
+
+} // namespace ctl

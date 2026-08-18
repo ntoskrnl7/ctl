@@ -1,0 +1,209 @@
+/**
+ * @file hash/detail/keccak
+ * @brief Shared byte-oriented Keccak-f[1600] sponge core
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <utility>
+
+#include <ctl/bytes>
+#include <ctl/detail/memory>
+
+namespace ctl {
+namespace hash {
+namespace detail {
+
+template <size_t _Rate> class keccak_sponge {
+  static_assert(_Rate != 0 && _Rate < 200,
+                "A Keccak-f[1600] rate must lie between zero and 200 bytes.");
+
+public:
+  static constexpr size_t rate = _Rate;
+
+  keccak_sponge()
+      : buffered_(0), squeezed_(0), phase_(phase::inactive) {
+    reset();
+  }
+
+  keccak_sponge(const keccak_sponge &) = delete;
+  keccak_sponge &operator=(const keccak_sponge &) = delete;
+
+  keccak_sponge(keccak_sponge &&other) noexcept
+      : buffered_(0), squeezed_(0), phase_(phase::inactive) {
+    take(other);
+  }
+
+  keccak_sponge &operator=(keccak_sponge &&other) noexcept {
+    if (this != &other) {
+      erase();
+      take(other);
+    }
+    return *this;
+  }
+
+  ~keccak_sponge() { erase(); }
+
+  bool absorbing() const noexcept { return phase_ == phase::absorbing; }
+  bool squeezing() const noexcept { return phase_ == phase::squeezing; }
+
+  void reset() noexcept {
+    erase();
+    memset(state_, 0, sizeof(state_));
+    memset(buffer_, 0, sizeof(buffer_));
+    phase_ = phase::absorbing;
+  }
+
+  void update(ctl::bytes input) noexcept {
+    const uint8_t *data = input.data();
+    size_t size = input.size();
+    if (buffered_ != 0) {
+      const size_t needed = rate - buffered_;
+      const size_t taken = size < needed ? size : needed;
+      if (taken != 0) {
+        memcpy(buffer_ + buffered_, data, taken);
+        data += taken;
+      }
+      buffered_ += taken;
+      size -= taken;
+      if (buffered_ == rate) {
+        absorb(buffer_);
+        buffered_ = 0;
+      }
+    }
+
+    while (size >= rate) {
+      absorb(data);
+      data += rate;
+      size -= rate;
+    }
+
+    if (size != 0) {
+      memcpy(buffer_, data, size);
+      buffered_ = size;
+    }
+  }
+
+  void finish(uint8_t suffix) noexcept {
+    memset(buffer_ + buffered_, 0, rate - buffered_);
+    buffer_[buffered_] = suffix;
+    buffer_[rate - 1] |= 0x80u;
+    absorb(buffer_);
+    ctl::detail::secure_zero(buffer_, sizeof(buffer_));
+    buffered_ = 0;
+    squeezed_ = 0;
+    phase_ = phase::squeezing;
+  }
+
+  void squeeze(ctl::writable_bytes output) noexcept {
+    size_t written = 0;
+    while (written < output.size()) {
+      if (squeezed_ == rate) {
+        permute();
+        squeezed_ = 0;
+      }
+      const size_t available = rate - squeezed_;
+      const size_t taken = output.size() - written < available
+                               ? output.size() - written
+                               : available;
+      for (size_t i = 0; i < taken; ++i) {
+        const size_t position = squeezed_ + i;
+        output[written + i] = static_cast<uint8_t>(
+            state_[position / 8] >> (8u * (position % 8)));
+      }
+      written += taken;
+      squeezed_ += taken;
+    }
+  }
+
+  void erase() noexcept {
+    ctl::detail::secure_zero(state_, sizeof(state_));
+    ctl::detail::secure_zero(buffer_, sizeof(buffer_));
+    buffered_ = 0;
+    squeezed_ = 0;
+    phase_ = phase::inactive;
+  }
+
+private:
+  enum class phase : uint8_t { inactive, absorbing, squeezing };
+
+  static constexpr uint64_t rotate_left(uint64_t value,
+                                        unsigned int amount) noexcept {
+    return amount == 0 ? value : (value << amount) | (value >> (64u - amount));
+  }
+
+  void absorb(const uint8_t *block) noexcept {
+    for (size_t i = 0; i < rate; ++i)
+      state_[i / 8] ^= static_cast<uint64_t>(block[i]) << (8u * (i % 8));
+    permute();
+  }
+
+  void permute() noexcept {
+    static constexpr uint64_t round_constants[24] = {
+        0x0000000000000001ull, 0x0000000000008082ull, 0x800000000000808aull,
+        0x8000000080008000ull, 0x000000000000808bull, 0x0000000080000001ull,
+        0x8000000080008081ull, 0x8000000000008009ull, 0x000000000000008aull,
+        0x0000000000000088ull, 0x0000000080008009ull, 0x000000008000000aull,
+        0x000000008000808bull, 0x800000000000008bull, 0x8000000000008089ull,
+        0x8000000000008003ull, 0x8000000000008002ull, 0x8000000000000080ull,
+        0x000000000000800aull, 0x800000008000000aull, 0x8000000080008081ull,
+        0x8000000000008080ull, 0x0000000080000001ull, 0x8000000080008008ull};
+    static constexpr unsigned int rotations[25] = {
+        0,  1,  62, 28, 27, 36, 44, 6,  55, 20, 3,  10, 43,
+        25, 39, 41, 45, 15, 21, 8,  18, 2,  61, 56, 14};
+
+    uint64_t columns[5];
+    uint64_t mixed[25];
+    for (size_t round = 0; round < 24; ++round) {
+      for (size_t x = 0; x < 5; ++x)
+        columns[x] = state_[x] ^ state_[x + 5] ^ state_[x + 10] ^
+                     state_[x + 15] ^ state_[x + 20];
+      for (size_t x = 0; x < 5; ++x) {
+        const uint64_t delta =
+            columns[(x + 4) % 5] ^ rotate_left(columns[(x + 1) % 5], 1);
+        for (size_t y = 0; y < 5; ++y)
+          state_[x + 5 * y] ^= delta;
+      }
+
+      for (size_t y = 0; y < 5; ++y) {
+        for (size_t x = 0; x < 5; ++x) {
+          const size_t destination_x = y;
+          const size_t destination_y = (2 * x + 3 * y) % 5;
+          mixed[destination_x + 5 * destination_y] =
+              rotate_left(state_[x + 5 * y], rotations[x + 5 * y]);
+        }
+      }
+
+      for (size_t y = 0; y < 5; ++y) {
+        for (size_t x = 0; x < 5; ++x)
+          state_[x + 5 * y] =
+              mixed[x + 5 * y] ^
+              ((~mixed[(x + 1) % 5 + 5 * y]) & mixed[(x + 2) % 5 + 5 * y]);
+      }
+      state_[0] ^= round_constants[round];
+    }
+    ctl::detail::secure_zero(columns, sizeof(columns));
+    ctl::detail::secure_zero(mixed, sizeof(mixed));
+  }
+
+  void take(keccak_sponge &other) noexcept {
+    memcpy(state_, other.state_, sizeof(state_));
+    memcpy(buffer_, other.buffer_, sizeof(buffer_));
+    buffered_ = other.buffered_;
+    squeezed_ = other.squeezed_;
+    phase_ = other.phase_;
+    other.erase();
+  }
+
+  uint64_t state_[25];
+  uint8_t buffer_[rate];
+  size_t buffered_;
+  size_t squeezed_;
+  phase phase_;
+};
+
+} // namespace detail
+} // namespace hash
+} // namespace ctl

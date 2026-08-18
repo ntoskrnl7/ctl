@@ -1,0 +1,372 @@
+/**
+ * @file blake2
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief Unkeyed BLAKE2b and BLAKE2s hashes from RFC 7693
+ *
+ * BLAKE2s and BLAKE2b share one streaming engine parameterized by their word
+ * size, block size, round count and rotations. Digest length is selected in
+ * bits at compile time and must be a whole number of bytes: BLAKE2s permits 8
+ * through 256 bits and BLAKE2b permits 8 through 512 bits.
+ *
+ * RFC 7693 also specifies a built-in keyed mode. It is intentionally not
+ * smuggled into this default-constructible fixed hash type; a keyed BLAKE2
+ * construction belongs in the MAC namespace with an interface that makes key
+ * ownership explicit.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+#include <ctl/bytes>
+#include <ctl/detail/endian>
+#include <ctl/detail/memory>
+#include <ctl/hash/fixed>
+
+namespace ctl {
+namespace hash {
+namespace detail {
+
+struct blake2s_traits {
+  typedef uint32_t word_type;
+
+  static constexpr size_t block_size = 64;
+  static constexpr size_t max_digest_bits = 256;
+  static constexpr size_t rounds = 10;
+  static constexpr unsigned int rotation1 = 16;
+  static constexpr unsigned int rotation2 = 12;
+  static constexpr unsigned int rotation3 = 8;
+  static constexpr unsigned int rotation4 = 7;
+  static constexpr const char *name = "ctl::hash::blake2s";
+
+  inline static constexpr word_type initial[8] = {
+      0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+      0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+
+  static word_type load(const uint8_t *input) {
+    return ctl::detail::load_le32(input);
+  }
+
+  static constexpr word_type rotate_right(word_type value,
+                                          unsigned int amount) {
+    return ctl::detail::rotr32(value, amount);
+  }
+};
+
+struct blake2b_traits {
+  typedef uint64_t word_type;
+
+  static constexpr size_t block_size = 128;
+  static constexpr size_t max_digest_bits = 512;
+  static constexpr size_t rounds = 12;
+  static constexpr unsigned int rotation1 = 32;
+  static constexpr unsigned int rotation2 = 24;
+  static constexpr unsigned int rotation3 = 16;
+  static constexpr unsigned int rotation4 = 63;
+  static constexpr const char *name = "ctl::hash::blake2b";
+
+  inline static constexpr word_type initial[8] = {
+      0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull, 0x3c6ef372fe94f82bull,
+      0xa54ff53a5f1d36f1ull, 0x510e527fade682d1ull, 0x9b05688c2b3e6c1full,
+      0x1f83d9abfb41bd6bull, 0x5be0cd19137e2179ull};
+
+  static word_type load(const uint8_t *input) {
+    return ctl::detail::load_le64(input);
+  }
+
+  static constexpr word_type rotate_right(word_type value,
+                                          unsigned int amount) {
+    return (value >> amount) | (value << (64u - amount));
+  }
+};
+
+template <class _Traits, size_t _DigestBits>
+class blake2_impl
+    : public ctl::hash::fixed_hash<blake2_impl<_Traits, _DigestBits>,
+                                   _Traits::block_size, _DigestBits / 8> {
+  static_assert(_DigestBits >= 8 && _DigestBits <= _Traits::max_digest_bits &&
+                    _DigestBits % 8 == 0,
+                "BLAKE2 digest size must be a supported whole number of "
+                "bytes.");
+
+  typedef ctl::hash::fixed_hash<blake2_impl<_Traits, _DigestBits>,
+                                _Traits::block_size, _DigestBits / 8>
+      base_type;
+  typedef typename _Traits::word_type word_type;
+
+public:
+  using base_type::block_size;
+  using base_type::digest_size;
+  using typename base_type::digest_t;
+  using typename base_type::digest_view;
+  using typename base_type::writable_digest_view;
+
+  blake2_impl() : count_low_(0), count_high_(0), buffered_(0), active_(false) {
+    reset();
+  }
+
+  blake2_impl(const blake2_impl &) = delete;
+  blake2_impl &operator=(const blake2_impl &) = delete;
+
+  blake2_impl(blake2_impl &&other) noexcept : active_(false) { take(other); }
+
+  blake2_impl &operator=(blake2_impl &&other) noexcept {
+    if (this != &other) {
+      erase();
+      take(other);
+    }
+    return *this;
+  }
+
+  ~blake2_impl() { erase(); }
+
+  void reset() {
+    erase();
+    memcpy(state_, _Traits::initial, sizeof(state_));
+    state_[0] ^= static_cast<word_type>(0x01010000u ^ digest_size);
+    memset(buffer_, 0, sizeof(buffer_));
+    count_low_ = 0;
+    count_high_ = 0;
+    buffered_ = 0;
+    active_ = true;
+  }
+
+  void update(ctl::bytes input) {
+    require_active("update");
+    require_length(input.size());
+
+    const uint8_t *data = input.data();
+    size_t size = input.size();
+    if (size == 0)
+      return;
+
+    if (buffered_ != 0) {
+      const size_t fill = block_size - buffered_;
+      if (size <= fill) {
+        memcpy(buffer_ + buffered_, data, size);
+        buffered_ += size;
+        return;
+      }
+
+      if (fill != 0) {
+        memcpy(buffer_ + buffered_, data, fill);
+        data += fill;
+        size -= fill;
+      }
+      add_count(block_size);
+      compress(buffer_, false);
+      buffered_ = 0;
+    }
+
+    while (size > block_size) {
+      add_count(block_size);
+      compress(data, false);
+      data += block_size;
+      size -= block_size;
+    }
+
+    memcpy(buffer_, data, size);
+    buffered_ = size;
+  }
+
+  void finish(writable_digest_view output) {
+    require_active("finish");
+    add_count(buffered_);
+    memset(buffer_ + buffered_, 0, block_size - buffered_);
+    compress(buffer_, true);
+
+    constexpr size_t word_bytes = sizeof(word_type);
+    for (size_t i = 0; i < digest_size; ++i)
+      output[i] = static_cast<uint8_t>(state_[i / word_bytes] >>
+                                       (8u * (i % word_bytes)));
+    erase();
+  }
+
+private:
+  void require_active(const char *operation) const {
+    if (!active_)
+      throw std::logic_error(std::string(_Traits::name) + "::" + operation +
+                             " : this hash context has been finished or "
+                             "moved away. Reset it before use.");
+  }
+
+  void require_length(size_t additional) const {
+    if (!fits_uint64(additional))
+      throw_too_long();
+
+    const uint64_t amount = static_cast<uint64_t>(additional);
+    if constexpr (sizeof(word_type) == sizeof(uint32_t)) {
+      const uint64_t counted =
+          (static_cast<uint64_t>(count_high_) << 32) | count_low_;
+      const uint64_t buffered = static_cast<uint64_t>(buffered_);
+      const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+      if (buffered > maximum - counted ||
+          amount > maximum - (counted + buffered))
+        throw_too_long();
+    } else {
+      uint64_t low = count_low_;
+      uint64_t high = count_high_;
+      if (!try_add(low, high, static_cast<uint64_t>(buffered_)) ||
+          !try_add(low, high, amount))
+        throw_too_long();
+    }
+  }
+
+  static bool fits_uint64(size_t amount) {
+    if constexpr (sizeof(size_t) > sizeof(uint64_t))
+      return amount <=
+             static_cast<size_t>(std::numeric_limits<uint64_t>::max());
+    return true;
+  }
+
+  static bool try_add(uint64_t &low, uint64_t &high, uint64_t amount) {
+    const uint64_t next = low + amount;
+    if (next < low) {
+      if (high == std::numeric_limits<uint64_t>::max())
+        return false;
+      ++high;
+    }
+    low = next;
+    return true;
+  }
+
+  [[noreturn]] void throw_too_long() const {
+    throw std::length_error(
+        std::string(_Traits::name) +
+        "::update : the message is too long for BLAKE2's byte counter.");
+  }
+
+  void add_count(size_t bytes) {
+    if (!fits_uint64(bytes))
+      throw_too_long();
+    const uint64_t amount = static_cast<uint64_t>(bytes);
+
+    if constexpr (sizeof(word_type) == sizeof(uint32_t)) {
+      const uint64_t counted =
+          (static_cast<uint64_t>(count_high_) << 32) | count_low_;
+      if (amount > std::numeric_limits<uint64_t>::max() - counted)
+        throw_too_long();
+      const uint64_t total = counted + amount;
+      count_low_ = static_cast<word_type>(total);
+      count_high_ = static_cast<word_type>(total >> 32);
+    } else {
+      uint64_t low = count_low_;
+      uint64_t high = count_high_;
+      if (!try_add(low, high, amount))
+        throw_too_long();
+      count_low_ = static_cast<word_type>(low);
+      count_high_ = static_cast<word_type>(high);
+    }
+  }
+
+  static void mix(word_type *v, size_t a, size_t b, size_t c, size_t d,
+                  word_type x, word_type y) {
+    v[a] = static_cast<word_type>(v[a] + v[b] + x);
+    v[d] = _Traits::rotate_right(v[d] ^ v[a], _Traits::rotation1);
+    v[c] = static_cast<word_type>(v[c] + v[d]);
+    v[b] = _Traits::rotate_right(v[b] ^ v[c], _Traits::rotation2);
+    v[a] = static_cast<word_type>(v[a] + v[b] + y);
+    v[d] = _Traits::rotate_right(v[d] ^ v[a], _Traits::rotation3);
+    v[c] = static_cast<word_type>(v[c] + v[d]);
+    v[b] = _Traits::rotate_right(v[b] ^ v[c], _Traits::rotation4);
+  }
+
+  void compress(const uint8_t *block, bool last) {
+    static constexpr uint8_t sigma[10][16] = {
+        {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+        {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3},
+        {11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4},
+        {7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8},
+        {9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13},
+        {2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9},
+        {12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11},
+        {13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10},
+        {6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5},
+        {10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0}};
+
+    word_type message[16];
+    word_type work[16];
+    for (size_t i = 0; i < 16; ++i)
+      message[i] = _Traits::load(block + i * sizeof(word_type));
+    for (size_t i = 0; i < 8; ++i) {
+      work[i] = state_[i];
+      work[i + 8] = _Traits::initial[i];
+    }
+    work[12] ^= count_low_;
+    work[13] ^= count_high_;
+    if (last)
+      work[14] = ~work[14];
+
+    for (size_t round = 0; round < _Traits::rounds; ++round) {
+      const uint8_t *schedule = sigma[round % 10];
+      mix(work, 0, 4, 8, 12, message[schedule[0]], message[schedule[1]]);
+      mix(work, 1, 5, 9, 13, message[schedule[2]], message[schedule[3]]);
+      mix(work, 2, 6, 10, 14, message[schedule[4]], message[schedule[5]]);
+      mix(work, 3, 7, 11, 15, message[schedule[6]], message[schedule[7]]);
+      mix(work, 0, 5, 10, 15, message[schedule[8]], message[schedule[9]]);
+      mix(work, 1, 6, 11, 12, message[schedule[10]], message[schedule[11]]);
+      mix(work, 2, 7, 8, 13, message[schedule[12]], message[schedule[13]]);
+      mix(work, 3, 4, 9, 14, message[schedule[14]], message[schedule[15]]);
+    }
+
+    for (size_t i = 0; i < 8; ++i)
+      state_[i] ^= work[i] ^ work[i + 8];
+    ctl::detail::secure_zero(message, sizeof(message));
+    ctl::detail::secure_zero(work, sizeof(work));
+  }
+
+  void erase() {
+    ctl::detail::secure_zero(state_, sizeof(state_));
+    ctl::detail::secure_zero(buffer_, sizeof(buffer_));
+    count_low_ = 0;
+    count_high_ = 0;
+    buffered_ = 0;
+    active_ = false;
+  }
+
+  void take(blake2_impl &other) noexcept {
+    memcpy(state_, other.state_, sizeof(state_));
+    memcpy(buffer_, other.buffer_, sizeof(buffer_));
+    count_low_ = other.count_low_;
+    count_high_ = other.count_high_;
+    buffered_ = other.buffered_;
+    active_ = other.active_;
+    other.erase();
+  }
+
+  word_type state_[8];
+  uint8_t buffer_[block_size];
+  word_type count_low_;
+  word_type count_high_;
+  size_t buffered_;
+  bool active_;
+};
+
+} // namespace detail
+
+template <size_t _DigestBits = 256>
+using blake2s = detail::blake2_impl<detail::blake2s_traits, _DigestBits>;
+
+template <size_t _DigestBits = 512>
+using blake2b = detail::blake2_impl<detail::blake2b_traits, _DigestBits>;
+
+using blake2s_128 = blake2s<128>;
+using blake2s_160 = blake2s<160>;
+using blake2s_224 = blake2s<224>;
+using blake2s_256 = blake2s<256>;
+
+using blake2b_160 = blake2b<160>;
+using blake2b_256 = blake2b<256>;
+using blake2b_384 = blake2b<384>;
+using blake2b_512 = blake2b<512>;
+
+} // namespace hash
+} // namespace ctl

@@ -1,0 +1,158 @@
+/**
+ * @file hkdf
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief HMAC-based Extract-and-Expand Key Derivation Function, RFC 5869
+ *
+ * Extract turns input keying material into a fixed-size pseudorandom key;
+ * expand binds that key to optional context information and emits at most
+ * 255 hash digests. Derive performs both operations and securely erases the
+ * intermediate PRK. Output is required to be disjoint from every input so
+ * incremental writes cannot overwrite a value that a later block still uses.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
+#include <ctl/bytes>
+#include <ctl/detail/memory>
+#include <ctl/mac/hmac>
+
+namespace ctl {
+namespace kdf {
+
+template <class _Hash> class hkdf {
+public:
+  typedef _Hash hash_type;
+  typedef ctl::mac::hmac<hash_type> hmac_type;
+
+  static constexpr size_t prk_size = hash_type::digest_size;
+  static constexpr size_t max_output_size = 255u * hash_type::digest_size;
+
+  typedef uint8_t prk_t[prk_size];
+  typedef ctl::fixed_bytes<prk_size> prk_view;
+  typedef ctl::writable_fixed_bytes<prk_size> writable_prk_view;
+
+  /**
+   * @brief Performs RFC 5869-Extract
+   *
+   * An empty salt has RFC 5869's specified meaning: a string of HashLen zero
+   * bytes. HMAC padding makes an empty key exactly equivalent here.
+   */
+  static void extract(ctl::bytes salt, ctl::bytes input_key_material,
+                      writable_prk_view prk) {
+    ctl::detail::require_disjoint("ctl::kdf::hkdf::extract", "salt",
+                                  salt.data(), salt.size(), "PRK",
+                                  prk.data(), prk_size);
+    ctl::detail::require_disjoint(
+        "ctl::kdf::hkdf::extract", "input key material",
+        input_key_material.data(), input_key_material.size(), "PRK",
+        prk.data(), prk_size);
+    hmac_type::authenticate(salt, input_key_material, prk);
+  }
+
+  /**
+   * @brief Performs RFC 5869-Expand
+   *
+   * @exception std::length_error if output exceeds 255 * HashLen bytes
+   * @exception std::invalid_argument if output overlaps PRK or info
+   */
+  static void expand(prk_view prk, ctl::bytes info,
+                     ctl::writable_bytes output) {
+    validate_length(output.size());
+    require_output_disjoint(prk, info, output);
+    if (output.empty())
+      return;
+
+    ctl::detail::secret_buffer<prk_size> previous;
+    size_t previous_size = 0;
+    size_t written = 0;
+    const size_t blocks =
+        output.size() / prk_size + (output.size() % prk_size != 0);
+
+    try {
+      hmac_type prf(prk);
+      for (size_t block = 1; block <= blocks; ++block) {
+        if (block != 1)
+          prf.reset();
+        if (previous_size != 0)
+          prf.update(ctl::bytes(previous.data(), previous_size));
+        prf.update(info);
+        const uint8_t counter = static_cast<uint8_t>(block);
+        prf.update(ctl::bytes(&counter, sizeof(counter)));
+        prf.finish(previous);
+        previous_size = prk_size;
+
+        const size_t remaining = output.size() - written;
+        const size_t taken = remaining < prk_size ? remaining : prk_size;
+        memcpy(output.data() + written, previous.data(), taken);
+        written += taken;
+      }
+    } catch (...) {
+      ctl::detail::secure_zero(output.data(), output.size());
+      throw;
+    }
+  }
+
+  /**
+   * @brief Performs RFC 5869-Extract followed by RFC 5869-Expand
+   */
+  static void derive(ctl::bytes salt, ctl::bytes input_key_material,
+                     ctl::bytes info, ctl::writable_bytes output) {
+    validate_length(output.size());
+    require_all_inputs_disjoint(salt, input_key_material, info, output);
+
+    ctl::detail::secret_buffer<prk_size> prk;
+    try {
+      extract(salt, input_key_material, prk);
+      expand(prk, info, output);
+    } catch (...) {
+      ctl::detail::secure_zero(output.data(), output.size());
+      throw;
+    }
+  }
+
+private:
+  static void validate_length(size_t output_size) {
+    if (output_size > max_output_size)
+      throw std::length_error(
+          "ctl::kdf::hkdf::expand : RFC 5869 limits output to 255 * "
+          "HashLen bytes (" +
+          std::to_string(max_output_size) + " for this hash).");
+  }
+
+  static void require_output_disjoint(prk_view prk, ctl::bytes info,
+                                      ctl::writable_bytes output) {
+    ctl::detail::require_disjoint("ctl::kdf::hkdf::expand", "PRK",
+                                  prk.data(), prk_size, "output",
+                                  output.data(), output.size());
+    ctl::detail::require_disjoint("ctl::kdf::hkdf::expand", "info",
+                                  info.data(), info.size(), "output",
+                                  output.data(), output.size());
+  }
+
+  static void require_all_inputs_disjoint(
+      ctl::bytes salt, ctl::bytes input_key_material, ctl::bytes info,
+      ctl::writable_bytes output) {
+    ctl::detail::require_disjoint("ctl::kdf::hkdf::derive", "salt",
+                                  salt.data(), salt.size(), "output",
+                                  output.data(), output.size());
+    ctl::detail::require_disjoint(
+        "ctl::kdf::hkdf::derive", "input key material",
+        input_key_material.data(), input_key_material.size(), "output",
+        output.data(), output.size());
+    ctl::detail::require_disjoint("ctl::kdf::hkdf::derive", "info",
+                                  info.data(), info.size(), "output",
+                                  output.data(), output.size());
+  }
+};
+
+} // namespace kdf
+} // namespace ctl

@@ -1,0 +1,102 @@
+/**
+ * @file sha3
+ * @author jung-kwang lee (ntoskrnl7@gmail.com)
+ * @brief The fixed-output SHA-3 family from FIPS 202
+ *
+ * SHA3-224, SHA3-256, SHA3-384 and SHA3-512 share the Keccak-f[1600]
+ * permutation and differ in their sponge rate and digest length. Input is
+ * supplied as byte strings, so the FIPS bit-string functions are implemented
+ * for messages whose length is a multiple of eight.
+ *
+ * SHAKE uses the same private sponge core through ctl/hash/shake, but keeps its
+ * different absorb-then-squeeze lifecycle behind ctl/hash/xof.
+ *
+ * @version 0.1
+ *
+ * @copyright Copyright (c) 2022 C++ Cryptographics template library Authors
+ */
+#pragma once
+
+#include <cstddef>
+#include <stdexcept>
+#include <string>
+#include <utility>
+
+#include <ctl/bytes>
+#include <ctl/hash/detail/keccak>
+#include <ctl/hash/fixed>
+
+namespace ctl {
+namespace hash {
+namespace detail {
+
+template <size_t _DigestBits>
+class sha3_impl
+    : public ctl::hash::fixed_hash<sha3_impl<_DigestBits>,
+                                   200 - _DigestBits / 4, _DigestBits / 8> {
+  static_assert(_DigestBits == 224 || _DigestBits == 256 ||
+                    _DigestBits == 384 || _DigestBits == 512,
+                "SHA-3 supports 224, 256, 384 and 512 bit digests.");
+
+  typedef ctl::hash::fixed_hash<sha3_impl<_DigestBits>, 200 - _DigestBits / 4,
+                                _DigestBits / 8>
+      base_type;
+  typedef keccak_sponge<base_type::block_size> sponge_type;
+
+public:
+  using base_type::block_size;
+  using base_type::digest_size;
+  using typename base_type::digest_t;
+  using typename base_type::digest_view;
+  using typename base_type::writable_digest_view;
+
+  sha3_impl() = default;
+
+  sha3_impl(const sha3_impl &) = delete;
+  sha3_impl &operator=(const sha3_impl &) = delete;
+
+  sha3_impl(sha3_impl &&other) noexcept
+      : sponge_(std::move(other.sponge_)) {}
+
+  sha3_impl &operator=(sha3_impl &&other) noexcept {
+    if (this != &other) {
+      sponge_ = std::move(other.sponge_);
+    }
+    return *this;
+  }
+
+  void reset() noexcept { sponge_.reset(); }
+
+  void update(ctl::bytes input) {
+    require_active("update");
+    sponge_.update(input);
+  }
+
+  void finish(writable_digest_view output) {
+    require_active("finish");
+
+    sponge_.finish(0x06u);
+    sponge_.squeeze(output);
+    sponge_.erase();
+  }
+
+private:
+  void require_active(const char *operation) const {
+    if (!sponge_.absorbing())
+      throw std::logic_error(std::string("ctl::hash::sha3::") + operation +
+                             " : this hash context has been finished or "
+                             "moved away. Reset it before use.");
+  }
+
+  sponge_type sponge_;
+};
+
+} // namespace detail
+
+using sha3_224 = detail::sha3_impl<224>;
+using sha3_256 = detail::sha3_impl<256>;
+using sha3_384 = detail::sha3_impl<384>;
+using sha3_512 = detail::sha3_impl<512>;
+
+} // namespace hash
+} // namespace ctl

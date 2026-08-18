@@ -2,9 +2,9 @@
 
 Cryptographic Template Library
 
-A header only C++17 library of symmetric ciphers and modes of operation. A mode
-takes its block cipher as a template argument, so any cipher composes with any
-mode through the same code and nothing dispatches virtually per block.
+A header only C++17 cryptographic library. Its symmetric modes take the block
+cipher as a template argument, and its MACs and KDFs take the hash in the same
+way, so the compositions share code and do not dispatch virtually per block.
 
 ```cpp
 #include <ctl/symmetric/cipher/aes>
@@ -31,15 +31,34 @@ xts.encrypt(sector_number, sector, out);
 | AES | 128, 192, 256 | FIPS 197 appendix C, SP 800-38A F.1.1 |
 | ARIA | 128, 192, 256 | RFC 5794 appendix A |
 | LEA | 128, 192, 256 | the vectors published with KS X 3246 |
-| CTR_DRBG | on any of the ciphers | NIST CAVP, the no derivation function vectors |
+| System random | Windows, Linux, Apple and BSD | platform API contracts and failure-path tests |
+| CTR_DRBG | AES-128, AES-192, AES-256; DF by default, explicit no-DF variant | NIST CAVP vectors |
+| HMAC_DRBG | approved SHA-2 profiles | NIST CAVP vectors |
+| Hash_DRBG | approved SHA-2 profiles | NIST CAVP vectors, including 440/888-bit seed lengths |
+| RBG policy | system seed, automatic/fresh reseed, fork detection | deterministic source and system integration tests |
 | ECB | | SP 800-38A F.1.1 |
 | CBC | | SP 800-38A F.2.1 |
 | CTR | | SP 800-38A F.5.1 |
 | XTS | | NIST CAVP XTSTestVectors, ciphertext stealing included |
 | GCM | tags of 128 down to 96 bits | the canonical GCM test cases, non 96 bit IVs included |
+| SHA-2 | 224, 256, 384, 512, 512/224, 512/256 | FIPS 180-4 examples |
+| SHA-3 | 224, 256, 384, 512 | FIPS 202 examples |
+| SHAKE | 128 and 256, repeated byte-oriented squeeze | FIPS 202 examples and 1,250 `hashlib` answers |
+| BLAKE2s | unkeyed, byte-aligned digests from 8 through 256 bits | RFC 7693 appendix B and reference answers |
+| BLAKE2b | unkeyed, byte-aligned digests from 8 through 512 bits | RFC 7693 appendix A and reference answers |
+| HMAC | over any fixed-output hash above, full tags | RFC 4231 and reference answers |
+| HKDF-HMAC | extract, expand, and combined derive | RFC 5869 and generic-composition tests |
+| PBKDF2-HMAC | all fixed-output hashes above | RFC 7914, RFC 8018 and reference answers |
 
-Every published vector runs in both the accelerated and the software only
-build, so the same known answers cover both paths.
+Every published cipher and mode vector runs in both the accelerated and the
+software only build, so the same known answers cover both paths. All twelve
+standard-size fixed hashes were differentially checked against OpenSSL for
+hashing, HMAC and both KDFs. Every one of BLAKE2's 96 permitted digest byte
+lengths was also checked against `hashlib` for inputs from 0 through 512 bytes.
+SHA-3 and BLAKE2 cover empty, exact-block and multi-block inputs, every
+streaming split point, and composition through HMAC and both KDF templates.
+SHAKE128 and SHAKE256 use a separate absorb-then-squeeze interface; official
+2048-bit outputs and an independent boundary matrix cover both Keccak rates.
 
 Tables are generated rather than transcribed. The AES S-box and its round
 tables, and ARIA's SB1, SB3 and SB4, are all built at compile time from the
